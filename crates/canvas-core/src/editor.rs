@@ -12,7 +12,9 @@ use crate::geometry::{Point, Rect};
 use crate::history::{History, Transaction};
 use crate::hit::{elements_in_rect, hit_test};
 use crate::id::{new_element_id, new_version_nonce};
-use crate::model::{Document, Element, ElementId, ElementKind, ShapeKind, Style, TextAlign};
+use crate::model::{
+    Document, Element, ElementId, ElementKind, ShapeKind, Style, StylePatch, TextAlign,
+};
 use crate::nav::NavigationState;
 use crate::scene::Scene;
 use crate::text::{layout_text, ApproxMeasurer, TextMeasurer};
@@ -1336,6 +1338,63 @@ impl Editor {
         })
     }
 
+    /// Apply a style patch to the selection (undoably) and to the defaults
+    /// for new elements.
+    pub fn update_style(&mut self, patch: &StylePatch, now: u64) -> Effects {
+        if patch.is_empty() {
+            return Effects::default();
+        }
+        patch.apply_to(&mut self.style);
+        if self.selection.is_empty() || self.interaction != Interaction::Idle {
+            return Effects::default();
+        }
+        let ids: Vec<ElementId> = self.selection.iter().cloned().collect();
+        let mut tx = Transaction::begin();
+        let mut effects = Effects::default();
+        for id in &ids {
+            let patched = patch.clone();
+            if let Err(err) = tx.update(&mut self.doc, id, now, |element| {
+                if let Some(style) = element_style_mut(element) {
+                    patched.apply_to(style);
+                }
+            }) {
+                debug_assert!(false, "style update failed: {err}");
+            }
+            effects.changed.insert(id.clone());
+            // Text reflows when its font size changes.
+            if let Some(content) = self
+                .doc
+                .element(id)
+                .and_then(|element| match &element.kind {
+                    ElementKind::Text { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+            {
+                if let Some(rect) = self.text_rect_for(id, &content) {
+                    let _ = tx.update(&mut self.doc, id, now, |element| {
+                        if let ElementKind::Text { rect: r, .. } = &mut element.kind {
+                            *r = rect;
+                        }
+                    });
+                }
+            }
+        }
+        tx.commit(&mut self.history);
+        effects.overlay_changed = true;
+        effects
+    }
+
+    /// The style shown in the panel: the selection's style, else defaults.
+    pub fn current_style(&self) -> Style {
+        self.selection
+            .iter()
+            .next()
+            .and_then(|id| self.doc.element(id))
+            .and_then(|element| element_style(element))
+            .cloned()
+            .unwrap_or_else(|| self.style.clone())
+    }
+
     fn begin_erase(&mut self, world: Point, now: u64) -> Effects {
         self.tx = Some(Transaction::begin());
         let mut erased = BTreeSet::new();
@@ -1693,6 +1752,30 @@ fn constrain_angle(start: Point, current: Point, constrain: bool) -> Point {
         start.x + angle.cos() * length,
         start.y + angle.sin() * length,
     )
+}
+
+/// The mutable style of any element that draws.
+pub fn element_style_mut(element: &mut Element) -> Option<&mut Style> {
+    match &mut element.kind {
+        ElementKind::Shape { style, .. }
+        | ElementKind::Freehand { style, .. }
+        | ElementKind::Glyph { style, .. }
+        | ElementKind::Arrow { style, .. }
+        | ElementKind::Text { style, .. } => Some(style),
+        ElementKind::Frame { .. } => None,
+    }
+}
+
+/// The style of any element that draws.
+pub fn element_style(element: &Element) -> Option<&Style> {
+    match &element.kind {
+        ElementKind::Shape { style, .. }
+        | ElementKind::Freehand { style, .. }
+        | ElementKind::Glyph { style, .. }
+        | ElementKind::Arrow { style, .. }
+        | ElementKind::Text { style, .. } => Some(style),
+        ElementKind::Frame { .. } => None,
+    }
 }
 
 /// Translate every kind of element in place.
@@ -2408,5 +2491,80 @@ mod tests {
         e.pointer_down(Point::new(50.0, 50.0), 0, mods, 2);
         e.cancel_text();
         assert!(e.doc.is_empty());
+    }
+
+    #[test]
+    fn style_patch_applies_to_selection_and_undoes() {
+        use crate::model::{FillPattern, StylePatch};
+        let mut e = editor();
+        drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(100.0, 50.0), 1);
+        let id = e.doc.ordered_live()[0].id.clone();
+
+        let patch = StylePatch {
+            stroke_color: Some("#e03131".into()),
+            fill_style: Some(FillPattern::Solid),
+            fill_color: Some("#ffc9c9".into()),
+            ..StylePatch::default()
+        };
+        e.update_style(&patch, 2);
+
+        match &e.doc.element(&id).unwrap().kind {
+            ElementKind::Shape { style, .. } => {
+                assert_eq!(style.stroke_color, "#e03131");
+                assert_eq!(style.fill_style, FillPattern::Solid);
+                assert_eq!(style.fill_color, "#ffc9c9");
+            }
+            other => panic!("expected shape, got {other:?}"),
+        }
+
+        let cmd = Modifiers {
+            meta: true,
+            ..Modifiers::default()
+        };
+        press(&mut e, "z", cmd, 3);
+        match &e.doc.element(&id).unwrap().kind {
+            ElementKind::Shape { style, .. } => assert_eq!(style.stroke_color, "#1e1e1e"),
+            other => panic!("expected shape, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn style_patch_without_selection_updates_defaults() {
+        use crate::model::StylePatch;
+        let mut e = editor();
+        let patch = StylePatch {
+            stroke_width: Some(4.0),
+            ..StylePatch::default()
+        };
+        e.update_style(&patch, 1);
+        assert_eq!(e.style.stroke_width, 4.0);
+
+        drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(50.0, 50.0), 2);
+        match &e.doc.ordered_live()[0].kind {
+            ElementKind::Shape { style, .. } => assert_eq!(style.stroke_width, 4.0),
+            other => panic!("expected shape, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn current_style_reflects_the_selection() {
+        use crate::model::StylePatch;
+        let mut e = editor();
+        drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(50.0, 50.0), 1);
+        assert_eq!(e.current_style().stroke_color, "#1e1e1e");
+        e.update_style(
+            &StylePatch {
+                stroke_color: Some("#2f9e44".into()),
+                ..StylePatch::default()
+            },
+            2,
+        );
+        assert_eq!(e.current_style().stroke_color, "#2f9e44");
+        e.clear_selection();
+        assert_eq!(
+            e.current_style().stroke_color,
+            "#2f9e44",
+            "defaults carry over"
+        );
     }
 }

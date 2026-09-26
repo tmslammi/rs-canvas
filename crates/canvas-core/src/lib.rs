@@ -26,14 +26,17 @@ pub use camera::Camera;
 pub use delta::{Delta, EditError};
 pub use demo::demo_document;
 pub use display::{Dash, DisplayList, DrawOp, FillStyle, PathOp, Renderer, StrokeStyle, TextOp};
-pub use editor::{translate_element, Editor, Effects, Handle, Modifiers, ShellAction};
+pub use editor::{
+    element_style, element_style_mut, translate_element, Editor, Effects, Handle, Modifiers,
+    ShellAction,
+};
 pub use geometry::{Affine, Point, Rect};
 pub use history::{History, Transaction};
 pub use hit::{elements_in_rect, hit_test};
 pub use merge::reconcile;
 pub use model::{
     Binding, Document, Element, ElementId, ElementKind, Endpoint, FillPattern, Routing, ShapeKind,
-    StrokeDash, Style, TextAlign, SCHEMA_VERSION,
+    StrokeDash, Style, StylePatch, TextAlign, SCHEMA_VERSION,
 };
 pub use nav::NavigationState;
 pub use scene::{Scene, SceneLayer};

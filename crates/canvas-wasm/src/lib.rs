@@ -5,7 +5,7 @@
 
 use canvas_core::{
     Affine, Document, DrawOp, Editor as CoreEditor, Effects, FillStyle, Modifiers, Point, Rect,
-    Renderer, ShellAction, StrokeStyle, TextAlign, TextMeasurer, TextOp, Tool,
+    Renderer, ShellAction, StrokeStyle, StylePatch, TextAlign, TextMeasurer, TextOp, Tool,
 };
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -262,6 +262,19 @@ impl Editor {
     pub fn cancel_text(&mut self) {
         let effects = self.core.cancel_text();
         self.apply(effects);
+    }
+
+    /// Apply a style patch (JSON) to the selection and/or defaults.
+    pub fn update_style(&mut self, patch_json: &str) {
+        if let Ok(patch) = serde_json::from_str::<StylePatch>(patch_json) {
+            let effects = self.core.update_style(&patch, now_ms());
+            self.apply(effects);
+        }
+    }
+
+    /// The style the panel should show (selection style, else defaults).
+    pub fn current_style(&self) -> String {
+        serde_json::to_string(&self.core.current_style()).unwrap_or_default()
     }
 
     pub fn scroll(&self) -> Vec<f64> {

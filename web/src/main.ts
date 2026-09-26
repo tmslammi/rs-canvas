@@ -1,4 +1,5 @@
 import init, { Editor } from "./wasm/canvas_wasm.js";
+import { createStylePanel } from "./stylePanel";
 import "./styles.css";
 
 declare global {
@@ -39,7 +40,9 @@ async function boot(): Promise<void> {
   const scene = document.getElementById("scene") as HTMLCanvasElement;
   const overlay = document.getElementById("overlay") as HTMLCanvasElement;
   const toolbar = document.getElementById("toolbar") as HTMLElement;
+  const stylePanelHost = document.getElementById("style-panel") as HTMLElement;
   const editor = new Editor(scene, overlay);
+  const stylePanel = createStylePanel(stylePanelHost, editor);
 
   const updateCursor = (): void => {
     scene.style.cursor = editor.cursor();
@@ -96,6 +99,7 @@ async function boot(): Promise<void> {
     }
     undoButton.disabled = !editor.can_undo();
     redoButton.disabled = !editor.can_redo();
+    stylePanel.refresh();
   };
 
   // -- text editor overlay ------------------------------------------------
@@ -105,6 +109,7 @@ async function boot(): Promise<void> {
 
   const closeTextEditor = (): void => {
     textEditor.classList.remove("visible");
+    textEditor.blur();
     editingId = null;
   };
 

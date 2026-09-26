@@ -16,6 +16,8 @@ declare global {
       undo(): void;
       redo(): void;
       selection_bounds(): Float64Array | undefined;
+      current_style(): string;
+      update_style(patch: string): void;
     };
   }
 }

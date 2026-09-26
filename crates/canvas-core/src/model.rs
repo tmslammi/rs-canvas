@@ -92,6 +92,53 @@ impl Default for Style {
     }
 }
 
+/// A partial style update coming from the style panel.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct StylePatch {
+    pub stroke_color: Option<String>,
+    pub fill_color: Option<String>,
+    pub fill_style: Option<FillPattern>,
+    pub stroke_width: Option<f64>,
+    pub roughness: Option<u8>,
+    pub dash: Option<StrokeDash>,
+    pub opacity: Option<f64>,
+    pub font_size: Option<f64>,
+}
+
+impl StylePatch {
+    pub fn apply_to(&self, style: &mut Style) {
+        if let Some(value) = &self.stroke_color {
+            style.stroke_color = value.clone();
+        }
+        if let Some(value) = &self.fill_color {
+            style.fill_color = value.clone();
+        }
+        if let Some(value) = self.fill_style {
+            style.fill_style = value;
+        }
+        if let Some(value) = self.stroke_width {
+            style.stroke_width = value;
+        }
+        if let Some(value) = self.roughness {
+            style.roughness = value.min(2);
+        }
+        if let Some(value) = self.dash {
+            style.dash = value;
+        }
+        if let Some(value) = self.opacity {
+            style.opacity = value.clamp(0.05, 1.0);
+        }
+        if let Some(value) = self.font_size {
+            style.font_size = value.clamp(8.0, 96.0);
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self == &StylePatch::default()
+    }
+}
+
 /// One end of a connector: a world point, optionally bound to an element.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
