@@ -62,6 +62,11 @@ impl NavigationState {
         }
     }
 
+    /// Start a pan gesture explicitly (hand tool).
+    pub fn start_pan(&mut self, screen: Point) {
+        self.navigation = Navigation::Panning { last: screen };
+    }
+
     pub fn pointer_up(&mut self, button: u8) -> bool {
         if self.is_panning() && (button == 0 || button == 1) {
             self.navigation = Navigation::Idle;

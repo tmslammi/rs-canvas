@@ -8,11 +8,28 @@ declare global {
   }
 }
 
+interface ToolbarTool {
+  name: string;
+  label: string;
+  glyph: string;
+  shortcut: string;
+}
+
+const TOOLS: ToolbarTool[] = [
+  { name: "select", label: "Select", glyph: "↖", shortcut: "V" },
+  { name: "hand", label: "Hand", glyph: "✋", shortcut: "H" },
+  { name: "rectangle", label: "Rectangle", glyph: "▭", shortcut: "R" },
+  { name: "diamond", label: "Diamond", glyph: "◇", shortcut: "D" },
+  { name: "ellipse", label: "Ellipse", glyph: "◯", shortcut: "O" },
+];
+
 async function boot(): Promise<void> {
   await init();
 
   const scene = document.getElementById("scene") as HTMLCanvasElement;
-  const editor = new Editor(scene);
+  const overlay = document.getElementById("overlay") as HTMLCanvasElement;
+  const toolbar = document.getElementById("toolbar") as HTMLElement;
+  const editor = new Editor(scene, overlay);
 
   const updateCursor = (): void => {
     scene.style.cursor = editor.cursor();
@@ -22,6 +39,63 @@ async function boot(): Promise<void> {
     editor.resize();
     editor.render();
   };
+
+  // -- toolbar ------------------------------------------------------------
+
+  const toolButtons = new Map<string, HTMLButtonElement>();
+  for (const tool of TOOLS) {
+    const button = document.createElement("button");
+    button.textContent = tool.glyph;
+    button.title = `${tool.label} — ${tool.shortcut}`;
+    button.addEventListener("click", () => {
+      editor.set_tool(tool.name);
+      refreshToolbar();
+      updateCursor();
+    });
+    toolbar.appendChild(button);
+    toolButtons.set(tool.name, button);
+  }
+
+  const divider = document.createElement("div");
+  divider.className = "divider";
+  toolbar.appendChild(divider);
+
+  const undoButton = document.createElement("button");
+  undoButton.textContent = "↶";
+  undoButton.title = "Undo — ⌘Z";
+  undoButton.addEventListener("click", () => {
+    editor.undo();
+    refreshToolbar();
+  });
+
+  const redoButton = document.createElement("button");
+  redoButton.textContent = "↷";
+  redoButton.title = "Redo — ⇧⌘Z";
+  redoButton.addEventListener("click", () => {
+    editor.redo();
+    refreshToolbar();
+  });
+
+  toolbar.appendChild(undoButton);
+  toolbar.appendChild(redoButton);
+
+  const refreshToolbar = (): void => {
+    const active = editor.active_tool();
+    for (const [name, button] of toolButtons) {
+      button.classList.toggle("active", name === active);
+    }
+    undoButton.disabled = !editor.can_undo();
+    redoButton.disabled = !editor.can_redo();
+  };
+
+  // -- pointer input ------------------------------------------------------
+
+  const modifiers = (event: PointerEvent | KeyboardEvent | WheelEvent) => ({
+    shift: event.shiftKey,
+    alt: event.altKey,
+    ctrl: event.ctrlKey,
+    meta: event.metaKey,
+  });
 
   const activePointers = new Map<number, { x: number; y: number }>();
   let pinchDistance = 0;
@@ -35,7 +109,8 @@ async function boot(): Promise<void> {
     } catch {
       // pointer capture is best-effort
     }
-    editor.pointer_down(event.offsetX, event.offsetY, event.button);
+    editor.pointer_down(event.offsetX, event.offsetY, event.button, modifiers(event));
+    refreshToolbar();
     updateCursor();
   });
 
@@ -53,7 +128,7 @@ async function boot(): Promise<void> {
       pinchDistance = distance;
       return;
     }
-    editor.pointer_move(event.offsetX, event.offsetY);
+    editor.pointer_move(event.offsetX, event.offsetY, modifiers(event));
     updateCursor();
   });
 
@@ -62,7 +137,8 @@ async function boot(): Promise<void> {
     if (activePointers.size < 2) {
       pinchDistance = 0;
     }
-    editor.pointer_up(event.offsetX, event.offsetY, event.button);
+    editor.pointer_up(event.offsetX, event.offsetY, event.button, modifiers(event));
+    refreshToolbar();
     updateCursor();
   };
   scene.addEventListener("pointerup", endPointer);
@@ -86,13 +162,26 @@ async function boot(): Promise<void> {
 
   scene.addEventListener("contextmenu", (event) => event.preventDefault());
 
+  // -- keyboard -----------------------------------------------------------
+
   window.addEventListener("keydown", (event) => {
-    if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) {
+    if (
+      event.target instanceof HTMLInputElement ||
+      event.target instanceof HTMLTextAreaElement
+    ) {
       return;
     }
-    if (editor.key_down(event.key, event.shiftKey)) {
+    const handled = editor.key_down(
+      event.key,
+      event.shiftKey,
+      event.altKey,
+      event.ctrlKey,
+      event.metaKey,
+    );
+    if (handled) {
       event.preventDefault();
     }
+    refreshToolbar();
     updateCursor();
   });
 
@@ -109,6 +198,7 @@ async function boot(): Promise<void> {
   window.addEventListener("resize", redraw);
 
   redraw();
+  refreshToolbar();
 
   window.__rsEditor = editor;
   window.__rsReady = true;

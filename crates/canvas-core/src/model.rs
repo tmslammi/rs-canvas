@@ -222,6 +222,14 @@ impl Element {
         self.updated = now_ms;
     }
 
+    /// Compare everything except merge metadata (version, nonce, timestamp).
+    pub fn content_eq(&self, other: &Element) -> bool {
+        self.is_deleted == other.is_deleted
+            && self.frame_id == other.frame_id
+            && self.index == other.index
+            && self.kind == other.kind
+    }
+
     /// The world-space bounding box this element occupies, ignoring styling.
     pub fn bounds(&self) -> Rect {
         match &self.kind {

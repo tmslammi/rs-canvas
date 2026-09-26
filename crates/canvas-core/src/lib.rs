@@ -7,8 +7,10 @@ pub mod camera;
 pub mod delta;
 pub mod demo;
 pub mod display;
+pub mod editor;
 pub mod geometry;
 pub mod history;
+pub mod hit;
 pub mod id;
 pub mod index;
 pub mod merge;
@@ -17,13 +19,16 @@ pub mod nav;
 pub mod rough;
 pub mod scene;
 pub mod serialization;
+pub mod tool;
 
 pub use camera::Camera;
 pub use delta::{Delta, EditError};
 pub use demo::demo_document;
 pub use display::{Dash, DisplayList, DrawOp, FillStyle, PathOp, Renderer, StrokeStyle};
+pub use editor::{translate_element, Editor, Effects, Modifiers};
 pub use geometry::{Affine, Point, Rect};
 pub use history::{History, Transaction};
+pub use hit::{elements_in_rect, hit_test};
 pub use merge::reconcile;
 pub use model::{
     Binding, Document, Element, ElementId, ElementKind, Endpoint, FillPattern, Routing, ShapeKind,
@@ -31,3 +36,4 @@ pub use model::{
 };
 pub use nav::NavigationState;
 pub use scene::{Scene, SceneLayer};
+pub use tool::Tool;

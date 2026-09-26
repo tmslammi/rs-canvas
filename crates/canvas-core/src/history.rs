@@ -104,6 +104,9 @@ impl Transaction {
             .clone();
         let mut after = before.clone();
         mutate(&mut after);
+        if after.content_eq(&before) {
+            return Ok(());
+        }
         after.touch(now_ms);
         self.push_applied(doc, Delta::Update { before, after })
     }
@@ -238,6 +241,21 @@ mod tests {
 
         assert!(history.undo(&mut doc).unwrap());
         assert_eq!(doc.element(&id), Some(&before));
+    }
+
+    #[test]
+    fn noop_updates_are_not_recorded() {
+        let mut doc = Document::new();
+        let mut history = History::new();
+        let id = doc.add(shape(0.0, 0.0), 1);
+        let before = doc.element(&id).unwrap().clone();
+
+        let mut tx = Transaction::begin();
+        tx.update(&mut doc, &id, 2, |_| {}).unwrap();
+        assert!(tx.is_empty(), "a no-op update records nothing");
+        assert_eq!(doc.element(&id), Some(&before), "metadata did not change");
+        tx.commit(&mut history);
+        assert!(!history.can_undo());
     }
 
     #[test]

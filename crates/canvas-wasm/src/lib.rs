@@ -1,16 +1,22 @@
 //! canvas-wasm: the thin wasm-bindgen façade over canvas-core.
-
-use std::collections::BTreeSet;
+//!
+//! Owns the two canvases and forwards input into the core Editor; every
+//! input returns Effects that say what to repaint.
 
 use canvas_core::{
-    demo_document, Affine, Camera, Document, DrawOp, ElementId, FillStyle, History,
-    NavigationState, PathOp, Point, Renderer, Scene, StrokeStyle,
+    Affine, Document, DrawOp, Editor as CoreEditor, Effects, FillStyle, Modifiers, Point, Rect,
+    Renderer, StrokeStyle, Tool,
 };
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement};
 
 const BACKGROUND: &str = "#f8f7f4";
+const ACCENT: &str = "#1971c2";
+
+fn now_ms() -> u64 {
+    js_sys::Date::now() as u64
+}
 
 /// A Canvas2D implementation of the core's renderer seam.
 struct Canvas2dRenderer {
@@ -70,7 +76,7 @@ impl Renderer for Canvas2dRenderer {
         self.ctx.restore();
     }
 
-    fn clear_rect(&mut self, rect: canvas_core::Rect, color: &str) {
+    fn clear_rect(&mut self, rect: Rect, color: &str) {
         self.ctx.save();
         let _ = self.ctx.set_transform(1.0, 0.0, 0.0, 1.0, 0.0, 0.0);
         self.ctx.set_fill_style_str(color);
@@ -79,7 +85,7 @@ impl Renderer for Canvas2dRenderer {
         self.ctx.restore();
     }
 
-    fn draw_path(&mut self, op: &PathOp) {
+    fn draw_path(&mut self, op: &canvas_core::PathOp) {
         if op.points.len() < 2 {
             return;
         }
@@ -108,7 +114,7 @@ impl Renderer for Canvas2dRenderer {
         }
     }
 
-    fn draw_line_batch(&mut self, segments: &[[canvas_core::Point; 2]], stroke: &StrokeStyle) {
+    fn draw_line_batch(&mut self, segments: &[[Point; 2]], stroke: &StrokeStyle) {
         if segments.is_empty() {
             return;
         }
@@ -126,198 +132,266 @@ impl Renderer for Canvas2dRenderer {
 /// The editor handle the shell talks to.
 #[wasm_bindgen]
 pub struct Editor {
-    canvas: HtmlCanvasElement,
+    scene_canvas: HtmlCanvasElement,
+    overlay_canvas: HtmlCanvasElement,
     renderer: Canvas2dRenderer,
-    camera: Camera,
+    overlay: CanvasRenderingContext2d,
     dpr: f64,
-    doc: Document,
-    scene: Scene,
-    nav: NavigationState,
-    /// Undo/redo stacks; wired to the UI in the interaction ticket.
-    #[allow(dead_code)]
-    history: History,
+    core: CoreEditor,
 }
 
 #[wasm_bindgen]
 impl Editor {
     #[wasm_bindgen(constructor)]
-    pub fn new(canvas: HtmlCanvasElement) -> Result<Editor, JsValue> {
+    pub fn new(
+        scene_canvas: HtmlCanvasElement,
+        overlay_canvas: HtmlCanvasElement,
+    ) -> Result<Editor, JsValue> {
         console_error_panic_hook::set_once();
-        let ctx = canvas
+        let ctx = scene_canvas
             .get_context("2d")?
-            .ok_or_else(|| JsValue::from_str("canvas has no 2d context"))?
+            .ok_or_else(|| JsValue::from_str("scene canvas has no 2d context"))?
+            .dyn_into::<CanvasRenderingContext2d>()?;
+        let overlay = overlay_canvas
+            .get_context("2d")?
+            .ok_or_else(|| JsValue::from_str("overlay canvas has no 2d context"))?
             .dyn_into::<CanvasRenderingContext2d>()?;
         let dpr = web_sys::window()
             .map(|w| w.device_pixel_ratio())
             .unwrap_or(1.0);
-        let doc = demo_document();
-        let mut scene = Scene::new();
-        scene.rebuild_all(&doc);
+        let core = CoreEditor::new(canvas_core::demo_document());
         Ok(Editor {
-            canvas,
+            scene_canvas,
+            overlay_canvas,
             renderer: Canvas2dRenderer { ctx },
-            camera: Camera::default(),
+            overlay,
             dpr,
-            doc,
-            scene,
-            nav: NavigationState::new(),
-            history: History::new(),
+            core,
         })
     }
 
-    /// Match the backing store to the canvas's layout size.
+    /// Match both backing stores to their layout sizes.
     pub fn resize(&self) {
-        let w = self.canvas.client_width() as f64;
-        let h = self.canvas.client_height() as f64;
-        self.canvas
-            .set_width((w * self.dpr).round().max(1.0) as u32);
-        self.canvas
-            .set_height((h * self.dpr).round().max(1.0) as u32);
+        for canvas in [&self.scene_canvas, &self.overlay_canvas] {
+            let w = canvas.client_width() as f64;
+            let h = canvas.client_height() as f64;
+            canvas.set_width((w * self.dpr).round().max(1.0) as u32);
+            canvas.set_height((h * self.dpr).round().max(1.0) as u32);
+        }
     }
 
-    /// The camera's world scroll offset.
+    /// Replace the drawing with an empty one.
+    pub fn new_document(&mut self) {
+        self.core = CoreEditor::new(Document::new());
+        self.render();
+    }
+
     pub fn scroll(&self) -> Vec<f64> {
-        vec![self.camera.scroll.x, self.camera.scroll.y]
+        vec![self.core.camera.scroll.x, self.core.camera.scroll.y]
     }
 
     pub fn zoom(&self) -> f64 {
-        self.camera.zoom
+        self.core.camera.zoom
     }
 
     pub fn element_count(&self) -> usize {
-        self.doc.ordered_live().len()
+        self.core.doc.ordered_live().len()
+    }
+
+    pub fn active_tool(&self) -> String {
+        self.core.tool.name().into()
+    }
+
+    pub fn can_undo(&self) -> bool {
+        self.core.history.can_undo()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        self.core.history.can_redo()
+    }
+
+    /// Selection bounds in world space, or undefined.
+    pub fn selection_bounds(&self) -> Option<Vec<f64>> {
+        self.core
+            .selection_bounds()
+            .map(|r| vec![r.x, r.y, r.w, r.h])
+    }
+
+    pub fn set_tool(&mut self, name: &str) {
+        if let Some(tool) = Tool::from_name(name) {
+            self.core.tool = tool;
+            self.draw_overlay();
+        }
+    }
+
+    pub fn undo(&mut self) {
+        let effects = self.core.undo();
+        self.apply(effects);
+    }
+
+    pub fn redo(&mut self) {
+        let effects = self.core.redo();
+        self.apply(effects);
     }
 
     /// Draw everything visible for this frame.
     pub fn render(&mut self) {
-        let viewport = self.camera.viewport(self.css_width(), self.css_height());
+        let viewport = self.core.camera.viewport(
+            self.scene_canvas.client_width() as f64,
+            self.scene_canvas.client_height() as f64,
+        );
         self.renderer.begin_frame();
         self.renderer.clear(BACKGROUND);
         self.renderer
-            .set_transform(self.camera.transform().then(Affine::scale(self.dpr)));
-        for layer in self.scene.visible(viewport) {
+            .set_transform(self.core.camera.transform().then(Affine::scale(self.dpr)));
+        for layer in self.core.scene.visible(viewport) {
             self.renderer.draw_ops(&layer.ops);
         }
         self.renderer.end_frame();
+        self.draw_overlay();
     }
 
-    /// Rebuild the changed elements' layers and repaint only their dirty
-    /// rectangles.
-    pub fn apply_changes(&mut self, changed: Vec<String>) {
-        let changed: BTreeSet<ElementId> = changed.into_iter().collect();
-        let dirty = self.scene.update(&self.doc, &changed);
-        self.paint_dirty(&dirty);
+    // -- input -------------------------------------------------------------
+
+    pub fn pointer_down(&mut self, x: f64, y: f64, button: u8, mods: JsValue) {
+        let mods = parse_modifiers(&mods);
+        let effects = self
+            .core
+            .pointer_down(Point::new(x, y), button, mods, now_ms());
+        self.apply(effects);
+    }
+
+    pub fn pointer_move(&mut self, x: f64, y: f64, mods: JsValue) {
+        let mods = parse_modifiers(&mods);
+        let effects = self.core.pointer_move(Point::new(x, y), mods, now_ms());
+        self.apply(effects);
+    }
+
+    pub fn pointer_up(&mut self, x: f64, y: f64, button: u8, mods: JsValue) {
+        let mods = parse_modifiers(&mods);
+        let effects = self.core.pointer_up(Point::new(x, y), mods, now_ms());
+        let _ = button;
+        self.apply(effects);
+    }
+
+    pub fn wheel(&mut self, x: f64, y: f64, dx: f64, dy: f64, ctrl: bool) {
+        self.core
+            .nav
+            .wheel(&mut self.core.camera, Point::new(x, y), dx, dy, ctrl);
+        self.render();
+    }
+
+    pub fn zoom_at(&mut self, x: f64, y: f64, factor: f64) {
+        self.core.camera.zoom_at(Point::new(x, y), factor);
+        self.render();
+    }
+
+    /// Returns true when the shell should preventDefault.
+    pub fn key_down(&mut self, key: &str, shift: bool, alt: bool, ctrl: bool, meta: bool) -> bool {
+        let mods = Modifiers {
+            shift,
+            alt,
+            ctrl,
+            meta,
+        };
+        let handled = matches!(key, " " | "Escape" | "Delete" | "Backspace")
+            || mods.command()
+            || Tool::from_shortcut(key).is_some();
+        if matches!(key, " " | "Escape" | "Delete" | "Backspace") || mods.command() {
+            let effects = self.core.key_down(key, mods, now_ms());
+            self.apply(effects);
+        } else if let Some(tool) = Tool::from_shortcut(key) {
+            self.core.tool = tool;
+            self.draw_overlay();
+        } else if key == "1" && shift {
+            self.zoom_to_fit();
+        } else if key == "0" && shift {
+            self.reset_zoom();
+        } else {
+            let effects = self.core.key_down(key, mods, now_ms());
+            self.apply(effects);
+        }
+        handled
+    }
+
+    pub fn key_up(&mut self, key: &str) {
+        let effects = self.core.key_up(key);
+        self.apply(effects);
+    }
+
+    pub fn blur(&mut self) {
+        self.core.nav.set_space(false);
+        self.core.nav.cancel();
+        self.draw_overlay();
+    }
+
+    pub fn cursor(&self) -> String {
+        if self.core.nav.is_panning() {
+            return "grabbing".into();
+        }
+        if self.core.nav.space_held() || self.core.tool == Tool::Hand {
+            return "grab".into();
+        }
+        match self.core.tool {
+            Tool::Select => "default".into(),
+            Tool::Text => "text".into(),
+            _ => "crosshair".into(),
+        }
+    }
+
+    pub fn zoom_to_fit(&mut self) {
+        if let Some(bounds) = self.core.scene.bounds() {
+            self.core.camera.zoom_to_fit(
+                bounds,
+                (
+                    self.scene_canvas.client_width() as f64,
+                    self.scene_canvas.client_height() as f64,
+                ),
+                48.0,
+            );
+        } else {
+            self.core.camera = canvas_core::Camera::default();
+        }
+        self.render();
+    }
+
+    pub fn reset_zoom(&mut self) {
+        let center = Point::new(
+            self.scene_canvas.client_width() as f64 / 2.0,
+            self.scene_canvas.client_height() as f64 / 2.0,
+        );
+        self.core.camera.set_zoom_at(center, 1.0);
+        self.render();
     }
 
     /// Screen point -> world point, through the current camera.
     pub fn screen_to_world(&self, x: f64, y: f64) -> Vec<f64> {
-        let p = self.camera.screen_to_world(canvas_core::Point::new(x, y));
+        let p = self.core.camera.screen_to_world(Point::new(x, y));
         vec![p.x, p.y]
-    }
-
-    /// Start a pointer interaction. Button: 0 left, 1 middle, 2 right.
-    pub fn pointer_down(&mut self, x: f64, y: f64, button: u8) {
-        self.nav.pointer_down(Point::new(x, y), button);
-    }
-
-    pub fn pointer_move(&mut self, x: f64, y: f64) {
-        if self.nav.pointer_move(&mut self.camera, Point::new(x, y)) {
-            self.render();
-        }
-    }
-
-    pub fn pointer_up(&mut self, x: f64, y: f64, button: u8) {
-        let _ = (x, y);
-        self.nav.pointer_up(button);
-    }
-
-    /// Wheel/trackpad event. Ctrl means pinch-zoom.
-    pub fn wheel(&mut self, x: f64, y: f64, dx: f64, dy: f64, ctrl: bool) {
-        self.nav
-            .wheel(&mut self.camera, Point::new(x, y), dx, dy, ctrl);
-        self.render();
-    }
-
-    /// Pinch zoom from a shell-level touch gesture.
-    pub fn zoom_at(&mut self, x: f64, y: f64, factor: f64) {
-        self.camera.zoom_at(Point::new(x, y), factor);
-        self.render();
-    }
-
-    /// Keyboard input. Returns true when the key was handled.
-    pub fn key_down(&mut self, key: &str, shift: bool) -> bool {
-        match key {
-            " " => {
-                self.nav.set_space(true);
-                true
-            }
-            "1" if shift => {
-                self.zoom_to_fit();
-                true
-            }
-            "0" if shift => {
-                self.reset_zoom();
-                true
-            }
-            _ => false,
-        }
-    }
-
-    pub fn key_up(&mut self, key: &str) {
-        if key == " " {
-            self.nav.set_space(false);
-        }
-    }
-
-    /// Reset held state when the window loses focus.
-    pub fn blur(&mut self) {
-        self.nav.set_space(false);
-        self.nav.cancel();
-    }
-
-    /// The CSS cursor the shell should apply.
-    pub fn cursor(&self) -> String {
-        if self.nav.is_panning() {
-            "grabbing".into()
-        } else if self.nav.space_held() {
-            "grab".into()
-        } else {
-            "default".into()
-        }
-    }
-
-    /// Fit the drawing into the viewport (Shift+1).
-    pub fn zoom_to_fit(&mut self) {
-        if let Some(bounds) = self.scene.bounds() {
-            self.camera
-                .zoom_to_fit(bounds, (self.css_width(), self.css_height()), 48.0);
-        } else {
-            self.reset_zoom();
-            return;
-        }
-        self.render();
-    }
-
-    /// Snap back to 100% around the viewport centre (Shift+0).
-    pub fn reset_zoom(&mut self) {
-        let center = Point::new(self.css_width() / 2.0, self.css_height() / 2.0);
-        self.camera.set_zoom_at(center, 1.0);
-        self.render();
     }
 }
 
 impl Editor {
-    fn css_width(&self) -> f64 {
-        self.canvas.client_width() as f64
+    fn apply(&mut self, effects: Effects) {
+        if effects.repaint_all {
+            self.render();
+            return;
+        }
+        if !effects.changed.is_empty() {
+            let dirty = self.core.scene.update(&self.core.doc, &effects.changed);
+            self.paint_dirty(&dirty);
+        }
+        if effects.overlay_changed || !effects.changed.is_empty() {
+            self.draw_overlay();
+        }
     }
 
-    fn css_height(&self) -> f64 {
-        self.canvas.client_height() as f64
-    }
-
-    fn paint_dirty(&mut self, dirty: &[canvas_core::Rect]) {
-        let viewport = self.camera.viewport(self.css_width(), self.css_height());
-        let visible_dirty: Vec<canvas_core::Rect> = dirty
+    fn paint_dirty(&mut self, dirty: &[Rect]) {
+        let viewport = self.core.camera.viewport(
+            self.scene_canvas.client_width() as f64,
+            self.scene_canvas.client_height() as f64,
+        );
+        let visible_dirty: Vec<Rect> = dirty
             .iter()
             .filter(|r| r.intersects(&viewport))
             .copied()
@@ -327,14 +401,13 @@ impl Editor {
         }
         self.renderer.begin_frame();
         for rect in &visible_dirty {
-            let top_left = self
-                .camera
-                .world_to_screen(canvas_core::Point::new(rect.x, rect.y));
+            let top_left = self.core.camera.world_to_screen(Point::new(rect.x, rect.y));
             let bottom_right = self
+                .core
                 .camera
-                .world_to_screen(canvas_core::Point::new(rect.max_x(), rect.max_y()));
-            let screen = canvas_core::Rect::from_points(top_left, bottom_right).expand(1.0);
-            let device = canvas_core::Rect::new(
+                .world_to_screen(Point::new(rect.max_x(), rect.max_y()));
+            let screen = Rect::from_points(top_left, bottom_right).expand(1.0);
+            let device = Rect::new(
                 screen.x * self.dpr,
                 screen.y * self.dpr,
                 screen.w * self.dpr,
@@ -343,8 +416,8 @@ impl Editor {
             self.renderer.clear_rect(device, BACKGROUND);
         }
         self.renderer
-            .set_transform(self.camera.transform().then(Affine::scale(self.dpr)));
-        for layer in self.scene.layers.iter() {
+            .set_transform(self.core.camera.transform().then(Affine::scale(self.dpr)));
+        for layer in self.core.scene.layers.iter() {
             let intersects_dirty = visible_dirty
                 .iter()
                 .any(|rect| layer.bounds.intersects(rect));
@@ -353,5 +426,101 @@ impl Editor {
             }
         }
         self.renderer.end_frame();
+    }
+
+    fn draw_overlay(&mut self) {
+        let (w, h) = (
+            self.overlay_canvas.width() as f64,
+            self.overlay_canvas.height() as f64,
+        );
+        self.overlay.save();
+        let _ = self.overlay.set_transform(1.0, 0.0, 0.0, 1.0, 0.0, 0.0);
+        self.overlay.clear_rect(0.0, 0.0, w, h);
+
+        let camera = self.core.camera;
+        if let Some(rect) = self.core.marquee_rect() {
+            let a = camera.world_to_screen(Point::new(rect.x, rect.y));
+            let b = camera.world_to_screen(Point::new(rect.max_x(), rect.max_y()));
+            let r = Rect::from_points(a, b);
+            self.overlay.set_fill_style_str("rgba(25, 113, 194, 0.08)");
+            self.overlay.set_stroke_style_str(ACCENT);
+            self.overlay.set_line_width(self.dpr);
+            self.overlay.fill_rect(
+                r.x * self.dpr,
+                r.y * self.dpr,
+                r.w * self.dpr,
+                r.h * self.dpr,
+            );
+            self.overlay.stroke_rect(
+                r.x * self.dpr,
+                r.y * self.dpr,
+                r.w * self.dpr,
+                r.h * self.dpr,
+            );
+        }
+
+        if let Some(bounds) = self.core.selection_bounds() {
+            let a = camera.world_to_screen(Point::new(bounds.x, bounds.y));
+            let b = camera.world_to_screen(Point::new(bounds.max_x(), bounds.max_y()));
+            let r = Rect::from_points(a, b).expand(1.0);
+            let device = |r: Rect| {
+                Rect::new(
+                    r.x * self.dpr,
+                    r.y * self.dpr,
+                    r.w * self.dpr,
+                    r.h * self.dpr,
+                )
+            };
+            let r = device(r);
+            self.overlay.set_stroke_style_str(ACCENT);
+            self.overlay.set_line_width(self.dpr);
+            let dash = js_sys::Array::new();
+            dash.push(&JsValue::from_f64(5.0 * self.dpr));
+            dash.push(&JsValue::from_f64(5.0 * self.dpr));
+            let _ = self.overlay.set_line_dash(dash.as_ref());
+            self.overlay.stroke_rect(r.x, r.y, r.w, r.h);
+            let _ = self.overlay.set_line_dash(&js_sys::Array::new());
+
+            let handle = 4.0 * self.dpr;
+            let points = [
+                (r.x, r.y),
+                (r.x + r.w / 2.0, r.y),
+                (r.x + r.w, r.y),
+                (r.x + r.w, r.y + r.h / 2.0),
+                (r.x + r.w, r.y + r.h),
+                (r.x + r.w / 2.0, r.y + r.h),
+                (r.x, r.y + r.h),
+                (r.x, r.y + r.h / 2.0),
+            ];
+            self.overlay.set_fill_style_str("#ffffff");
+            for (x, y) in points {
+                self.overlay
+                    .fill_rect(x - handle, y - handle, handle * 2.0, handle * 2.0);
+                self.overlay
+                    .stroke_rect(x - handle, y - handle, handle * 2.0, handle * 2.0);
+            }
+        }
+        self.overlay.restore();
+    }
+}
+
+fn parse_modifiers(value: &JsValue) -> Modifiers {
+    Modifiers {
+        shift: js_sys::Reflect::get(value, &"shift".into())
+            .ok()
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        alt: js_sys::Reflect::get(value, &"alt".into())
+            .ok()
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        ctrl: js_sys::Reflect::get(value, &"ctrl".into())
+            .ok()
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        meta: js_sys::Reflect::get(value, &"meta".into())
+            .ok()
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
     }
 }
