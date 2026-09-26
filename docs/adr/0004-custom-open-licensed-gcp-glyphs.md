@@ -1,0 +1,3 @@
+# Custom open-licensed GCP glyphs instead of official icons
+
+The GCP shape library consists of custom, MIT-licensed glyphs drawn in the hand-drawn style — roughly two dozen curated services plus generic architecture shapes — carrying product names nominatively. Google's official icon packs ship with no open licence: the grant covers accurately referencing Google technology in diagrams, not redistribution of the asset files or modification such as recoloring, so vendoring them into this MIT-licensed repo would be redistribution without a grant. If bundling official icons ever becomes important, the path is written permission via Google's Partner Marketing Hub.
