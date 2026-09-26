@@ -1,4 +1,5 @@
-import init, { Editor, load_saved_json } from "./wasm/canvas_wasm.js";
+import init, { Editor, glyph_catalog, load_saved_json } from "./wasm/canvas_wasm.js";
+import { createLibraryPanel } from "./libraryPanel";
 import { createStylePanel } from "./stylePanel";
 import "./styles.css";
 
@@ -42,8 +43,19 @@ async function boot(): Promise<void> {
   const overlay = document.getElementById("overlay") as HTMLCanvasElement;
   const toolbar = document.getElementById("toolbar") as HTMLElement;
   const stylePanelHost = document.getElementById("style-panel") as HTMLElement;
+  const libraryPanelHost = document.getElementById("library-panel") as HTMLElement;
   const editor = new Editor(scene, overlay);
   const stylePanel = createStylePanel(stylePanelHost, editor);
+  createLibraryPanel(libraryPanelHost, editor, glyph_catalog());
+
+  const libraryToggle = document.createElement("button");
+  libraryToggle.textContent = "▦";
+  libraryToggle.title = "Shapes library";
+  libraryToggle.addEventListener("click", () => {
+    libraryPanelHost.classList.toggle("visible");
+    libraryToggle.classList.toggle("active", libraryPanelHost.classList.contains("visible"));
+  });
+  toolbar.appendChild(libraryToggle);
 
   const toast = document.createElement("div");
   toast.id = "toast";

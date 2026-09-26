@@ -230,13 +230,20 @@ impl Editor {
     }
 
     /// Match both backing stores to their layout sizes.
-    pub fn resize(&self) {
+    pub fn resize(&mut self) {
         for canvas in [&self.scene_canvas, &self.overlay_canvas] {
             let w = canvas.client_width() as f64;
             let h = canvas.client_height() as f64;
             canvas.set_width((w * self.dpr).round().max(1.0) as u32);
             canvas.set_height((h * self.dpr).round().max(1.0) as u32);
         }
+        self.core.set_viewport(self.css_width(), self.css_height());
+    }
+
+    /// Insert a shape-library glyph at the viewport centre.
+    pub fn insert_glyph(&mut self, glyph_id: &str) {
+        let effects = self.core.insert_glyph(glyph_id, now_ms());
+        self.apply(effects);
     }
 
     /// Replace the drawing with an empty one.
@@ -247,6 +254,7 @@ impl Editor {
             cache: Default::default(),
         };
         self.core.set_measurer(Box::new(measurer));
+        self.core.set_viewport(self.css_width(), self.css_height());
         self.render();
         self.schedule_save();
     }
@@ -557,6 +565,14 @@ impl Editor {
 }
 
 impl Editor {
+    fn css_width(&self) -> f64 {
+        self.scene_canvas.client_width() as f64
+    }
+
+    fn css_height(&self) -> f64 {
+        self.scene_canvas.client_height() as f64
+    }
+
     fn apply(&mut self, effects: Effects) {
         let actions = effects.actions.clone();
         let durable =
@@ -748,6 +764,12 @@ impl Editor {
 #[wasm_bindgen]
 pub async fn load_saved_json() -> Option<String> {
     storage::load_document().await.ok().flatten()
+}
+
+/// The shape-library catalog (JSON) for the panel.
+#[wasm_bindgen]
+pub fn glyph_catalog() -> String {
+    serde_json::to_string(&canvas_core::glyph_catalog()).unwrap_or_else(|_| "[]".into())
 }
 
 fn parse_modifiers(value: &JsValue) -> Modifiers {

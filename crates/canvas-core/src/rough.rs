@@ -8,6 +8,7 @@
 use crate::connector;
 use crate::display::{Dash, DrawOp, FillStyle, PathOp, StrokeStyle, TextOp};
 use crate::geometry::{Point, Rect};
+use crate::glyphs;
 use crate::model::{Document, Element, ElementKind, FillPattern, ShapeKind, Style, TextAlign};
 use crate::text::{layout_text, TextMeasurer};
 
@@ -414,7 +415,24 @@ pub fn build_element_ops(
             ops
         }
         // Glyph rendering arrives with the shape library ticket.
-        ElementKind::Glyph { .. } => Vec::new(),
+        ElementKind::Glyph {
+            glyph, rect, style, ..
+        } => {
+            let Some(definition) = glyphs::lookup(glyph) else {
+                return Vec::new();
+            };
+            let mut ops = Vec::new();
+            for (index, shape) in definition.shapes.iter().enumerate() {
+                let (points, closed) = glyphs::shape_points(shape, *rect);
+                ops.extend(outline_ops(
+                    &points,
+                    style,
+                    seed ^ (index as u64) << 8,
+                    closed,
+                ));
+            }
+            ops
+        }
         ElementKind::Text {
             rect,
             text,

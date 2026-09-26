@@ -220,6 +220,7 @@ pub struct Editor {
     last_pressure: f64,
     measurer: Box<dyn TextMeasurer>,
     hover_anchors: Option<(ElementId, Vec<Point>)>,
+    viewport_size: (f64, f64),
 }
 
 impl Editor {
@@ -240,9 +241,15 @@ impl Editor {
             last_pressure: 0.5,
             measurer: Box::new(ApproxMeasurer),
             hover_anchors: None,
+            viewport_size: (800.0, 600.0),
         };
         editor.refresh_scene();
         editor
+    }
+
+    /// The shell reports its viewport size (used for insert-at-centre).
+    pub fn set_viewport(&mut self, width: f64, height: f64) {
+        self.viewport_size = (width.max(1.0), height.max(1.0));
     }
 
     /// Whether a gesture is in progress (no committed save point yet).
@@ -1648,6 +1655,83 @@ impl Editor {
             .and_then(|element| element_style(element))
             .cloned()
             .unwrap_or_else(|| self.style.clone())
+    }
+
+    /// Insert a library glyph at the viewport centre with a caption beneath.
+    pub fn insert_glyph(&mut self, glyph: &str, now: u64) -> Effects {
+        let Some(definition) = crate::glyphs::lookup(glyph) else {
+            return Effects::default();
+        };
+        if self.interaction != Interaction::Idle {
+            return Effects::default();
+        }
+        let center = self.camera.screen_to_world(Point::new(
+            self.viewport_size.0 / 2.0,
+            self.viewport_size.1 / 2.0,
+        ));
+        let size = 96.0;
+        let rect = Rect::new(center.x - size / 2.0, center.y - size / 2.0, size, size);
+        let mut tx = Transaction::begin();
+
+        let glyph_element = Element::new(
+            ElementKind::Glyph {
+                glyph: glyph.to_string(),
+                rect,
+                style: self.style.clone(),
+                caption_id: None,
+            },
+            self.next_index(),
+            now,
+        );
+        let glyph_id = glyph_element.id.clone();
+        if let Err(err) = tx.add(&mut self.doc, glyph_element) {
+            debug_assert!(false, "glyph insert failed: {err}");
+        }
+
+        let wrap = rect.w * 2.0;
+        let layout = layout_text(
+            definition.name,
+            self.style.font_size,
+            Some(wrap),
+            self.measurer.as_ref(),
+        );
+        let caption_rect = Rect::new(
+            center.x - wrap / 2.0,
+            rect.max_y() + 4.0,
+            wrap,
+            layout.height,
+        );
+        let caption = Element::new(
+            ElementKind::Text {
+                rect: caption_rect,
+                text: definition.name.to_string(),
+                align: TextAlign::Center,
+                fixed_width: true,
+                container_id: Some(glyph_id.clone()),
+                style: self.style.clone(),
+            },
+            self.next_index(),
+            now,
+        );
+        let caption_id = caption.id.clone();
+        if let Err(err) = tx.add(&mut self.doc, caption) {
+            debug_assert!(false, "caption insert failed: {err}");
+        }
+        let link = caption_id.clone();
+        if let Err(err) = tx.update(&mut self.doc, &glyph_id, now, |element| {
+            if let ElementKind::Glyph { caption_id, .. } = &mut element.kind {
+                *caption_id = Some(link);
+            }
+        }) {
+            debug_assert!(false, "caption link failed: {err}");
+        }
+        tx.commit(&mut self.history);
+        self.selection = [glyph_id.clone()].into_iter().collect();
+        Effects {
+            changed: [glyph_id, caption_id].into_iter().collect(),
+            overlay_changed: true,
+            ..Effects::default()
+        }
     }
 
     fn begin_erase(&mut self, world: Point, now: u64) -> Effects {
@@ -3306,5 +3390,92 @@ mod tests {
             ElementKind::Frame { name, .. } => assert_eq!(name, "us-central1"),
             other => panic!("expected frame, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn inserting_a_glyph_creates_it_with_a_linked_caption() {
+        let mut e = editor();
+        e.set_viewport(800.0, 600.0);
+        let effects = e.insert_glyph("cloud_run", 1);
+        assert_eq!(e.doc.ordered_live().len(), 2, "glyph + caption");
+        assert_eq!(effects.changed.len(), 2);
+
+        let glyph = e
+            .doc
+            .ordered_live()
+            .into_iter()
+            .find(|element| matches!(element.kind, ElementKind::Glyph { .. }))
+            .expect("glyph")
+            .clone();
+        let caption = e
+            .doc
+            .ordered_live()
+            .into_iter()
+            .find(|element| element.is_text())
+            .expect("caption")
+            .clone();
+
+        match &glyph.kind {
+            ElementKind::Glyph {
+                glyph, caption_id, ..
+            } => {
+                assert_eq!(glyph, "cloud_run");
+                assert_eq!(caption_id.as_ref(), Some(&caption.id));
+            }
+            other => panic!("expected glyph, got {other:?}"),
+        }
+        match &caption.kind {
+            ElementKind::Text {
+                text,
+                container_id,
+                align,
+                ..
+            } => {
+                assert_eq!(text, "Cloud Run");
+                assert_eq!(container_id.as_ref(), Some(&glyph.id));
+                assert_eq!(*align, TextAlign::Center);
+            }
+            other => panic!("expected text, got {other:?}"),
+        }
+        assert!(
+            caption.bounds().y >= glyph.bounds().max_y(),
+            "caption sits beneath the glyph"
+        );
+
+        // The caption follows the glyph when it moves.
+        let before = caption.bounds();
+        e.select([glyph.id.clone()]);
+        let mods = Modifiers::default();
+        let center = glyph.bounds().center();
+        e.pointer_down(center, 0, mods, 2);
+        e.pointer_move(Point::new(center.x + 60.0, center.y), mods, 3);
+        e.pointer_up(Point::new(center.x + 60.0, center.y), mods, 4);
+        let after = e.doc.element(&caption.id).unwrap().bounds();
+        assert!((after.x - before.x - 60.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn every_library_glyph_renders_ops() {
+        use crate::scene::Scene;
+        use crate::text::ApproxMeasurer;
+        let mut doc = Document::new();
+        for info in crate::glyphs::catalog() {
+            let element = Element::new(
+                ElementKind::Glyph {
+                    glyph: info.id.to_string(),
+                    rect: Rect::new(0.0, 0.0, 96.0, 96.0),
+                    style: Style::default(),
+                    caption_id: None,
+                },
+                "a0".into(),
+                0,
+            );
+            let ops = crate::rough::build_element_ops(&element, &doc, &ApproxMeasurer);
+            assert!(!ops.is_empty(), "{} renders nothing", info.id);
+            doc.insert(element);
+        }
+        let mut scene = Scene::new();
+        scene.rebuild_all(&doc, &ApproxMeasurer);
+        assert_eq!(scene.layers.len(), crate::glyphs::catalog().len());
     }
 }

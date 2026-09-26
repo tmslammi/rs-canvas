@@ -11,6 +11,7 @@ pub mod demo;
 pub mod display;
 pub mod editor;
 pub mod geometry;
+pub mod glyphs;
 pub mod history;
 pub mod hit;
 pub mod id;
@@ -36,6 +37,7 @@ pub use editor::{
     ShellAction,
 };
 pub use geometry::{Affine, Point, Rect};
+pub use glyphs::{catalog as glyph_catalog, lookup as glyph_lookup, GlyphCategory, GlyphInfo};
 pub use history::{History, Transaction};
 pub use hit::{elements_in_rect, hit_test};
 pub use merge::reconcile;
