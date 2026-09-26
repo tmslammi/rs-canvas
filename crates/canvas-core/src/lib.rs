@@ -4,6 +4,7 @@
 //! No browser dependencies; everything here is testable natively.
 
 pub mod camera;
+pub mod connector;
 pub mod delta;
 pub mod demo;
 pub mod display;
@@ -23,6 +24,7 @@ pub mod text;
 pub mod tool;
 
 pub use camera::Camera;
+pub use connector::{anchor_points, nearest_anchor, resolve_endpoint, route, AnchorSide};
 pub use delta::{Delta, EditError};
 pub use demo::demo_document;
 pub use display::{Dash, DisplayList, DrawOp, FillStyle, PathOp, Renderer, StrokeStyle, TextOp};

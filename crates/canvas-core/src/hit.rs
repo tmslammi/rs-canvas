@@ -13,7 +13,7 @@ pub fn hit_test(doc: &Document, point: Point, tolerance: f64) -> Option<ElementI
         if element.is_deleted {
             continue;
         }
-        if hits(element, point, tolerance) {
+        if hits(doc, element, point, tolerance) {
             return Some(id);
         }
     }
@@ -29,7 +29,7 @@ pub fn elements_in_rect(doc: &Document, rect: Rect) -> Vec<ElementId> {
         .collect()
 }
 
-pub fn hits(element: &Element, p: Point, tolerance: f64) -> bool {
+pub fn hits(doc: &Document, element: &Element, p: Point, tolerance: f64) -> bool {
     match &element.kind {
         ElementKind::Shape { shape, rect, .. } => match shape {
             ShapeKind::Rectangle => rect.expand(tolerance).contains(p),
@@ -40,10 +40,14 @@ pub fn hits(element: &Element, p: Point, tolerance: f64) -> bool {
             near_polyline(points, p, tolerance + style.stroke_width / 2.0)
         }
         ElementKind::Arrow {
-            start, end, style, ..
+            start,
+            end,
+            routing,
+            style,
+            ..
         } => {
-            distance_to_segment(p, start.point(), end.point())
-                <= tolerance + style.stroke_width / 2.0
+            let route = crate::connector::route(start, end, *routing, doc);
+            near_polyline(&route, p, tolerance + style.stroke_width / 2.0)
         }
         ElementKind::Text { rect, .. } | ElementKind::Glyph { rect, .. } => {
             rect.expand(tolerance).contains(p)

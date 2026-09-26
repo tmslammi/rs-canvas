@@ -571,6 +571,22 @@ impl Editor {
             );
         }
 
+        let anchors = self.core.hover_anchor_points();
+        if !anchors.is_empty() {
+            self.overlay.set_fill_style_str("#ffffff");
+            self.overlay.set_stroke_style_str(ACCENT);
+            self.overlay.set_line_width(self.dpr * 1.5);
+            for point in anchors {
+                let screen = self.core.camera.world_to_screen(point);
+                let (x, y) = (screen.x * self.dpr, screen.y * self.dpr);
+                let radius = 4.0 * self.dpr;
+                self.overlay.begin_path();
+                let _ = self.overlay.arc(x, y, radius, 0.0, std::f64::consts::TAU);
+                self.overlay.fill();
+                self.overlay.stroke();
+            }
+        }
+
         if let Some(bounds) = self.core.selection_bounds() {
             let a = camera.world_to_screen(Point::new(bounds.x, bounds.y));
             let b = camera.world_to_screen(Point::new(bounds.max_x(), bounds.max_y()));

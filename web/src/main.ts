@@ -24,6 +24,7 @@ const TOOLS: ToolbarTool[] = [
   { name: "ellipse", label: "Ellipse", glyph: "◯", shortcut: "O" },
   { name: "freehand", label: "Draw", glyph: "✎", shortcut: "P" },
   { name: "line", label: "Line", glyph: "╱", shortcut: "L" },
+  { name: "arrow", label: "Arrow", glyph: "→", shortcut: "A" },
   { name: "text", label: "Text", glyph: "T", shortcut: "T" },
 ];
 

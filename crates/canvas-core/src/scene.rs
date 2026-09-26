@@ -74,7 +74,7 @@ impl Scene {
             let existing = self.layers.iter().position(|l| &l.element_id == id);
             match doc.element(id) {
                 Some(element) if !element.is_deleted => {
-                    let ops = build_element_ops(element, measurer);
+                    let ops = build_element_ops(element, doc, measurer);
                     let bounds = element.bounds().expand(margin(element));
                     if let Some(pos) = existing {
                         dirty.push(self.layers[pos].bounds);

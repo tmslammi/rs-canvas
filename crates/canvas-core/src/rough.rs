@@ -5,9 +5,10 @@
 //! sketchy pass at higher roughness levels; fills are hachure / cross-hatch
 //! line batches clipped to the shape polygon, or a solid polygon fill.
 
+use crate::connector;
 use crate::display::{Dash, DrawOp, FillStyle, PathOp, StrokeStyle, TextOp};
 use crate::geometry::{Point, Rect};
-use crate::model::{Element, ElementKind, FillPattern, ShapeKind, Style, TextAlign};
+use crate::model::{Document, Element, ElementKind, FillPattern, ShapeKind, Style, TextAlign};
 use crate::text::{layout_text, TextMeasurer};
 
 /// A tiny deterministic RNG (splitmix64).
@@ -292,7 +293,11 @@ fn batch(segments: Vec<[Point; 2]>, style: &Style) -> Vec<DrawOp> {
 }
 
 /// Build the drawing instructions for one element.
-pub fn build_element_ops(element: &Element, measurer: &dyn TextMeasurer) -> Vec<DrawOp> {
+pub fn build_element_ops(
+    element: &Element,
+    doc: &Document,
+    measurer: &dyn TextMeasurer,
+) -> Vec<DrawOp> {
     let seed = hash_str(&element.id);
     match &element.kind {
         ElementKind::Shape {
@@ -315,12 +320,69 @@ pub fn build_element_ops(element: &Element, measurer: &dyn TextMeasurer) -> Vec<
             })]
         }
         ElementKind::Arrow {
-            start, end, style, ..
+            start,
+            end,
+            routing,
+            start_arrowhead,
+            end_arrowhead,
+            style,
+            ..
         } => {
-            if style.stroke_color == "transparent" {
+            let points = connector::route(start, end, *routing, doc);
+            if style.stroke_color == "transparent" || points.len() < 2 {
                 return Vec::new();
             }
-            outline_ops(&[start.point(), end.point()], style, seed ^ 0xA22, false)
+            let mut rng = RoughRng::seeded(seed ^ 0xA22);
+            let (main, extras) = rough_polyline(&points, false, style.roughness, &mut rng);
+            let stroke = stroke_of(style, style.stroke_width);
+            let mut ops = Vec::new();
+            if main.len() >= 2 {
+                ops.push(DrawOp::Path(PathOp {
+                    points: main,
+                    closed: false,
+                    stroke: Some(stroke.clone()),
+                    fill: None,
+                }));
+            }
+            for seg in extras {
+                ops.push(DrawOp::Path(PathOp {
+                    points: seg,
+                    closed: false,
+                    stroke: Some(stroke.clone()),
+                    fill: None,
+                }));
+            }
+            let head_fill = Some(FillStyle::Solid {
+                color: style.stroke_color.clone(),
+                opacity: style.opacity,
+            });
+            if *end_arrowhead {
+                let head = connector::arrowhead(
+                    points[points.len() - 1],
+                    points[points.len() - 2],
+                    style.stroke_width,
+                );
+                if !head.is_empty() {
+                    ops.push(DrawOp::Path(PathOp {
+                        points: head,
+                        closed: true,
+                        stroke: None,
+                        fill: head_fill.clone(),
+                    }));
+                }
+            }
+            if *start_arrowhead {
+                let head = connector::arrowhead(points[0], points[1], style.stroke_width);
+                if !head.is_empty() {
+                    ops.push(DrawOp::Path(PathOp {
+                        points: head,
+                        closed: true,
+                        stroke: None,
+                        fill: head_fill,
+                    }));
+                }
+            }
+            ops
         }
         ElementKind::Frame { rect, .. } => {
             let polygon = shape_polygon(ShapeKind::Rectangle, *rect);
@@ -455,6 +517,7 @@ mod tests {
         use crate::model::{Element, ElementKind, ShapeKind, Style};
         use crate::text::ApproxMeasurer;
         let make = || {
+            let doc = Document::new();
             let mut element = Element::new(
                 ElementKind::Shape {
                     shape: ShapeKind::Diamond,
@@ -466,8 +529,42 @@ mod tests {
                 0,
             );
             element.id = "stable-id".into();
-            build_element_ops(&element, &ApproxMeasurer)
+            build_element_ops(&element, &doc, &ApproxMeasurer)
         };
         assert_eq!(make(), make());
+    }
+
+    #[test]
+    fn arrows_render_with_heads_and_routes() {
+        use crate::model::{Element, ElementKind, Endpoint, Routing, Style};
+        use crate::text::ApproxMeasurer;
+        let doc = Document::new();
+        let element = Element::new(
+            ElementKind::Arrow {
+                start: Endpoint::free(0.0, 0.0),
+                end: Endpoint::free(100.0, 50.0),
+                routing: Routing::Elbow,
+                start_arrowhead: false,
+                end_arrowhead: true,
+                style: Style::default(),
+                label_id: None,
+            },
+            "a0".into(),
+            0,
+        );
+        let ops = build_element_ops(&element, &doc, &ApproxMeasurer);
+        let heads = ops
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    DrawOp::Path(path) if path.closed && path.fill.is_some() && path.stroke.is_none()
+                )
+            })
+            .count();
+        assert_eq!(heads, 1, "exactly one arrowhead");
+        assert!(ops
+            .iter()
+            .any(|op| matches!(op, DrawOp::Path(path) if !path.closed)));
     }
 }

@@ -7,13 +7,15 @@
 use std::collections::{BTreeSet, HashMap};
 
 use crate::camera::Camera;
+use crate::connector;
 use crate::delta::Delta;
 use crate::geometry::{Point, Rect};
 use crate::history::{History, Transaction};
 use crate::hit::{elements_in_rect, hit_test};
 use crate::id::{new_element_id, new_version_nonce};
 use crate::model::{
-    Document, Element, ElementId, ElementKind, ShapeKind, Style, StylePatch, TextAlign,
+    Binding, Document, Element, ElementId, ElementKind, Endpoint, Routing, ShapeKind, Style,
+    StylePatch, TextAlign,
 };
 use crate::nav::NavigationState;
 use crate::scene::Scene;
@@ -185,6 +187,10 @@ enum Interaction {
         id: ElementId,
         start: Point,
     },
+    Connecting {
+        id: ElementId,
+        start: Point,
+    },
     Erasing {
         erased: BTreeSet<ElementId>,
     },
@@ -210,6 +216,7 @@ pub struct Editor {
     clipboard: Vec<Element>,
     last_pressure: f64,
     measurer: Box<dyn TextMeasurer>,
+    hover_anchors: Option<(ElementId, Vec<Point>)>,
 }
 
 impl Editor {
@@ -229,6 +236,7 @@ impl Editor {
             clipboard: Vec::new(),
             last_pressure: 0.5,
             measurer: Box::new(ApproxMeasurer),
+            hover_anchors: None,
         };
         editor.refresh_scene();
         editor
@@ -355,7 +363,8 @@ impl Editor {
             Tool::Select => self.begin_select(screen, world, mods),
             Tool::Rectangle | Tool::Diamond | Tool::Ellipse => self.begin_drawing(world, now),
             Tool::Freehand => self.begin_freehand(world, now),
-            Tool::Line | Tool::Arrow => self.begin_line(world, now),
+            Tool::Line => self.begin_line(world, now),
+            Tool::Arrow => self.begin_connector(world, now),
             Tool::Eraser => self.begin_erase(world, now),
             Tool::Text => self.start_text(world, now),
             Tool::Hand => {
@@ -413,6 +422,22 @@ impl Editor {
                         }
                     }
                     effects.changed.insert(original.id.clone());
+                }
+                let moved_ids: BTreeSet<ElementId> =
+                    originals.iter().map(|o| o.id.clone()).collect();
+                let updates = self.connected_arrow_updates(&moved_ids);
+                if let Some(tx) = self.tx.as_mut() {
+                    for (arrow_id, start_point, end_point) in updates {
+                        let _ = tx.update(&mut self.doc, &arrow_id, now, |element| {
+                            if let ElementKind::Arrow { start, end, .. } = &mut element.kind {
+                                start.x = start_point.x;
+                                start.y = start_point.y;
+                                end.x = end_point.x;
+                                end.y = end_point.y;
+                            }
+                        });
+                        effects.changed.insert(arrow_id);
+                    }
                 }
                 effects
             }
@@ -489,6 +514,58 @@ impl Editor {
                 }
                 Effects::changed(id)
             }
+            Interaction::Connecting { id, start } => {
+                let current = self.camera.screen_to_world(screen);
+                let tolerance = self.tolerance().max(4.0);
+                let approach = self
+                    .doc
+                    .element(&id)
+                    .and_then(|element| match &element.kind {
+                        ElementKind::Arrow { start, .. } => Some(start.point()),
+                        _ => None,
+                    });
+                let candidate =
+                    connector::binding_candidate(&self.doc, current, tolerance, approach);
+                let (end, binding, hover) = match candidate {
+                    Some((target_id, side, point)) => {
+                        let anchors = self
+                            .doc
+                            .element(&target_id)
+                            .map(|element| {
+                                connector::anchor_points(element.bounds())
+                                    .into_iter()
+                                    .map(|(_, p)| p)
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        (
+                            point,
+                            Some(Binding {
+                                element_id: target_id.clone(),
+                                focus: Some(side.focus()),
+                            }),
+                            Some((target_id, anchors)),
+                        )
+                    }
+                    None => (current, None, None),
+                };
+                self.hover_anchors = hover;
+                let _ = start;
+                if let Some(tx) = self.tx.as_mut() {
+                    let _ = tx.update(&mut self.doc, &id, now, |element| {
+                        if let ElementKind::Arrow { end: e, .. } = &mut element.kind {
+                            e.x = end.x;
+                            e.y = end.y;
+                            e.binding = binding.clone();
+                        }
+                    });
+                }
+                Effects {
+                    changed: [id].into_iter().collect(),
+                    overlay_changed: true,
+                    ..Effects::default()
+                }
+            }
         }
     }
 
@@ -500,6 +577,7 @@ impl Editor {
             Interaction::Drawing { .. }
             | Interaction::Moving { .. }
             | Interaction::Resizing { .. }
+            | Interaction::Connecting { .. }
             | Interaction::Line { .. } => self.pointer_move(screen, mods, now),
             _ => Effects::default(),
         };
@@ -577,11 +655,22 @@ impl Editor {
                     .map(|tx| tx.deltas().iter().map(|d| d.element_id().clone()).collect())
                     .unwrap_or_default();
                 let reflows = self.bound_text_reflows(&changed);
+                let arrow_updates = self.connected_arrow_updates(&changed);
                 if let Some(tx) = self.tx.as_mut() {
                     for (text_id, rect) in &reflows {
                         let _ = tx.update(&mut self.doc, text_id, now, |element| {
                             if let ElementKind::Text { rect: r, .. } = &mut element.kind {
                                 *r = *rect;
+                            }
+                        });
+                    }
+                    for (arrow_id, start_point, end_point) in arrow_updates {
+                        let _ = tx.update(&mut self.doc, &arrow_id, now, |element| {
+                            if let ElementKind::Arrow { start, end, .. } = &mut element.kind {
+                                start.x = start_point.x;
+                                start.y = start_point.y;
+                                end.x = end_point.x;
+                                end.y = end_point.y;
                             }
                         });
                     }
@@ -683,6 +772,37 @@ impl Editor {
                     effects.merge(selection_effects);
                 }
             }
+            Interaction::Connecting { id, .. } => {
+                self.interaction = Interaction::Idle;
+                self.hover_anchors = None;
+                let tiny = self
+                    .doc
+                    .element(&id)
+                    .map(|e| {
+                        let b = e.bounds();
+                        b.w < self.min_draw_size() && b.h < self.min_draw_size()
+                    })
+                    .unwrap_or(true);
+                if tiny {
+                    self.tx = None;
+                    let purged = self.doc.element(&id).cloned();
+                    if let Some(element) = purged {
+                        let _ = self.doc.apply(&Delta::Purge { element });
+                    }
+                    effects.merge(Effects {
+                        changed: [id].into_iter().collect(),
+                        overlay_changed: true,
+                        ..Effects::default()
+                    });
+                } else {
+                    if let Some(tx) = self.tx.take() {
+                        tx.commit(&mut self.history);
+                    }
+                    let selection_effects = self.select([id.clone()]);
+                    effects.changed.insert(id);
+                    effects.merge(selection_effects);
+                }
+            }
         }
         effects
     }
@@ -714,6 +834,17 @@ impl Editor {
             }) => match caption_id {
                 Some(text_id) => self.begin_text_edit(self.doc.element(&text_id).cloned(), now),
                 None => self.create_bound_text(id, rect, now),
+            },
+            Some(ElementKind::Arrow { label_id, .. }) => match label_id {
+                Some(text_id) => self.begin_text_edit(self.doc.element(&text_id).cloned(), now),
+                None => {
+                    let bounds = self
+                        .doc
+                        .element(&id)
+                        .map(|e| e.bounds())
+                        .unwrap_or(Rect::ZERO);
+                    self.create_bound_text(id, bounds, now)
+                }
             },
             _ => Effects::default(),
         }
@@ -829,6 +960,7 @@ impl Editor {
             |element| match &mut element.kind {
                 ElementKind::Shape { bound_text_id, .. } => *bound_text_id = Some(link_id),
                 ElementKind::Glyph { caption_id, .. } => *caption_id = Some(link_id),
+                ElementKind::Arrow { label_id, .. } => *label_id = Some(link_id),
                 _ => {}
             },
         ) {
@@ -984,6 +1116,22 @@ impl Editor {
                 container_rect.w,
                 layout.height,
             )),
+            ElementKind::Arrow {
+                start,
+                end,
+                routing,
+                ..
+            } => {
+                let points = connector::route(start, end, *routing, &self.doc);
+                let mid = connector::point_at(&points, 0.5);
+                let width = if rect.w > 1.0 { rect.w } else { 100.0 };
+                Some(Rect::new(
+                    mid.x - width / 2.0,
+                    mid.y - layout.height / 2.0,
+                    width,
+                    layout.height,
+                ))
+            }
             _ => Some(Rect::new(
                 container_rect.x + padding,
                 container_rect.y + (container_rect.h - layout.height) / 2.0,
@@ -1132,6 +1280,19 @@ impl Editor {
             }
             Interaction::Freehand { id } | Interaction::Line { id, .. } => {
                 self.tx = None;
+                let purged = self.doc.element(&id).cloned();
+                if let Some(element) = purged {
+                    let _ = self.doc.apply(&Delta::Purge { element });
+                }
+                Effects {
+                    changed: [id].into_iter().collect(),
+                    overlay_changed: true,
+                    ..Effects::default()
+                }
+            }
+            Interaction::Connecting { id, .. } => {
+                self.tx = None;
+                self.hover_anchors = None;
                 let purged = self.doc.element(&id).cloned();
                 if let Some(element) = purged {
                     let _ = self.doc.apply(&Delta::Purge { element });
@@ -1427,6 +1588,110 @@ impl Editor {
             overlay_changed: true,
             ..Effects::default()
         }
+    }
+
+    /// Anchor points to highlight during a connector drag.
+    pub fn hover_anchor_points(&self) -> Vec<Point> {
+        self.hover_anchors
+            .as_ref()
+            .map(|(_, points)| points.clone())
+            .unwrap_or_default()
+    }
+
+    fn begin_connector(&mut self, world: Point, now: u64) -> Effects {
+        let mut tx = Transaction::begin();
+        let tolerance = self.tolerance().max(4.0);
+        let candidate = connector::binding_candidate(&self.doc, world, tolerance, None);
+        let (start_point, start_binding) = match candidate {
+            Some((target_id, side, point)) => (
+                point,
+                Some(Binding {
+                    element_id: target_id,
+                    focus: Some(side.focus()),
+                }),
+            ),
+            None => (world, None),
+        };
+        let element = Element::new(
+            ElementKind::Arrow {
+                start: Endpoint {
+                    x: start_point.x,
+                    y: start_point.y,
+                    binding: start_binding,
+                },
+                end: Endpoint::free(world.x, world.y),
+                routing: Routing::Elbow,
+                start_arrowhead: false,
+                end_arrowhead: true,
+                style: self.style.clone(),
+                label_id: None,
+            },
+            self.next_index(),
+            now,
+        );
+        let id = element.id.clone();
+        if let Err(err) = tx.add(&mut self.doc, element) {
+            debug_assert!(false, "connector add failed: {err}");
+        }
+        self.tx = Some(tx);
+        self.interaction = Interaction::Connecting {
+            id: id.clone(),
+            start: world,
+        };
+        Effects {
+            changed: [id].into_iter().collect(),
+            overlay_changed: true,
+            ..Effects::default()
+        }
+    }
+
+    /// Arrows bound to this element.
+    pub fn bound_arrows(&self, element_id: &str) -> Vec<ElementId> {
+        self.doc
+            .elements
+            .values()
+            .filter(|element| {
+                if element.is_deleted {
+                    return false;
+                }
+                if let ElementKind::Arrow { start, end, .. } = &element.kind {
+                    let binds = |endpoint: &Endpoint| {
+                        endpoint
+                            .binding
+                            .as_ref()
+                            .is_some_and(|b| b.element_id == element_id)
+                    };
+                    binds(start) || binds(end)
+                } else {
+                    false
+                }
+            })
+            .map(|element| element.id.clone())
+            .collect()
+    }
+
+    /// New endpoint positions for arrows connected to the given elements.
+    fn connected_arrow_updates(
+        &self,
+        moved: &BTreeSet<ElementId>,
+    ) -> Vec<(ElementId, Point, Point)> {
+        let mut updates = Vec::new();
+        for moved_id in moved {
+            for arrow_id in self.bound_arrows(moved_id) {
+                if moved.contains(&arrow_id) {
+                    continue;
+                }
+                let Some(ElementKind::Arrow { start, end, .. }) =
+                    self.doc.element(&arrow_id).map(|e| e.kind.clone())
+                else {
+                    continue;
+                };
+                let (s, _) = connector::resolve_endpoint(&start, end.point(), &self.doc);
+                let (e, _) = connector::resolve_endpoint(&end, start.point(), &self.doc);
+                updates.push((arrow_id, s, e));
+            }
+        }
+        updates
     }
 
     fn begin_line(&mut self, world: Point, now: u64) -> Effects {
@@ -2565,6 +2830,115 @@ mod tests {
             e.current_style().stroke_color,
             "#2f9e44",
             "defaults carry over"
+        );
+    }
+
+    #[test]
+    fn connecting_two_shapes_binds_both_ends() {
+        let mut e = editor();
+        drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(100.0, 100.0), 1);
+        drag_shape(&mut e, Point::new(300.0, 0.0), Point::new(400.0, 100.0), 2);
+        let a = e.doc.ordered_live()[0].id.clone();
+        let b = e.doc.ordered_live()[1].id.clone();
+        e.selection.clear();
+
+        let mods = Modifiers::default();
+        press(&mut e, "a", mods, 3);
+        e.pointer_down(Point::new(50.0, 50.0), 0, mods, 4);
+        e.pointer_move(Point::new(200.0, 50.0), mods, 5);
+        e.pointer_move(Point::new(350.0, 50.0), mods, 6);
+        assert_eq!(e.hover_anchor_points().len(), 4);
+        e.pointer_up(Point::new(350.0, 50.0), mods, 7);
+
+        assert!(e.hover_anchor_points().is_empty());
+        assert_eq!(e.doc.ordered_live().len(), 3);
+        let arrow = e
+            .doc
+            .ordered_live()
+            .into_iter()
+            .find(|element| matches!(element.kind, ElementKind::Arrow { .. }))
+            .expect("arrow created")
+            .clone();
+        match &arrow.kind {
+            ElementKind::Arrow { start, end, .. } => {
+                assert_eq!(
+                    start.binding.as_ref().map(|b| b.element_id.clone()),
+                    Some(a.clone())
+                );
+                assert_eq!(
+                    end.binding.as_ref().map(|b| b.element_id.clone()),
+                    Some(b.clone())
+                );
+            }
+            other => panic!("expected arrow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn moving_a_bound_shape_updates_the_arrow() {
+        let mut e = editor();
+        drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(100.0, 100.0), 1);
+        drag_shape(&mut e, Point::new(300.0, 0.0), Point::new(400.0, 100.0), 2);
+        let b = e.doc.ordered_live()[1].id.clone();
+
+        let mods = Modifiers::default();
+        press(&mut e, "a", mods, 3);
+        e.pointer_down(Point::new(50.0, 50.0), 0, mods, 4);
+        e.pointer_move(Point::new(350.0, 50.0), mods, 5);
+        e.pointer_up(Point::new(350.0, 50.0), mods, 6);
+
+        let arrow_id = e
+            .doc
+            .ordered_live()
+            .iter()
+            .find(|element| matches!(element.kind, ElementKind::Arrow { .. }))
+            .unwrap()
+            .id
+            .clone();
+        let before = e.doc.element(&arrow_id).unwrap().bounds();
+
+        press(&mut e, "v", mods, 7);
+        e.select([b.clone()]);
+        e.pointer_down(Point::new(350.0, 50.0), 0, mods, 8);
+        e.pointer_move(Point::new(450.0, 150.0), mods, 9);
+        e.pointer_up(Point::new(450.0, 150.0), mods, 10);
+
+        let after = e.doc.element(&arrow_id).unwrap().bounds();
+        assert!(
+            after != before,
+            "arrow endpoints followed the moved shape: {before:?} -> {after:?}"
+        );
+    }
+
+    #[test]
+    fn double_click_a_connector_creates_a_label() {
+        let mut e = editor();
+        drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(100.0, 100.0), 1);
+        drag_shape(&mut e, Point::new(300.0, 0.0), Point::new(400.0, 100.0), 2);
+        let mods = Modifiers::default();
+        press(&mut e, "a", mods, 3);
+        e.pointer_down(Point::new(50.0, 50.0), 0, mods, 4);
+        e.pointer_move(Point::new(350.0, 50.0), mods, 5);
+        e.pointer_up(Point::new(350.0, 50.0), mods, 6);
+
+        press(&mut e, "v", mods, 7);
+        e.double_click(Point::new(200.0, 50.0), 8);
+        let text_id = e
+            .doc
+            .ordered_live()
+            .iter()
+            .find(|element| element.is_text())
+            .expect("label text created")
+            .id
+            .clone();
+        e.commit_text(&text_id, "https", 9);
+
+        let label = e.doc.element(&text_id).unwrap();
+        assert!(label.bounds().w > 50.0);
+        assert!(
+            (label.bounds().center().x - 200.0).abs() < 60.0,
+            "label sits near the route midpoint: {:?}",
+            label.bounds()
         );
     }
 }
