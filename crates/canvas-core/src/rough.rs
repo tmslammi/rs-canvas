@@ -5,9 +5,10 @@
 //! sketchy pass at higher roughness levels; fills are hachure / cross-hatch
 //! line batches clipped to the shape polygon, or a solid polygon fill.
 
-use crate::display::{Dash, DrawOp, FillStyle, PathOp, StrokeStyle};
+use crate::display::{Dash, DrawOp, FillStyle, PathOp, StrokeStyle, TextOp};
 use crate::geometry::{Point, Rect};
-use crate::model::{Element, ElementKind, FillPattern, ShapeKind, Style};
+use crate::model::{Element, ElementKind, FillPattern, ShapeKind, Style, TextAlign};
+use crate::text::{layout_text, TextMeasurer};
 
 /// A tiny deterministic RNG (splitmix64).
 pub struct RoughRng {
@@ -291,7 +292,7 @@ fn batch(segments: Vec<[Point; 2]>, style: &Style) -> Vec<DrawOp> {
 }
 
 /// Build the drawing instructions for one element.
-pub fn build_element_ops(element: &Element) -> Vec<DrawOp> {
+pub fn build_element_ops(element: &Element, measurer: &dyn TextMeasurer) -> Vec<DrawOp> {
     let seed = hash_str(&element.id);
     match &element.kind {
         ElementKind::Shape {
@@ -338,8 +339,48 @@ pub fn build_element_ops(element: &Element) -> Vec<DrawOp> {
                 fill: None,
             })]
         }
-        // Text and glyph rendering arrive in their own tickets.
-        ElementKind::Text { .. } | ElementKind::Glyph { .. } => Vec::new(),
+        // Glyph rendering arrives with the shape library ticket.
+        ElementKind::Glyph { .. } => Vec::new(),
+        ElementKind::Text {
+            rect,
+            text,
+            align,
+            container_id,
+            fixed_width,
+            style,
+        } => {
+            if text.is_empty() {
+                return Vec::new();
+            }
+            let wrap_width = if *fixed_width || container_id.is_some() {
+                Some(rect.w.max(1.0))
+            } else {
+                None
+            };
+            let layout = layout_text(text, style.font_size, wrap_width, measurer);
+            let mut ops = Vec::new();
+            for (i, line) in layout.lines.iter().enumerate() {
+                if line.is_empty() {
+                    continue;
+                }
+                let baseline = rect.y + layout.line_height * (i as f64 + 0.75);
+                let x = match align {
+                    TextAlign::Left => rect.x,
+                    TextAlign::Center => rect.x + rect.w / 2.0,
+                    TextAlign::Right => rect.max_x(),
+                };
+                ops.push(DrawOp::Text(TextOp {
+                    x,
+                    y: baseline,
+                    text: line.clone(),
+                    font_size: style.font_size,
+                    color: style.stroke_color.clone(),
+                    opacity: style.opacity,
+                    align: *align,
+                }));
+            }
+            ops
+        }
     }
 }
 
@@ -412,6 +453,7 @@ mod tests {
     #[test]
     fn rendering_a_document_is_deterministic() {
         use crate::model::{Element, ElementKind, ShapeKind, Style};
+        use crate::text::ApproxMeasurer;
         let make = || {
             let mut element = Element::new(
                 ElementKind::Shape {
@@ -424,7 +466,7 @@ mod tests {
                 0,
             );
             element.id = "stable-id".into();
-            build_element_ops(&element)
+            build_element_ops(&element, &ApproxMeasurer)
         };
         assert_eq!(make(), make());
     }

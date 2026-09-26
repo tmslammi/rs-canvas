@@ -23,10 +23,18 @@ const TOOLS: ToolbarTool[] = [
   { name: "ellipse", label: "Ellipse", glyph: "◯", shortcut: "O" },
   { name: "freehand", label: "Draw", glyph: "✎", shortcut: "P" },
   { name: "line", label: "Line", glyph: "╱", shortcut: "L" },
+  { name: "text", label: "Text", glyph: "T", shortcut: "T" },
 ];
+
+async function loadFonts(): Promise<void> {
+  const face = new FontFace("ComicShanns", "url(/fonts/ComicShanns-Regular.ttf)");
+  await face.load();
+  document.fonts.add(face);
+}
 
 async function boot(): Promise<void> {
   await init();
+  await loadFonts();
 
   const scene = document.getElementById("scene") as HTMLCanvasElement;
   const overlay = document.getElementById("overlay") as HTMLCanvasElement;
@@ -90,6 +98,79 @@ async function boot(): Promise<void> {
     redoButton.disabled = !editor.can_redo();
   };
 
+  // -- text editor overlay ------------------------------------------------
+
+  const textEditor = document.getElementById("text-editor") as HTMLTextAreaElement;
+  let editingId: string | null = null;
+
+  const closeTextEditor = (): void => {
+    textEditor.classList.remove("visible");
+    editingId = null;
+  };
+
+  const commitTextEditor = (): void => {
+    if (!editingId) return;
+    const id = editingId;
+    const content = textEditor.value;
+    closeTextEditor();
+    editor.commit_text(id, content);
+    refreshToolbar();
+    updateCursor();
+  };
+
+  interface OpenTextEditorAction {
+    type: string;
+    id: string;
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+    font_size: number;
+    text: string;
+    align: string;
+  }
+
+  editor.set_action_handler((json: string) => {
+    const action = JSON.parse(json) as OpenTextEditorAction;
+    if (action.type !== "open_text_editor") return;
+    editingId = action.id;
+    textEditor.value = action.text;
+    textEditor.style.left = `${action.x}px`;
+    textEditor.style.top = `${action.y}px`;
+    textEditor.style.width = `${action.width}px`;
+    textEditor.style.height = `${action.height}px`;
+    textEditor.style.fontSize = `${action.font_size}px`;
+    textEditor.style.lineHeight = "1.3";
+    textEditor.style.textAlign = action.align;
+    textEditor.classList.add("visible");
+    textEditor.focus();
+    textEditor.setSelectionRange(action.text.length, action.text.length);
+  });
+
+  textEditor.addEventListener("input", () => {
+    textEditor.style.height = "auto";
+    textEditor.style.height = `${Math.max(textEditor.scrollHeight, 24)}px`;
+  });
+
+  textEditor.addEventListener("keydown", (event) => {
+    const composing = event.isComposing || event.keyCode === 229;
+    if (event.key === "Escape" && !composing) {
+      event.preventDefault();
+      commitTextEditor();
+    }
+  });
+
+  textEditor.addEventListener("blur", () => {
+    if (editingId) commitTextEditor();
+  });
+
+  scene.addEventListener("dblclick", (event) => {
+    if (editingId) commitTextEditor();
+    editor.double_click(event.offsetX, event.offsetY);
+    refreshToolbar();
+    updateCursor();
+  });
+
   // -- pointer input ------------------------------------------------------
 
   const modifiers = (event: PointerEvent | KeyboardEvent | WheelEvent) => ({
@@ -103,6 +184,10 @@ async function boot(): Promise<void> {
   let pinchDistance = 0;
 
   scene.addEventListener("pointerdown", (event) => {
+    event.preventDefault();
+    if (editingId) {
+      commitTextEditor();
+    }
     if (event.pointerType === "touch") {
       activePointers.set(event.pointerId, { x: event.offsetX, y: event.offsetY });
     }

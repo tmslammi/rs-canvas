@@ -12,10 +12,28 @@ use crate::geometry::{Point, Rect};
 use crate::history::{History, Transaction};
 use crate::hit::{elements_in_rect, hit_test};
 use crate::id::{new_element_id, new_version_nonce};
-use crate::model::{Document, Element, ElementId, ElementKind, ShapeKind, Style};
+use crate::model::{Document, Element, ElementId, ElementKind, ShapeKind, Style, TextAlign};
 use crate::nav::NavigationState;
 use crate::scene::Scene;
+use crate::text::{layout_text, ApproxMeasurer, TextMeasurer};
 use crate::tool::Tool;
+
+/// A message from the core to the browser shell (via the wasm façade).
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ShellAction {
+    OpenTextEditor {
+        id: ElementId,
+        /// Screen-space rectangle in CSS pixels.
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        font_size: f64,
+        text: String,
+        align: TextAlign,
+    },
+}
 
 /// What the shell should repaint after an input.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -26,6 +44,8 @@ pub struct Effects {
     pub repaint_all: bool,
     /// Selection or in-progress decoration changed (overlay repaint).
     pub overlay_changed: bool,
+    /// Shell actions to dispatch (text editor, later: dialogs).
+    pub actions: Vec<ShellAction>,
 }
 
 impl Effects {
@@ -39,6 +59,7 @@ impl Effects {
         self.changed.extend(other.changed);
         self.repaint_all |= other.repaint_all;
         self.overlay_changed |= other.overlay_changed;
+        self.actions.extend(other.actions);
     }
 }
 
@@ -165,6 +186,10 @@ enum Interaction {
     Erasing {
         erased: BTreeSet<ElementId>,
     },
+    TextEditing {
+        id: ElementId,
+        original: Box<Option<Element>>,
+    },
 }
 
 /// The editable session.
@@ -182,16 +207,15 @@ pub struct Editor {
     marquee_current: Option<Point>,
     clipboard: Vec<Element>,
     last_pressure: f64,
+    measurer: Box<dyn TextMeasurer>,
 }
 
 impl Editor {
     pub fn new(doc: Document) -> Self {
-        let mut scene = Scene::new();
-        scene.rebuild_all(&doc);
-        Self {
+        let mut editor = Self {
             doc,
             camera: Camera::default(),
-            scene,
+            scene: Scene::new(),
             history: History::new(),
             nav: NavigationState::new(),
             tool: Tool::default(),
@@ -202,7 +226,27 @@ impl Editor {
             marquee_current: None,
             clipboard: Vec::new(),
             last_pressure: 0.5,
-        }
+            measurer: Box::new(ApproxMeasurer),
+        };
+        editor.refresh_scene();
+        editor
+    }
+
+    /// Install a real text measurer (the wasm façade does this).
+    pub fn set_measurer(&mut self, measurer: Box<dyn TextMeasurer>) {
+        self.measurer = measurer;
+        self.refresh_scene();
+    }
+
+    /// Rebuild the whole scene cache.
+    pub fn refresh_scene(&mut self) -> Vec<Rect> {
+        self.scene.rebuild_all(&self.doc, self.measurer.as_ref())
+    }
+
+    /// Rebuild the changed elements' layers, returning dirty world rects.
+    pub fn rebuild_changed(&mut self, changed: &BTreeSet<ElementId>) -> Vec<Rect> {
+        self.scene
+            .update(&self.doc, changed, self.measurer.as_ref())
     }
 
     /// The shell reports pointer pressure for freehand capture.
@@ -287,6 +331,17 @@ impl Editor {
         mods: Modifiers,
         now: u64,
     ) -> Effects {
+        if let Interaction::TextEditing { id, .. } = self.interaction.clone() {
+            let current = self
+                .doc
+                .element(&id)
+                .and_then(|element| match &element.kind {
+                    ElementKind::Text { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let _ = self.commit_text(&id, &current, now);
+        }
         if self.nav.pointer_down(screen, button) {
             return Effects::default();
         }
@@ -300,6 +355,7 @@ impl Editor {
             Tool::Freehand => self.begin_freehand(world, now),
             Tool::Line | Tool::Arrow => self.begin_line(world, now),
             Tool::Eraser => self.begin_erase(world, now),
+            Tool::Text => self.start_text(world, now),
             Tool::Hand => {
                 self.nav.start_pan(screen);
                 Effects::default()
@@ -390,6 +446,7 @@ impl Editor {
                 self.interaction = Interaction::Erasing { erased };
                 effects
             }
+            Interaction::TextEditing { .. } => Effects::default(),
             Interaction::Freehand { id } => {
                 let current = self.camera.screen_to_world(screen);
                 let last = self.doc.element(&id).and_then(|e| match &e.kind {
@@ -512,12 +569,28 @@ impl Editor {
             }
             Interaction::Resizing { .. } => {
                 self.interaction = Interaction::Idle;
+                let changed: BTreeSet<ElementId> = self
+                    .tx
+                    .as_ref()
+                    .map(|tx| tx.deltas().iter().map(|d| d.element_id().clone()).collect())
+                    .unwrap_or_default();
+                let reflows = self.bound_text_reflows(&changed);
+                if let Some(tx) = self.tx.as_mut() {
+                    for (text_id, rect) in &reflows {
+                        let _ = tx.update(&mut self.doc, text_id, now, |element| {
+                            if let ElementKind::Text { rect: r, .. } = &mut element.kind {
+                                *r = *rect;
+                            }
+                        });
+                    }
+                }
                 if let Some(tx) = self.tx.take() {
-                    let changed: BTreeSet<ElementId> =
+                    let mut changed_now: BTreeSet<ElementId> =
                         tx.deltas().iter().map(|d| d.element_id().clone()).collect();
+                    changed_now.extend(changed);
                     tx.commit(&mut self.history);
                     effects.merge(Effects {
-                        changed,
+                        changed: changed_now,
                         overlay_changed: true,
                         ..Effects::default()
                     });
@@ -531,6 +604,7 @@ impl Editor {
                 effects.changed.extend(erased);
                 effects.overlay_changed = true;
             }
+            Interaction::TextEditing { .. } => {}
             Interaction::Freehand { id } => {
                 self.interaction = Interaction::Idle;
                 if let Some(tx) = self.tx.as_mut() {
@@ -611,10 +685,341 @@ impl Editor {
         effects
     }
 
-    /// Double-click (for bound text later).
+    /// Double-click: edit text, or create bound text inside a shape/glyph.
     pub fn double_click(&mut self, screen: Point, now: u64) -> Effects {
-        let _ = (screen, now);
-        Effects::default()
+        if self.interaction != Interaction::Idle {
+            return Effects::default();
+        }
+        let world = self.camera.screen_to_world(screen);
+        let tolerance = self.tolerance();
+        let Some(id) = hit_test(&self.doc, world, tolerance) else {
+            return Effects::default();
+        };
+        match self.doc.element(&id).map(|e| e.kind.clone()) {
+            Some(ElementKind::Text { .. }) => {
+                self.begin_text_edit(self.doc.element(&id).cloned(), now)
+            }
+            Some(ElementKind::Shape {
+                bound_text_id,
+                rect,
+                ..
+            }) => match bound_text_id {
+                Some(text_id) => self.begin_text_edit(self.doc.element(&text_id).cloned(), now),
+                None => self.create_bound_text(id, rect, now),
+            },
+            Some(ElementKind::Glyph {
+                caption_id, rect, ..
+            }) => match caption_id {
+                Some(text_id) => self.begin_text_edit(self.doc.element(&text_id).cloned(), now),
+                None => self.create_bound_text(id, rect, now),
+            },
+            _ => Effects::default(),
+        }
+    }
+
+    /// Create a point-text element and open the editor.
+    pub fn start_text(&mut self, world: Point, now: u64) -> Effects {
+        if self.interaction != Interaction::Idle {
+            return Effects::default();
+        }
+        let mut tx = Transaction::begin();
+        let element = Element::new(
+            ElementKind::Text {
+                rect: Rect::new(
+                    world.x,
+                    world.y,
+                    0.0,
+                    self.measurer.line_height(self.style.font_size),
+                ),
+                text: String::new(),
+                align: TextAlign::Left,
+                fixed_width: false,
+                container_id: None,
+                style: self.style.clone(),
+            },
+            self.next_index(),
+            now,
+        );
+        let id = element.id.clone();
+        if let Err(err) = tx.add(&mut self.doc, element) {
+            debug_assert!(false, "text add failed: {err}");
+        }
+        self.tx = Some(tx);
+        self.interaction = Interaction::TextEditing {
+            id: id.clone(),
+            original: Box::new(None),
+        };
+        let action = self.text_editor_action(&id, String::new());
+        Effects {
+            changed: [id].into_iter().collect(),
+            overlay_changed: true,
+            actions: action.into_iter().collect(),
+            ..Effects::default()
+        }
+    }
+
+    fn begin_text_edit(&mut self, existing: Option<Element>, now: u64) -> Effects {
+        let _ = now;
+        let Some(element) = existing else {
+            return Effects::default();
+        };
+        let id = element.id.clone();
+        let content = match &element.kind {
+            ElementKind::Text { text, .. } => text.clone(),
+            _ => return Effects::default(),
+        };
+        self.tx = Some(Transaction::begin());
+        self.interaction = Interaction::TextEditing {
+            id: id.clone(),
+            original: Box::new(Some(element)),
+        };
+        let action = self.text_editor_action(&id, content);
+        Effects {
+            changed: [id].into_iter().collect(),
+            overlay_changed: true,
+            actions: action.into_iter().collect(),
+            ..Effects::default()
+        }
+    }
+
+    fn create_bound_text(
+        &mut self,
+        container_id: ElementId,
+        container_rect: Rect,
+        now: u64,
+    ) -> Effects {
+        let is_glyph = matches!(
+            self.doc.element(&container_id).map(|e| &e.kind),
+            Some(ElementKind::Glyph { .. })
+        );
+        let mut tx = Transaction::begin();
+        let font_size = self.style.font_size;
+        let element = Element::new(
+            ElementKind::Text {
+                rect: Rect::new(
+                    container_rect.x + 10.0,
+                    if is_glyph {
+                        container_rect.max_y() + 4.0
+                    } else {
+                        container_rect.center().y
+                    },
+                    (container_rect.w - 20.0).max(20.0),
+                    self.measurer.line_height(font_size),
+                ),
+                text: String::new(),
+                align: TextAlign::Center,
+                fixed_width: true,
+                container_id: Some(container_id.clone()),
+                style: self.style.clone(),
+            },
+            self.next_index(),
+            now,
+        );
+        let text_id = element.id.clone();
+        if let Err(err) = tx.add(&mut self.doc, element) {
+            debug_assert!(false, "bound text add failed: {err}");
+        }
+        let link_id = text_id.clone();
+        if let Err(err) = tx.update(
+            &mut self.doc,
+            &container_id,
+            now,
+            |element| match &mut element.kind {
+                ElementKind::Shape { bound_text_id, .. } => *bound_text_id = Some(link_id),
+                ElementKind::Glyph { caption_id, .. } => *caption_id = Some(link_id),
+                _ => {}
+            },
+        ) {
+            debug_assert!(false, "container link failed: {err}");
+        }
+        self.tx = Some(tx);
+        self.interaction = Interaction::TextEditing {
+            id: text_id.clone(),
+            original: Box::new(None),
+        };
+        let action = self.text_editor_action(&text_id, String::new());
+        Effects {
+            changed: [container_id, text_id].into_iter().collect(),
+            overlay_changed: true,
+            actions: action.into_iter().collect(),
+            ..Effects::default()
+        }
+    }
+
+    fn text_editor_action(&self, id: &str, content: String) -> Option<ShellAction> {
+        let element = self.doc.element(id)?;
+        let (rect, font_size, align) = match &element.kind {
+            ElementKind::Text {
+                rect, align, style, ..
+            } => (*rect, style.font_size, *align),
+            _ => return None,
+        };
+        let top_left = self.camera.world_to_screen(Point::new(rect.x, rect.y));
+        let bottom_right = self
+            .camera
+            .world_to_screen(Point::new(rect.max_x(), rect.max_y()));
+        let screen = Rect::from_points(top_left, bottom_right);
+        Some(ShellAction::OpenTextEditor {
+            id: id.into(),
+            x: screen.x,
+            y: screen.y,
+            width: screen.w.max(60.0),
+            height: screen.h.max(font_size * self.camera.zoom * 1.6),
+            font_size: font_size * self.camera.zoom,
+            text: content,
+            align,
+        })
+    }
+
+    /// Commit the open text edit with the shell's textarea contents.
+    pub fn commit_text(&mut self, id: &str, text: &str, now: u64) -> Effects {
+        let Interaction::TextEditing {
+            id: editing_id,
+            original,
+        } = self.interaction.clone()
+        else {
+            return Effects::default();
+        };
+        let original = *original;
+        if editing_id != id {
+            return Effects::default();
+        }
+        let tx = self.tx.take();
+        self.interaction = Interaction::Idle;
+        let mut effects = Effects {
+            changed: [id.to_string()].into_iter().collect(),
+            overlay_changed: true,
+            ..Effects::default()
+        };
+
+        if text.trim().is_empty() {
+            match original {
+                Some(orig) => {
+                    if let Some(mut tx) = tx {
+                        let _ = tx.update(&mut self.doc, id, now, |element| {
+                            if let (
+                                ElementKind::Text {
+                                    text: current,
+                                    rect,
+                                    ..
+                                },
+                                ElementKind::Text {
+                                    text: orig_text,
+                                    rect: orig_rect,
+                                    ..
+                                },
+                            ) = (&mut element.kind, &orig.kind)
+                            {
+                                *current = orig_text.clone();
+                                *rect = *orig_rect;
+                            }
+                        });
+                        tx.commit(&mut self.history);
+                    }
+                }
+                None => {
+                    let purged = self.doc.element(id).cloned();
+                    if let Some(element) = purged {
+                        let _ = self.doc.apply(&Delta::Purge { element });
+                    }
+                    self.selection.remove(id);
+                }
+            }
+            return effects;
+        }
+
+        let new_rect = self.text_rect_for(id, text);
+        if let (Some(mut tx), Some(new_rect)) = (tx, new_rect) {
+            let content = text.to_string();
+            let _ = tx.update(&mut self.doc, id, now, |element| {
+                if let ElementKind::Text { text, rect, .. } = &mut element.kind {
+                    *text = content.clone();
+                    *rect = new_rect;
+                }
+            });
+            tx.commit(&mut self.history);
+            self.selection = [id.to_string()].into_iter().collect();
+            effects.changed.insert(id.to_string());
+        }
+        effects
+    }
+
+    fn text_rect_for(&self, id: &str, text: &str) -> Option<Rect> {
+        let element = self.doc.element(id)?;
+        let (rect, fixed_width, container_id, font_size) = match &element.kind {
+            ElementKind::Text {
+                rect,
+                fixed_width,
+                container_id,
+                style,
+                ..
+            } => (*rect, *fixed_width, container_id.clone(), style.font_size),
+            _ => return None,
+        };
+        let measurer = self.measurer.as_ref();
+        let Some(container_id) = container_id else {
+            let layout = if fixed_width {
+                layout_text(text, font_size, Some(rect.w), measurer)
+            } else {
+                layout_text(text, font_size, None, measurer)
+            };
+            let width = if fixed_width {
+                rect.w
+            } else {
+                layout.width.max(1.0)
+            };
+            return Some(Rect::new(rect.x, rect.y, width, layout.height));
+        };
+        let container = self.doc.element(&container_id)?;
+        let container_rect = container.bounds();
+        let padding = 10.0;
+        let wrap = (container_rect.w - padding * 2.0).max(20.0);
+        let layout = layout_text(text, font_size, Some(wrap), measurer);
+        match &container.kind {
+            ElementKind::Glyph { .. } => Some(Rect::new(
+                container_rect.x,
+                container_rect.max_y() + 4.0,
+                container_rect.w,
+                layout.height,
+            )),
+            _ => Some(Rect::new(
+                container_rect.x + padding,
+                container_rect.y + (container_rect.h - layout.height) / 2.0,
+                container_rect.w - padding * 2.0,
+                layout.height,
+            )),
+        }
+    }
+
+    /// Discard the open text edit, restoring the prior state.
+    pub fn cancel_text(&mut self) -> Effects {
+        let Interaction::TextEditing { id, original } = self.interaction.clone() else {
+            return Effects::default();
+        };
+        let original = *original;
+        self.tx = None;
+        self.interaction = Interaction::Idle;
+        match original {
+            Some(orig) => {
+                if let Some(current) = self.doc.element(&id).cloned() {
+                    let _ = self.doc.apply(&Delta::Update {
+                        before: current,
+                        after: orig,
+                    });
+                }
+            }
+            None => {
+                let purged = self.doc.element(&id).cloned();
+                if let Some(element) = purged {
+                    let _ = self.doc.apply(&Delta::Purge { element });
+                }
+            }
+        }
+        Effects {
+            changed: [id].into_iter().collect(),
+            overlay_changed: true,
+            ..Effects::default()
+        }
     }
 
     // -- keyboard ----------------------------------------------------------
@@ -735,6 +1140,30 @@ impl Editor {
                     ..Effects::default()
                 }
             }
+            Interaction::TextEditing { id, original } => {
+                self.tx = None;
+                match *original {
+                    Some(orig) => {
+                        if let Some(current) = self.doc.element(&id).cloned() {
+                            let _ = self.doc.apply(&Delta::Update {
+                                before: current,
+                                after: orig,
+                            });
+                        }
+                    }
+                    None => {
+                        let purged = self.doc.element(&id).cloned();
+                        if let Some(element) = purged {
+                            let _ = self.doc.apply(&Delta::Purge { element });
+                        }
+                    }
+                }
+                Effects {
+                    changed: [id].into_iter().collect(),
+                    overlay_changed: true,
+                    ..Effects::default()
+                }
+            }
         }
     }
 
@@ -830,11 +1259,7 @@ impl Editor {
                 if !self.selection.contains(&id) {
                     self.selection = [id].into_iter().collect();
                 }
-                let originals: Vec<Element> = self
-                    .selection
-                    .iter()
-                    .filter_map(|sid| self.doc.element(sid).cloned())
-                    .collect();
+                let originals: Vec<Element> = self.selection_with_followers();
                 self.tx = Some(Transaction::begin());
                 self.interaction = Interaction::Moving {
                     start: world,
@@ -1004,6 +1429,52 @@ impl Editor {
             .iter()
             .filter_map(|id| self.doc.element(id).cloned())
             .collect()
+    }
+
+    /// Elements that always travel with this element (bound text; frames add
+    /// children later).
+    pub fn followers(&self, id: &str) -> Vec<ElementId> {
+        match self.doc.element(id).map(|e| &e.kind) {
+            Some(ElementKind::Shape {
+                bound_text_id: Some(text_id),
+                ..
+            })
+            | Some(ElementKind::Glyph {
+                caption_id: Some(text_id),
+                ..
+            }) => vec![text_id.clone()],
+            _ => Vec::new(),
+        }
+    }
+
+    fn selection_with_followers(&self) -> Vec<Element> {
+        let mut ids: BTreeSet<ElementId> = self.selection.clone();
+        for id in &self.selection {
+            ids.extend(self.followers(id));
+        }
+        ids.iter()
+            .filter_map(|id| self.doc.element(id).cloned())
+            .collect()
+    }
+
+    /// Bound-text rectangles that must be recomputed after containers change.
+    fn bound_text_reflows(&self, containers: &BTreeSet<ElementId>) -> Vec<(ElementId, Rect)> {
+        let mut reflows = Vec::new();
+        for container_id in containers {
+            let Some(text_id) = self.followers(container_id).into_iter().next() else {
+                continue;
+            };
+            let Some(content) = self.doc.element(&text_id).and_then(|e| match &e.kind {
+                ElementKind::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            }) else {
+                continue;
+            };
+            if let Some(rect) = self.text_rect_for(&text_id, &content) {
+                reflows.push((text_id, rect));
+            }
+        }
+        reflows
     }
 
     /// Move the selection by a world-space delta, one undo step.
@@ -1690,7 +2161,7 @@ mod tests {
             },
             1,
         );
-        e.scene.rebuild_all(&e.doc);
+        e.refresh_scene();
         e.select([first.clone()]);
 
         let cmd = Modifiers {
@@ -1820,5 +2291,122 @@ mod tests {
         } else {
             panic!("expected arrow");
         }
+    }
+
+    #[test]
+    fn text_tool_commit_sets_content_and_autosizes() {
+        let mut e = editor();
+        let mods = Modifiers::default();
+        press(&mut e, "t", mods, 1);
+        e.pointer_down(Point::new(50.0, 50.0), 0, mods, 2);
+        let id = e.doc.ordered_live()[0].id.clone();
+        e.commit_text(&id, "Hello world", 3);
+
+        match &e.doc.element(&id).unwrap().kind {
+            ElementKind::Text { text, rect, .. } => {
+                assert_eq!(text, "Hello world");
+                assert!(rect.w > 100.0, "auto width grew: {rect:?}");
+            }
+            other => panic!("expected text, got {other:?}"),
+        }
+        assert_eq!(e.selection.len(), 1);
+    }
+
+    #[test]
+    fn empty_text_is_discarded_without_history() {
+        let mut e = editor();
+        let mods = Modifiers::default();
+        press(&mut e, "t", mods, 1);
+        e.pointer_down(Point::new(50.0, 50.0), 0, mods, 2);
+        let id = e.doc.ordered_live()[0].id.clone();
+        e.commit_text(&id, "   ", 3);
+        assert!(e.doc.is_empty());
+        assert!(!e.history.can_undo());
+    }
+
+    #[test]
+    fn double_click_shapes_creates_bound_text_that_follows_them() {
+        let mut e = editor();
+        drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(200.0, 100.0), 1);
+        let shape_id = e.doc.ordered_live()[0].id.clone();
+        press(&mut e, "v", Modifiers::default(), 2);
+
+        e.double_click(Point::new(100.0, 50.0), 3);
+        let text_id = e
+            .doc
+            .ordered_live()
+            .iter()
+            .find(|element| element.id != shape_id)
+            .expect("bound text created")
+            .id
+            .clone();
+        e.commit_text(&text_id, "node", 4);
+
+        match e.doc.element(&shape_id).unwrap().kind.clone() {
+            ElementKind::Shape { bound_text_id, .. } => {
+                assert_eq!(bound_text_id, Some(text_id.clone()));
+            }
+            other => panic!("expected shape, got {other:?}"),
+        }
+        let before = e.doc.element(&text_id).unwrap().bounds();
+
+        let mods = Modifiers::default();
+        e.pointer_down(Point::new(100.0, 50.0), 0, mods, 5);
+        e.pointer_move(Point::new(150.0, 70.0), mods, 6);
+        e.pointer_up(Point::new(150.0, 70.0), mods, 7);
+        let after = e.doc.element(&text_id).unwrap().bounds();
+        assert!(
+            (after.x - before.x - 50.0).abs() < 0.01,
+            "bound text follows its shape: {before:?} -> {after:?}"
+        );
+    }
+
+    #[test]
+    fn resizing_a_shape_reflows_bound_text() {
+        let mut e = editor();
+        drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(200.0, 100.0), 1);
+        let shape_id = e.doc.ordered_live()[0].id.clone();
+        press(&mut e, "v", Modifiers::default(), 2);
+        e.double_click(Point::new(100.0, 50.0), 3);
+        let text_id = e
+            .doc
+            .ordered_live()
+            .iter()
+            .find(|element| element.id != shape_id)
+            .unwrap()
+            .id
+            .clone();
+        e.commit_text(
+            &text_id,
+            "a somewhat long caption that wraps onto several lines at small widths",
+            4,
+        );
+
+        let height_before = e.doc.element(&text_id).unwrap().bounds().h;
+        let mods = Modifiers::default();
+        // Select the shape (clicking its edge; the text is selected after commit).
+        e.pointer_down(Point::new(5.0, 5.0), 0, mods, 5);
+        e.pointer_up(Point::new(5.0, 5.0), mods, 5);
+        assert!(e.selection.contains(&shape_id));
+
+        // Shrink the shape by dragging its SE handle.
+        e.pointer_down(Point::new(200.0, 100.0), 0, mods, 6);
+        e.pointer_move(Point::new(70.0, 100.0), mods, 7);
+        e.pointer_up(Point::new(70.0, 100.0), mods, 8);
+        let height_after = e.doc.element(&text_id).unwrap().bounds().h;
+        assert!(
+            height_after > height_before,
+            "text wrapped taller after shrinking: {height_before} -> {height_after}"
+        );
+    }
+
+    #[test]
+    fn escape_cancels_text_editing() {
+        let mut e = editor();
+        let mods = Modifiers::default();
+        press(&mut e, "t", mods, 1);
+        e.pointer_down(Point::new(50.0, 50.0), 0, mods, 2);
+        e.cancel_text();
+        assert!(e.doc.is_empty());
     }
 }

@@ -24,6 +24,7 @@ dependencies = [
  "canvas-core",
  "console_error_panic_hook",
  "js-sys",
+ "serde_json",
  "wasm-bindgen",
  "web-sys",
 ]

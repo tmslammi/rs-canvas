@@ -77,3 +77,24 @@ body {
   margin: 4px 4px;
   background: #e9ecef;
 }
+
+#text-editor {
+  position: absolute;
+  display: none;
+  z-index: 10;
+  margin: 0;
+  padding: 0;
+  border: none;
+  outline: none;
+  resize: none;
+  background: transparent;
+  overflow: hidden;
+  font-family: "ComicShanns", system-ui, sans-serif;
+  color: #1e1e1e;
+  white-space: pre;
+  caret-color: #1971c2;
+}
+
+#text-editor.visible {
+  display: block;
+}

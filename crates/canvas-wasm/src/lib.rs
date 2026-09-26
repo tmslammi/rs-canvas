@@ -5,7 +5,7 @@
 
 use canvas_core::{
     Affine, Document, DrawOp, Editor as CoreEditor, Effects, FillStyle, Modifiers, Point, Rect,
-    Renderer, StrokeStyle, Tool,
+    Renderer, ShellAction, StrokeStyle, TextAlign, TextMeasurer, TextOp, Tool,
 };
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -16,6 +16,34 @@ const ACCENT: &str = "#1971c2";
 
 fn now_ms() -> u64 {
     js_sys::Date::now() as u64
+}
+
+/// `measureText`-backed measurer with a small cache.
+struct FontMeasurer {
+    ctx: CanvasRenderingContext2d,
+    cache: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<(u64, String), f64>>>,
+}
+
+impl TextMeasurer for FontMeasurer {
+    fn measure_width(&self, text: &str, font_size: f64) -> f64 {
+        let key = (font_size.to_bits(), text.to_string());
+        if let Some(width) = self.cache.borrow().get(&key) {
+            return *width;
+        }
+        self.ctx
+            .set_font(&format!("{font_size}px ComicShanns, sans-serif"));
+        let width = self
+            .ctx
+            .measure_text(text)
+            .map(|metrics| metrics.width())
+            .unwrap_or_else(|_| text.chars().count() as f64 * font_size * 0.55);
+        let mut cache = self.cache.borrow_mut();
+        if cache.len() > 4096 {
+            cache.clear();
+        }
+        cache.insert(key, width);
+        width
+    }
 }
 
 /// A Canvas2D implementation of the core's renderer seam.
@@ -40,6 +68,7 @@ impl Canvas2dRenderer {
             match op {
                 DrawOp::Path(path) => self.draw_path(path),
                 DrawOp::LineBatch { segments, stroke } => self.draw_line_batch(segments, stroke),
+                DrawOp::Text(text) => self.draw_text(text),
             }
         }
     }
@@ -127,6 +156,21 @@ impl Renderer for Canvas2dRenderer {
         self.ctx.stroke();
         self.ctx.set_global_alpha(1.0);
     }
+
+    fn draw_text(&mut self, op: &TextOp) {
+        self.ctx
+            .set_font(&format!("{}px ComicShanns, sans-serif", op.font_size));
+        self.ctx.set_fill_style_str(&op.color);
+        self.ctx.set_global_alpha(op.opacity);
+        let align = match op.align {
+            TextAlign::Left => "left",
+            TextAlign::Center => "center",
+            TextAlign::Right => "right",
+        };
+        self.ctx.set_text_align(align);
+        let _ = self.ctx.fill_text(&op.text, op.x, op.y);
+        self.ctx.set_global_alpha(1.0);
+    }
 }
 
 /// The editor handle the shell talks to.
@@ -138,6 +182,7 @@ pub struct Editor {
     overlay: CanvasRenderingContext2d,
     dpr: f64,
     core: CoreEditor,
+    on_action: Option<js_sys::Function>,
 }
 
 #[wasm_bindgen]
@@ -160,14 +205,21 @@ impl Editor {
             .map(|w| w.device_pixel_ratio())
             .unwrap_or(1.0);
         let core = CoreEditor::new(canvas_core::demo_document());
-        Ok(Editor {
+        let mut editor = Editor {
             scene_canvas,
             overlay_canvas,
-            renderer: Canvas2dRenderer { ctx },
+            renderer: Canvas2dRenderer { ctx: ctx.clone() },
             overlay,
             dpr,
             core,
-        })
+            on_action: None,
+        };
+        let measurer = FontMeasurer {
+            ctx,
+            cache: Default::default(),
+        };
+        editor.core.set_measurer(Box::new(measurer));
+        Ok(editor)
     }
 
     /// Match both backing stores to their layout sizes.
@@ -183,7 +235,33 @@ impl Editor {
     /// Replace the drawing with an empty one.
     pub fn new_document(&mut self) {
         self.core = CoreEditor::new(Document::new());
+        let measurer = FontMeasurer {
+            ctx: self.renderer.ctx.clone(),
+            cache: Default::default(),
+        };
+        self.core.set_measurer(Box::new(measurer));
         self.render();
+    }
+
+    /// The shell installs a callback for shell actions (text editor, …).
+    pub fn set_action_handler(&mut self, handler: js_sys::Function) {
+        self.on_action = Some(handler);
+    }
+
+    pub fn double_click(&mut self, x: f64, y: f64) {
+        let effects = self.core.double_click(Point::new(x, y), now_ms());
+        self.apply(effects);
+    }
+
+    /// Commit the open text edit with the textarea's contents.
+    pub fn commit_text(&mut self, id: &str, text: &str) {
+        let effects = self.core.commit_text(id, text, now_ms());
+        self.apply(effects);
+    }
+
+    pub fn cancel_text(&mut self) {
+        let effects = self.core.cancel_text();
+        self.apply(effects);
     }
 
     pub fn scroll(&self) -> Vec<f64> {
@@ -381,16 +459,29 @@ impl Editor {
 
 impl Editor {
     fn apply(&mut self, effects: Effects) {
+        let actions = effects.actions.clone();
         if effects.repaint_all {
             self.render();
+        } else {
+            if !effects.changed.is_empty() {
+                let dirty = self.core.rebuild_changed(&effects.changed);
+                self.paint_dirty(&dirty);
+            }
+            if effects.overlay_changed || !effects.changed.is_empty() {
+                self.draw_overlay();
+            }
+        }
+        self.dispatch_actions(&actions);
+    }
+
+    fn dispatch_actions(&self, actions: &[ShellAction]) {
+        let Some(handler) = &self.on_action else {
             return;
-        }
-        if !effects.changed.is_empty() {
-            let dirty = self.core.scene.update(&self.core.doc, &effects.changed);
-            self.paint_dirty(&dirty);
-        }
-        if effects.overlay_changed || !effects.changed.is_empty() {
-            self.draw_overlay();
+        };
+        for action in actions {
+            if let Ok(json) = serde_json::to_string(action) {
+                let _ = handler.call1(&JsValue::NULL, &JsValue::from_str(&json));
+            }
         }
     }
 

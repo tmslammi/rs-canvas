@@ -61,6 +61,20 @@ pub struct PathOp {
     pub fill: Option<FillStyle>,
 }
 
+/// A run of laid-out text in world coordinates.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextOp {
+    /// Anchor x: left edge, centre or right edge depending on `align`.
+    pub x: f64,
+    /// Baseline y.
+    pub y: f64,
+    pub text: String,
+    pub font_size: f64,
+    pub color: String,
+    pub opacity: f64,
+    pub align: crate::model::TextAlign,
+}
+
 /// One drawing instruction.
 #[derive(Clone, Debug, PartialEq)]
 pub enum DrawOp {
@@ -71,6 +85,7 @@ pub enum DrawOp {
         segments: Vec<[Point; 2]>,
         stroke: StrokeStyle,
     },
+    Text(TextOp),
 }
 
 /// A frame's worth of drawing instructions in world coordinates.
@@ -109,4 +124,5 @@ pub trait Renderer {
     fn clear_rect(&mut self, rect: Rect, color: &str);
     fn draw_path(&mut self, op: &PathOp);
     fn draw_line_batch(&mut self, segments: &[[Point; 2]], stroke: &StrokeStyle);
+    fn draw_text(&mut self, op: &TextOp);
 }
