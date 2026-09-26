@@ -52,8 +52,15 @@ pub fn hits(doc: &Document, element: &Element, p: Point, tolerance: f64) -> bool
         ElementKind::Text { rect, .. } | ElementKind::Glyph { rect, .. } => {
             rect.expand(tolerance).contains(p)
         }
-        ElementKind::Frame { rect, .. } => near_rect_border(*rect, p, tolerance.max(4.0)),
+        ElementKind::Frame { rect, .. } => {
+            near_rect_border(*rect, p, tolerance.max(4.0)) || frame_name_hit(*rect, p)
+        }
     }
+}
+
+fn frame_name_hit(rect: Rect, p: Point) -> bool {
+    let band = Rect::new(rect.x, rect.y - 18.0, rect.w.clamp(120.0, 240.0), 18.0);
+    band.contains(p)
 }
 
 fn point_in_diamond(rect: Rect, p: Point, tolerance: f64) -> bool {

@@ -384,7 +384,7 @@ pub fn build_element_ops(
             }
             ops
         }
-        ElementKind::Frame { rect, .. } => {
+        ElementKind::Frame { rect, name } => {
             let polygon = shape_polygon(ShapeKind::Rectangle, *rect);
             let mut rng = RoughRng::seeded(seed ^ 0xF4A3E);
             let (main, _) = rough_polyline(&polygon, true, 0, &mut rng);
@@ -394,12 +394,24 @@ pub fn build_element_ops(
                 dash: Dash::Dashed,
                 opacity: 1.0,
             };
-            vec![DrawOp::Path(PathOp {
+            let mut ops = vec![DrawOp::Path(PathOp {
                 points: main,
                 closed: true,
                 stroke: Some(stroke),
                 fill: None,
-            })]
+            })];
+            if !name.is_empty() {
+                ops.push(DrawOp::Text(TextOp {
+                    x: rect.x + 2.0,
+                    y: rect.y - 8.0,
+                    text: name.clone(),
+                    font_size: 14.0,
+                    color: "#868e96".into(),
+                    opacity: 1.0,
+                    align: TextAlign::Left,
+                }));
+            }
+            ops
         }
         // Glyph rendering arrives with the shape library ticket.
         ElementKind::Glyph { .. } => Vec::new(),

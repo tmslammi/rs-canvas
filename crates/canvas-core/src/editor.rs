@@ -194,6 +194,9 @@ enum Interaction {
     Erasing {
         erased: BTreeSet<ElementId>,
     },
+    FrameNameEditing {
+        id: ElementId,
+    },
     TextEditing {
         id: ElementId,
         original: Box<Option<Element>>,
@@ -362,6 +365,7 @@ impl Editor {
         match self.tool {
             Tool::Select => self.begin_select(screen, world, mods),
             Tool::Rectangle | Tool::Diamond | Tool::Ellipse => self.begin_drawing(world, now),
+            Tool::Frame => self.begin_frame(world, now),
             Tool::Freehand => self.begin_freehand(world, now),
             Tool::Line => self.begin_line(world, now),
             Tool::Arrow => self.begin_connector(world, now),
@@ -371,7 +375,6 @@ impl Editor {
                 self.nav.start_pan(screen);
                 Effects::default()
             }
-            _ => Effects::default(),
         }
     }
 
@@ -384,15 +387,18 @@ impl Editor {
         }
         match self.interaction.clone() {
             Interaction::Idle => Effects::default(),
+            Interaction::FrameNameEditing { .. } => Effects::default(),
             Interaction::Drawing { id, start } => {
                 let current = self.camera.screen_to_world(screen);
                 let rect = self.drawn_rect(start, current, mods);
                 if let Some(tx) = self.tx.as_mut() {
-                    if let Err(err) = tx.update(&mut self.doc, &id, now, |element| {
-                        if let ElementKind::Shape { rect: r, .. } = &mut element.kind {
-                            *r = rect;
-                        }
-                    }) {
+                    if let Err(err) =
+                        tx.update(&mut self.doc, &id, now, |element| match &mut element.kind {
+                            ElementKind::Shape { rect: r, .. }
+                            | ElementKind::Frame { rect: r, .. } => *r = rect,
+                            _ => {}
+                        })
+                    {
                         debug_assert!(false, "drawing update failed: {err}");
                     }
                 }
@@ -583,6 +589,7 @@ impl Editor {
         };
         match self.interaction.clone() {
             Interaction::Idle => {}
+            Interaction::FrameNameEditing { .. } => {}
             Interaction::Drawing { id, .. } => {
                 let tiny = self
                     .doc
@@ -606,6 +613,7 @@ impl Editor {
                         ..Effects::default()
                     });
                 } else {
+                    self.sync_frame_membership(now);
                     if let Some(tx) = self.tx.take() {
                         tx.commit(&mut self.history);
                     }
@@ -636,6 +644,7 @@ impl Editor {
             }
             Interaction::Moving { .. } => {
                 self.interaction = Interaction::Idle;
+                self.sync_frame_membership(now);
                 if let Some(tx) = self.tx.take() {
                     let changed: BTreeSet<ElementId> =
                         tx.deltas().iter().map(|d| d.element_id().clone()).collect();
@@ -656,6 +665,7 @@ impl Editor {
                     .unwrap_or_default();
                 let reflows = self.bound_text_reflows(&changed);
                 let arrow_updates = self.connected_arrow_updates(&changed);
+                self.sync_frame_membership(now);
                 if let Some(tx) = self.tx.as_mut() {
                     for (text_id, rect) in &reflows {
                         let _ = tx.update(&mut self.doc, text_id, now, |element| {
@@ -734,6 +744,7 @@ impl Editor {
                         ..Effects::default()
                     });
                 } else {
+                    self.sync_frame_membership(now);
                     if let Some(tx) = self.tx.take() {
                         tx.commit(&mut self.history);
                     }
@@ -764,6 +775,7 @@ impl Editor {
                         ..Effects::default()
                     });
                 } else {
+                    self.sync_frame_membership(now);
                     if let Some(tx) = self.tx.take() {
                         tx.commit(&mut self.history);
                     }
@@ -795,6 +807,7 @@ impl Editor {
                         ..Effects::default()
                     });
                 } else {
+                    self.sync_frame_membership(now);
                     if let Some(tx) = self.tx.take() {
                         tx.commit(&mut self.history);
                     }
@@ -846,6 +859,27 @@ impl Editor {
                     self.create_bound_text(id, bounds, now)
                 }
             },
+            Some(ElementKind::Frame { rect, name, .. }) => {
+                self.interaction = Interaction::FrameNameEditing { id: id.clone() };
+                let top_left = self
+                    .camera
+                    .world_to_screen(Point::new(rect.x, rect.y - 18.0));
+                let action = ShellAction::OpenTextEditor {
+                    id,
+                    x: top_left.x,
+                    y: top_left.y,
+                    width: (rect.w * self.camera.zoom).max(120.0),
+                    height: 20.0 * self.camera.zoom.max(0.5),
+                    font_size: 14.0 * self.camera.zoom,
+                    text: name,
+                    align: TextAlign::Left,
+                };
+                Effects {
+                    overlay_changed: true,
+                    actions: vec![action],
+                    ..Effects::default()
+                }
+            }
             _ => Effects::default(),
         }
     }
@@ -1007,6 +1041,28 @@ impl Editor {
 
     /// Commit the open text edit with the shell's textarea contents.
     pub fn commit_text(&mut self, id: &str, text: &str, now: u64) -> Effects {
+        if let Interaction::FrameNameEditing { id: editing_id } = self.interaction.clone() {
+            if editing_id != id {
+                return Effects::default();
+            }
+            self.interaction = Interaction::Idle;
+            let effects = Effects {
+                changed: [id.to_string()].into_iter().collect(),
+                overlay_changed: true,
+                ..Effects::default()
+            };
+            if !text.trim().is_empty() {
+                let mut tx = Transaction::begin();
+                let name = text.to_string();
+                let _ = tx.update(&mut self.doc, id, now, |element| {
+                    if let ElementKind::Frame { name: current, .. } = &mut element.kind {
+                        *current = name.clone();
+                    }
+                });
+                tx.commit(&mut self.history);
+            }
+            return effects;
+        }
         let Interaction::TextEditing {
             id: editing_id,
             original,
@@ -1327,6 +1383,14 @@ impl Editor {
                     ..Effects::default()
                 }
             }
+            Interaction::FrameNameEditing { id } => {
+                self.interaction = Interaction::Idle;
+                Effects {
+                    changed: [id].into_iter().collect(),
+                    overlay_changed: true,
+                    ..Effects::default()
+                }
+            }
         }
     }
 
@@ -1340,7 +1404,10 @@ impl Editor {
             return Effects::default();
         }
         let mut tx = Transaction::begin();
-        let ids: Vec<ElementId> = self.selection.iter().cloned().collect();
+        let ids: Vec<ElementId> = self
+            .selection_with_followers_recursive()
+            .into_iter()
+            .collect();
         for id in &ids {
             if let Err(err) = tx.remove(&mut self.doc, id, now) {
                 debug_assert!(false, "delete failed: {err}");
@@ -1566,6 +1633,39 @@ impl Editor {
         effects
     }
 
+    fn begin_frame(&mut self, world: Point, now: u64) -> Effects {
+        let mut tx = Transaction::begin();
+        let count = self
+            .doc
+            .elements
+            .values()
+            .filter(|element| element.is_frame() && !element.is_deleted)
+            .count();
+        let name = format!("Frame {}", count + 1);
+        let element = Element::new(
+            ElementKind::Frame {
+                rect: Rect::new(world.x, world.y, 0.0, 0.0),
+                name,
+            },
+            self.next_index(),
+            now,
+        );
+        let id = element.id.clone();
+        if let Err(err) = tx.add(&mut self.doc, element) {
+            debug_assert!(false, "frame add failed: {err}");
+        }
+        self.tx = Some(tx);
+        self.interaction = Interaction::Drawing {
+            id: id.clone(),
+            start: world,
+        };
+        Effects {
+            changed: [id].into_iter().collect(),
+            overlay_changed: true,
+            ..Effects::default()
+        }
+    }
+
     fn begin_freehand(&mut self, world: Point, now: u64) -> Effects {
         let mut tx = Transaction::begin();
         let element = Element::new(
@@ -1694,6 +1794,69 @@ impl Editor {
         updates
     }
 
+    /// Frame membership updates needed after the given elements moved.
+    fn frame_membership_updates(
+        &self,
+        ids: &BTreeSet<ElementId>,
+    ) -> Vec<(ElementId, Option<ElementId>)> {
+        let mut out = Vec::new();
+        for id in ids {
+            let Some(element) = self.doc.element(id) else {
+                continue;
+            };
+            if element.is_deleted || element.is_frame() {
+                continue;
+            }
+            if let ElementKind::Text {
+                container_id: Some(_),
+                ..
+            } = &element.kind
+            {
+                continue;
+            }
+            let target = self.frame_containing(element.bounds().center());
+            if element.frame_id != target {
+                out.push((id.clone(), target));
+            }
+        }
+        out
+    }
+
+    /// The smallest frame whose rectangle contains a point.
+    fn frame_containing(&self, point: Point) -> Option<ElementId> {
+        let mut best: Option<(f64, ElementId)> = None;
+        for element in self.doc.elements.values() {
+            if element.is_deleted {
+                continue;
+            }
+            if let ElementKind::Frame { rect, .. } = &element.kind {
+                if rect.contains(point) {
+                    let area = rect.w * rect.h;
+                    if best.as_ref().map(|(a, _)| area < *a).unwrap_or(true) {
+                        best = Some((area, element.id.clone()));
+                    }
+                }
+            }
+        }
+        best.map(|(_, id)| id)
+    }
+
+    /// Reconcile frame membership inside the open transaction.
+    fn sync_frame_membership(&mut self, now: u64) {
+        let Some(tx) = self.tx.as_ref() else {
+            return;
+        };
+        let ids: BTreeSet<ElementId> = tx.deltas().iter().map(|d| d.element_id().clone()).collect();
+        let updates = self.frame_membership_updates(&ids);
+        if let Some(tx) = self.tx.as_mut() {
+            for (id, frame_id) in updates {
+                let _ = tx.update(&mut self.doc, &id, now, |element| {
+                    element.frame_id = frame_id.clone();
+                });
+            }
+        }
+    }
+
     fn begin_line(&mut self, world: Point, now: u64) -> Effects {
         let mut tx = Transaction::begin();
         let arrowhead = self.tool == Tool::Arrow;
@@ -1755,8 +1918,8 @@ impl Editor {
             .collect()
     }
 
-    /// Elements that always travel with this element (bound text; frames add
-    /// children later).
+    /// Elements that always travel with this element: bound text, frame
+    /// children.
     pub fn followers(&self, id: &str) -> Vec<ElementId> {
         match self.doc.element(id).map(|e| &e.kind) {
             Some(ElementKind::Shape {
@@ -1766,17 +1929,39 @@ impl Editor {
             | Some(ElementKind::Glyph {
                 caption_id: Some(text_id),
                 ..
+            })
+            | Some(ElementKind::Arrow {
+                label_id: Some(text_id),
+                ..
             }) => vec![text_id.clone()],
+            Some(ElementKind::Frame { .. }) => self
+                .doc
+                .elements
+                .values()
+                .filter(|element| !element.is_deleted && element.frame_id.as_deref() == Some(id))
+                .map(|element| element.id.clone())
+                .collect(),
             _ => Vec::new(),
         }
     }
 
-    fn selection_with_followers(&self) -> Vec<Element> {
-        let mut ids: BTreeSet<ElementId> = self.selection.clone();
-        for id in &self.selection {
-            ids.extend(self.followers(id));
+    /// The selection plus every follower, transitively.
+    pub fn selection_with_followers_recursive(&self) -> BTreeSet<ElementId> {
+        let mut out = self.selection.clone();
+        let mut frontier: Vec<ElementId> = out.iter().cloned().collect();
+        while let Some(id) = frontier.pop() {
+            for follower in self.followers(&id) {
+                if out.insert(follower.clone()) {
+                    frontier.push(follower);
+                }
+            }
         }
-        ids.iter()
+        out
+    }
+
+    fn selection_with_followers(&self) -> Vec<Element> {
+        self.selection_with_followers_recursive()
+            .iter()
             .filter_map(|id| self.doc.element(id).cloned())
             .collect()
     }
@@ -1829,19 +2014,19 @@ impl Editor {
         if self.interaction != Interaction::Idle {
             return Effects::default();
         }
-        let source = self.selected_elements();
+        let source = self.selection_with_followers();
         self.insert_copies(source, 12.0, 12.0, now)
     }
 
-    /// Copy the selection into the internal clipboard.
+    /// Copy the selection (with its followers) into the internal clipboard.
     pub fn copy(&mut self) -> Effects {
-        self.clipboard = self.selected_elements();
+        self.clipboard = self.selection_with_followers();
         Effects::default()
     }
 
     /// Copy and delete the selection.
     pub fn cut(&mut self, now: u64) -> Effects {
-        self.clipboard = self.selected_elements();
+        self.clipboard = self.selection_with_followers();
         self.delete_selection(now)
     }
 
@@ -2940,5 +3125,159 @@ mod tests {
             "label sits near the route midpoint: {:?}",
             label.bounds()
         );
+    }
+
+    #[test]
+    fn frame_tool_draws_a_named_frame() {
+        let mut e = editor();
+        let mods = Modifiers::default();
+        press(&mut e, "f", mods, 1);
+        e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
+        e.pointer_move(Point::new(400.0, 300.0), mods, 3);
+        e.pointer_up(Point::new(400.0, 300.0), mods, 4);
+        assert_eq!(e.doc.ordered_live().len(), 1);
+        match &e.doc.ordered_live()[0].kind {
+            ElementKind::Frame { rect, name } => {
+                assert_eq!(*rect, Rect::new(0.0, 0.0, 400.0, 300.0));
+                assert_eq!(name, "Frame 1");
+            }
+            other => panic!("expected frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dropping_shapes_in_and_out_of_a_frame_sets_membership() {
+        let mut e = editor();
+        let mods = Modifiers::default();
+        press(&mut e, "f", mods, 1);
+        e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
+        e.pointer_move(Point::new(400.0, 300.0), mods, 3);
+        e.pointer_up(Point::new(400.0, 300.0), mods, 4);
+        let frame_id = e.doc.ordered_live()[0].id.clone();
+
+        drag_shape(&mut e, Point::new(50.0, 50.0), Point::new(150.0, 150.0), 5);
+        let shape_id = e.doc.ordered_live()[1].id.clone();
+        assert_eq!(
+            e.doc.element(&shape_id).unwrap().frame_id.as_ref(),
+            Some(&frame_id),
+            "shape drawn inside the frame is owned"
+        );
+
+        press(&mut e, "v", mods, 6);
+        e.select([shape_id.clone()]);
+        e.pointer_down(Point::new(100.0, 100.0), 0, mods, 7);
+        e.pointer_move(Point::new(600.0, 100.0), mods, 8);
+        e.pointer_up(Point::new(600.0, 100.0), mods, 9);
+        assert_eq!(
+            e.doc.element(&shape_id).unwrap().frame_id,
+            None,
+            "dragged out, membership released"
+        );
+    }
+
+    #[test]
+    fn moving_a_frame_moves_its_children() {
+        let mut e = editor();
+        let mods = Modifiers::default();
+        press(&mut e, "f", mods, 1);
+        e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
+        e.pointer_move(Point::new(400.0, 300.0), mods, 3);
+        e.pointer_up(Point::new(400.0, 300.0), mods, 4);
+        let frame_id = e.doc.ordered_live()[0].id.clone();
+
+        drag_shape(&mut e, Point::new(50.0, 50.0), Point::new(150.0, 150.0), 5);
+        let shape_id = e.doc.ordered_live()[1].id.clone();
+        let before = e.doc.element(&shape_id).unwrap().bounds();
+
+        press(&mut e, "v", mods, 6);
+        e.select([frame_id.clone()]);
+        // Grab the frame by its border, away from the resize handles.
+        e.pointer_down(Point::new(300.0, 300.0), 0, mods, 7);
+        e.pointer_move(Point::new(340.0, 330.0), mods, 8);
+        e.pointer_up(Point::new(340.0, 330.0), mods, 9);
+
+        let after = e.doc.element(&shape_id).unwrap().bounds();
+        assert!((after.x - before.x - 40.0).abs() < 0.01);
+        assert!((after.y - before.y - 30.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn deleting_a_frame_deletes_children_in_one_undoable_step() {
+        let mut e = editor();
+        let mods = Modifiers::default();
+        press(&mut e, "f", mods, 1);
+        e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
+        e.pointer_move(Point::new(400.0, 300.0), mods, 3);
+        e.pointer_up(Point::new(400.0, 300.0), mods, 4);
+        let frame_id = e.doc.ordered_live()[0].id.clone();
+        drag_shape(&mut e, Point::new(50.0, 50.0), Point::new(150.0, 150.0), 5);
+        assert_eq!(e.doc.ordered_live().len(), 2);
+
+        press(&mut e, "v", mods, 6);
+        e.select([frame_id]);
+        press(&mut e, "Delete", mods, 7);
+        assert!(e.doc.ordered_live().is_empty(), "children deleted too");
+
+        let cmd = Modifiers {
+            meta: true,
+            ..Modifiers::default()
+        };
+        press(&mut e, "z", cmd, 8);
+        assert_eq!(e.doc.ordered_live().len(), 2, "one undo restores all");
+    }
+
+    #[test]
+    fn duplicating_a_frame_duplicates_its_children() {
+        let mut e = editor();
+        let mods = Modifiers::default();
+        press(&mut e, "f", mods, 1);
+        e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
+        e.pointer_move(Point::new(400.0, 300.0), mods, 3);
+        e.pointer_up(Point::new(400.0, 300.0), mods, 4);
+        let frame_id = e.doc.ordered_live()[0].id.clone();
+        drag_shape(&mut e, Point::new(50.0, 50.0), Point::new(150.0, 150.0), 5);
+
+        press(&mut e, "v", mods, 6);
+        e.select([frame_id.clone()]);
+        let cmd = Modifiers {
+            meta: true,
+            ..Modifiers::default()
+        };
+        press(&mut e, "d", cmd, 7);
+        assert_eq!(e.doc.ordered_live().len(), 4, "frame + child duplicated");
+
+        let copy_frame = e
+            .doc
+            .ordered_live()
+            .into_iter()
+            .filter(|element| element.is_frame())
+            .map(|element| element.id.clone())
+            .find(|id| id != &frame_id)
+            .expect("duplicated frame");
+        let copy_child = e
+            .doc
+            .ordered_live()
+            .into_iter()
+            .find(|element| element.frame_id.as_ref() == Some(&copy_frame));
+        assert!(copy_child.is_some(), "copy's child points at the copy");
+    }
+
+    #[test]
+    fn frame_names_are_edited_by_double_click() {
+        let mut e = editor();
+        let mods = Modifiers::default();
+        press(&mut e, "f", mods, 1);
+        e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
+        e.pointer_move(Point::new(400.0, 300.0), mods, 3);
+        e.pointer_up(Point::new(400.0, 300.0), mods, 4);
+        let frame_id = e.doc.ordered_live()[0].id.clone();
+
+        press(&mut e, "v", mods, 5);
+        e.double_click(Point::new(100.0, -8.0), 6);
+        e.commit_text(&frame_id, "us-central1", 7);
+        match &e.doc.element(&frame_id).unwrap().kind {
+            ElementKind::Frame { name, .. } => assert_eq!(name, "us-central1"),
+            other => panic!("expected frame, got {other:?}"),
+        }
     }
 }
