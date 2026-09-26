@@ -21,6 +21,8 @@ const TOOLS: ToolbarTool[] = [
   { name: "rectangle", label: "Rectangle", glyph: "▭", shortcut: "R" },
   { name: "diamond", label: "Diamond", glyph: "◇", shortcut: "D" },
   { name: "ellipse", label: "Ellipse", glyph: "◯", shortcut: "O" },
+  { name: "freehand", label: "Draw", glyph: "✎", shortcut: "P" },
+  { name: "line", label: "Line", glyph: "╱", shortcut: "L" },
 ];
 
 async function boot(): Promise<void> {
@@ -109,6 +111,7 @@ async function boot(): Promise<void> {
     } catch {
       // pointer capture is best-effort
     }
+    editor.set_pressure(event.pressure);
     editor.pointer_down(event.offsetX, event.offsetY, event.button, modifiers(event));
     refreshToolbar();
     updateCursor();
@@ -128,6 +131,7 @@ async function boot(): Promise<void> {
       pinchDistance = distance;
       return;
     }
+    editor.set_pressure(event.pressure);
     editor.pointer_move(event.offsetX, event.offsetY, modifiers(event));
     updateCursor();
   });

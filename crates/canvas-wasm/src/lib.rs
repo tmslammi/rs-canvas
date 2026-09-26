@@ -261,6 +261,11 @@ impl Editor {
         self.apply(effects);
     }
 
+    /// Forward pointer pressure for freehand capture.
+    pub fn set_pressure(&mut self, pressure: f64) {
+        self.core.set_pressure(pressure);
+    }
+
     pub fn pointer_move(&mut self, x: f64, y: f64, mods: JsValue) {
         let mods = parse_modifiers(&mods);
         let effects = self.core.pointer_move(Point::new(x, y), mods, now_ms());

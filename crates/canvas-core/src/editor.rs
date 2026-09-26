@@ -155,6 +155,13 @@ enum Interaction {
         bounds: Rect,
         originals: Vec<Element>,
     },
+    Freehand {
+        id: ElementId,
+    },
+    Line {
+        id: ElementId,
+        start: Point,
+    },
     Erasing {
         erased: BTreeSet<ElementId>,
     },
@@ -174,6 +181,7 @@ pub struct Editor {
     tx: Option<Transaction>,
     marquee_current: Option<Point>,
     clipboard: Vec<Element>,
+    last_pressure: f64,
 }
 
 impl Editor {
@@ -193,7 +201,13 @@ impl Editor {
             tx: None,
             marquee_current: None,
             clipboard: Vec::new(),
+            last_pressure: 0.5,
         }
+    }
+
+    /// The shell reports pointer pressure for freehand capture.
+    pub fn set_pressure(&mut self, pressure: f64) {
+        self.last_pressure = pressure.clamp(0.0, 1.0);
     }
 
     fn tolerance(&self) -> f64 {
@@ -283,6 +297,8 @@ impl Editor {
         match self.tool {
             Tool::Select => self.begin_select(screen, world, mods),
             Tool::Rectangle | Tool::Diamond | Tool::Ellipse => self.begin_drawing(world, now),
+            Tool::Freehand => self.begin_freehand(world, now),
+            Tool::Line | Tool::Arrow => self.begin_line(world, now),
             Tool::Eraser => self.begin_erase(world, now),
             Tool::Hand => {
                 self.nav.start_pan(screen);
@@ -374,6 +390,46 @@ impl Editor {
                 self.interaction = Interaction::Erasing { erased };
                 effects
             }
+            Interaction::Freehand { id } => {
+                let current = self.camera.screen_to_world(screen);
+                let last = self.doc.element(&id).and_then(|e| match &e.kind {
+                    ElementKind::Freehand { points, .. } => points.last().copied(),
+                    _ => None,
+                });
+                let mut effects = Effects::default();
+                let far_enough = last
+                    .map(|last| last.distance(current) >= 1.5 / self.camera.zoom)
+                    .unwrap_or(false);
+                if far_enough {
+                    let pressure = self.last_pressure;
+                    if let Some(tx) = self.tx.as_mut() {
+                        let _ = tx.update(&mut self.doc, &id, now, |element| {
+                            if let ElementKind::Freehand {
+                                points, pressures, ..
+                            } = &mut element.kind
+                            {
+                                points.push(current);
+                                pressures.push(pressure);
+                            }
+                        });
+                    }
+                    effects.changed.insert(id);
+                }
+                effects
+            }
+            Interaction::Line { id, start } => {
+                let current = self.camera.screen_to_world(screen);
+                let end = constrain_angle(start, current, mods.shift);
+                if let Some(tx) = self.tx.as_mut() {
+                    let _ = tx.update(&mut self.doc, &id, now, |element| {
+                        if let ElementKind::Arrow { end: e, .. } = &mut element.kind {
+                            e.x = end.x;
+                            e.y = end.y;
+                        }
+                    });
+                }
+                Effects::changed(id)
+            }
         }
     }
 
@@ -384,7 +440,8 @@ impl Editor {
         let mut effects = match self.interaction {
             Interaction::Drawing { .. }
             | Interaction::Moving { .. }
-            | Interaction::Resizing { .. } => self.pointer_move(screen, mods, now),
+            | Interaction::Resizing { .. }
+            | Interaction::Line { .. } => self.pointer_move(screen, mods, now),
             _ => Effects::default(),
         };
         match self.interaction.clone() {
@@ -473,6 +530,82 @@ impl Editor {
                 }
                 effects.changed.extend(erased);
                 effects.overlay_changed = true;
+            }
+            Interaction::Freehand { id } => {
+                self.interaction = Interaction::Idle;
+                if let Some(tx) = self.tx.as_mut() {
+                    let _ = tx.update(&mut self.doc, &id, now, |element| {
+                        if let ElementKind::Freehand {
+                            points, pressures, ..
+                        } = &mut element.kind
+                        {
+                            let simplified = simplify_freehand(std::mem::take(points));
+                            *points = simplified;
+                            let n = points.len();
+                            pressures.truncate(n);
+                            while pressures.len() < n {
+                                pressures.push(0.5);
+                            }
+                        }
+                    });
+                }
+                let tiny = self
+                    .doc
+                    .element(&id)
+                    .and_then(|e| match &e.kind {
+                        ElementKind::Freehand { points, .. } => Some(points.len() < 2),
+                        _ => None,
+                    })
+                    .unwrap_or(true);
+                if tiny {
+                    self.tx = None;
+                    let purged = self.doc.element(&id).cloned();
+                    if let Some(element) = purged {
+                        let _ = self.doc.apply(&Delta::Purge { element });
+                    }
+                    effects.merge(Effects {
+                        changed: [id].into_iter().collect(),
+                        overlay_changed: true,
+                        ..Effects::default()
+                    });
+                } else {
+                    if let Some(tx) = self.tx.take() {
+                        tx.commit(&mut self.history);
+                    }
+                    let selection_effects = self.select([id.clone()]);
+                    effects.changed.insert(id);
+                    effects.merge(selection_effects);
+                }
+            }
+            Interaction::Line { id, .. } => {
+                self.interaction = Interaction::Idle;
+                let tiny = self
+                    .doc
+                    .element(&id)
+                    .map(|e| {
+                        let b = e.bounds();
+                        b.w < self.min_draw_size() && b.h < self.min_draw_size()
+                    })
+                    .unwrap_or(true);
+                if tiny {
+                    self.tx = None;
+                    let purged = self.doc.element(&id).cloned();
+                    if let Some(element) = purged {
+                        let _ = self.doc.apply(&Delta::Purge { element });
+                    }
+                    effects.merge(Effects {
+                        changed: [id].into_iter().collect(),
+                        overlay_changed: true,
+                        ..Effects::default()
+                    });
+                } else {
+                    if let Some(tx) = self.tx.take() {
+                        tx.commit(&mut self.history);
+                    }
+                    let selection_effects = self.select([id.clone()]);
+                    effects.changed.insert(id);
+                    effects.merge(selection_effects);
+                }
             }
         }
         effects
@@ -586,6 +719,18 @@ impl Editor {
                 }
                 Effects {
                     changed: erased,
+                    overlay_changed: true,
+                    ..Effects::default()
+                }
+            }
+            Interaction::Freehand { id } | Interaction::Line { id, .. } => {
+                self.tx = None;
+                let purged = self.doc.element(&id).cloned();
+                if let Some(element) = purged {
+                    let _ = self.doc.apply(&Delta::Purge { element });
+                }
+                Effects {
+                    changed: [id].into_iter().collect(),
                     overlay_changed: true,
                     ..Effects::default()
                 }
@@ -774,6 +919,62 @@ impl Editor {
         self.interaction = Interaction::Erasing { erased };
         effects.overlay_changed = true;
         effects
+    }
+
+    fn begin_freehand(&mut self, world: Point, now: u64) -> Effects {
+        let mut tx = Transaction::begin();
+        let element = Element::new(
+            ElementKind::Freehand {
+                points: vec![world],
+                pressures: vec![self.last_pressure],
+                style: self.style.clone(),
+            },
+            self.next_index(),
+            now,
+        );
+        let id = element.id.clone();
+        if let Err(err) = tx.add(&mut self.doc, element) {
+            debug_assert!(false, "freehand add failed: {err}");
+        }
+        self.tx = Some(tx);
+        self.interaction = Interaction::Freehand { id: id.clone() };
+        Effects {
+            changed: [id].into_iter().collect(),
+            overlay_changed: true,
+            ..Effects::default()
+        }
+    }
+
+    fn begin_line(&mut self, world: Point, now: u64) -> Effects {
+        let mut tx = Transaction::begin();
+        let arrowhead = self.tool == Tool::Arrow;
+        let element = Element::new(
+            ElementKind::Arrow {
+                start: crate::model::Endpoint::free(world.x, world.y),
+                end: crate::model::Endpoint::free(world.x, world.y),
+                routing: crate::model::Routing::Straight,
+                start_arrowhead: false,
+                end_arrowhead: arrowhead,
+                style: self.style.clone(),
+                label_id: None,
+            },
+            self.next_index(),
+            now,
+        );
+        let id = element.id.clone();
+        if let Err(err) = tx.add(&mut self.doc, element) {
+            debug_assert!(false, "line add failed: {err}");
+        }
+        self.tx = Some(tx);
+        self.interaction = Interaction::Line {
+            id: id.clone(),
+            start: world,
+        };
+        Effects {
+            changed: [id].into_iter().collect(),
+            overlay_changed: true,
+            ..Effects::default()
+        }
     }
 
     fn erase_at(
@@ -975,6 +1176,52 @@ impl Editor {
         }
         Rect::from_points(start, current)
     }
+}
+
+/// Light smoothing for freehand capture: drop near-duplicate points, then a
+/// gentle moving average that keeps both endpoints.
+pub fn simplify_freehand(points: Vec<Point>) -> Vec<Point> {
+    let mut dedup: Vec<Point> = Vec::with_capacity(points.len());
+    for p in points {
+        if dedup
+            .last()
+            .map(|last| last.distance(p) >= 1.0)
+            .unwrap_or(true)
+        {
+            dedup.push(p);
+        }
+    }
+    if dedup.len() < 3 {
+        return dedup;
+    }
+    let mut out = Vec::with_capacity(dedup.len());
+    out.push(dedup[0]);
+    for window in dedup.windows(3) {
+        out.push(Point::new(
+            window[0].x * 0.25 + window[1].x * 0.5 + window[2].x * 0.25,
+            window[0].y * 0.25 + window[1].y * 0.5 + window[2].y * 0.25,
+        ));
+    }
+    out.push(dedup[dedup.len() - 1]);
+    out
+}
+
+/// Snap a line end to 15-degree steps when shift is held.
+fn constrain_angle(start: Point, current: Point, constrain: bool) -> Point {
+    if !constrain {
+        return current;
+    }
+    let d = current - start;
+    let length = d.length();
+    if length < 1e-6 {
+        return current;
+    }
+    let step = std::f64::consts::PI / 12.0;
+    let angle = (d.y.atan2(d.x) / step).round() * step;
+    Point::new(
+        start.x + angle.cos() * length,
+        start.y + angle.sin() * length,
+    )
 }
 
 /// Translate every kind of element in place.
@@ -1476,5 +1723,102 @@ mod tests {
         };
         press(&mut e, "z", cmd, 7);
         assert_eq!(e.doc.ordered_live().len(), 2, "one undo restores both");
+    }
+
+    #[test]
+    fn freehand_captures_points_and_smooths() {
+        let mut e = editor();
+        press(&mut e, "p", Modifiers::default(), 1);
+        let mods = Modifiers::default();
+        e.set_pressure(0.7);
+        e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
+        for i in 1..=20 {
+            e.pointer_move(
+                Point::new(i as f64 * 3.0, (i as f64 * 0.7).sin() * 4.0),
+                mods,
+                2 + i,
+            );
+        }
+        e.pointer_up(Point::new(60.0, 0.0), mods, 30);
+
+        assert_eq!(e.doc.ordered_live().len(), 1);
+        let points = match &e.doc.ordered_live()[0].kind {
+            ElementKind::Freehand {
+                points, pressures, ..
+            } => {
+                assert_eq!(pressures.len(), points.len());
+                assert!(pressures.iter().all(|p| (*p - 0.7).abs() < 1e-9));
+                points.clone()
+            }
+            other => panic!("expected freehand, got {other:?}"),
+        };
+        assert!(points.len() >= 3, "kept a stroke of points");
+        assert_eq!(points[0], Point::new(0.0, 0.0), "endpoints are preserved");
+    }
+
+    #[test]
+    fn escape_cancels_freehand() {
+        let mut e = editor();
+        press(&mut e, "p", Modifiers::default(), 1);
+        let mods = Modifiers::default();
+        e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
+        e.pointer_move(Point::new(50.0, 10.0), mods, 3);
+        e.key_down("Escape", mods, 4);
+        assert!(e.doc.is_empty());
+    }
+
+    #[test]
+    fn line_tool_creates_an_arrow_element() {
+        let mut e = editor();
+        press(&mut e, "l", Modifiers::default(), 1);
+        let mods = Modifiers::default();
+        e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
+        e.pointer_move(Point::new(100.0, 50.0), mods, 3);
+        e.pointer_up(Point::new(100.0, 50.0), mods, 4);
+
+        let element = e.doc.ordered_live()[0];
+        match &element.kind {
+            ElementKind::Arrow {
+                start,
+                end,
+                end_arrowhead,
+                ..
+            } => {
+                assert_eq!(start.point(), Point::new(0.0, 0.0));
+                assert_eq!(end.point(), Point::new(100.0, 50.0));
+                assert!(!end_arrowhead);
+            }
+            other => panic!("expected arrow, got {other:?}"),
+        }
+
+        press(&mut e, "a", Modifiers::default(), 5);
+        e.pointer_down(Point::new(200.0, 0.0), 0, mods, 6);
+        e.pointer_move(Point::new(300.0, 0.0), mods, 7);
+        e.pointer_up(Point::new(300.0, 0.0), mods, 8);
+        let arrow = e.doc.ordered_live()[1];
+        match &arrow.kind {
+            ElementKind::Arrow { end_arrowhead, .. } => assert!(end_arrowhead),
+            other => panic!("expected arrow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shift_constrains_line_to_angles() {
+        let mut e = editor();
+        press(&mut e, "l", Modifiers::default(), 1);
+        let shift = Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        };
+        e.pointer_down(Point::new(0.0, 0.0), 0, shift, 2);
+        e.pointer_move(Point::new(100.0, 10.0), shift, 3);
+        e.pointer_up(Point::new(100.0, 10.0), shift, 4);
+        let element = e.doc.ordered_live()[0];
+        if let ElementKind::Arrow { end, .. } = &element.kind {
+            assert!(end.y.abs() < 1e-6, "snapped to horizontal: {end:?}");
+            assert!((end.x - 100.4).abs() < 1.0);
+        } else {
+            panic!("expected arrow");
+        }
     }
 }
