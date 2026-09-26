@@ -22,6 +22,7 @@ declare global {
       load_json(json: string): void;
       export_svg(): string;
       export_png(scale: number): string;
+      load_benchmark_fixture(count: number): void;
     };
   }
 }

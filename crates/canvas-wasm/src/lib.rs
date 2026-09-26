@@ -256,6 +256,13 @@ impl Editor {
         self.on_action = Some(handler);
     }
 
+    /// Load the deterministic large fixture (scale verification).
+    pub fn load_benchmark_fixture(&mut self, count: usize) {
+        let doc = canvas_core::benchmark_fixture(count);
+        let effects = self.core.replace_document(doc);
+        self.apply(effects);
+    }
+
     /// Serialize the document for saving to a file.
     pub fn save_json(&self) -> String {
         canvas_core::serialization::to_json_pretty(&self.core.doc).unwrap_or_default()
