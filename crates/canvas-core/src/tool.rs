@@ -32,7 +32,7 @@ impl Tool {
         Tool::Eraser,
     ];
 
-    /// Excalidraw-familiar single-key shortcut.
+    /// Single-key tool shortcut.
     pub fn shortcut(self) -> &'static str {
         match self {
             Tool::Select => "v",
