@@ -1,4 +1,4 @@
-import init, { Editor } from "./wasm/canvas_wasm.js";
+import init, { Editor, load_saved_json } from "./wasm/canvas_wasm.js";
 import { createStylePanel } from "./stylePanel";
 import "./styles.css";
 
@@ -44,6 +44,18 @@ async function boot(): Promise<void> {
   const stylePanelHost = document.getElementById("style-panel") as HTMLElement;
   const editor = new Editor(scene, overlay);
   const stylePanel = createStylePanel(stylePanelHost, editor);
+
+  const toast = document.createElement("div");
+  toast.id = "toast";
+  document.body.appendChild(toast);
+  let toastTimer = 0;
+  const showToast = (message: string, isError = false): void => {
+    toast.textContent = message;
+    toast.classList.toggle("error", isError);
+    toast.classList.add("visible");
+    window.clearTimeout(toastTimer);
+    toastTimer = window.setTimeout(() => toast.classList.remove("visible"), 3200);
+  };
 
   const updateCursor = (): void => {
     scene.style.cursor = editor.cursor();
@@ -92,6 +104,71 @@ async function boot(): Promise<void> {
 
   toolbar.appendChild(undoButton);
   toolbar.appendChild(redoButton);
+
+  // -- files --------------------------------------------------------------
+
+  const fileDivider = document.createElement("div");
+  fileDivider.className = "divider";
+  toolbar.appendChild(fileDivider);
+
+  const newButton = document.createElement("button");
+  newButton.textContent = "✚";
+  newButton.title = "New drawing";
+  newButton.addEventListener("click", () => {
+    editor.new_document();
+    refreshToolbar();
+    showToast("New drawing");
+  });
+
+  const openButton = document.createElement("button");
+  openButton.textContent = "📂";
+  openButton.title = "Open… (⌘O)";
+
+  const saveButton = document.createElement("button");
+  saveButton.textContent = "💾";
+  saveButton.title = "Save (⌘S)";
+
+  toolbar.appendChild(newButton);
+  toolbar.appendChild(openButton);
+  toolbar.appendChild(saveButton);
+
+  const fileInput = document.createElement("input");
+  fileInput.type = "file";
+  fileInput.id = "file-input";
+  fileInput.accept = ".json,application/json";
+  fileInput.style.display = "none";
+  document.body.appendChild(fileInput);
+
+  const saveFile = (): void => {
+    const json = editor.save_json();
+    const blob = new Blob([json], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    const stamp = new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-");
+    anchor.href = url;
+    anchor.download = `rs-canvas-${stamp}.json`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+    showToast("Saved");
+  };
+
+  openButton.addEventListener("click", () => fileInput.click());
+  saveButton.addEventListener("click", () => saveFile());
+
+  fileInput.addEventListener("change", async () => {
+    const file = fileInput.files?.[0];
+    if (!file) return;
+    const text = await file.text();
+    try {
+      editor.load_json(text);
+      refreshToolbar();
+      updateCursor();
+      showToast(`Opened ${file.name}`);
+    } catch (error) {
+      showToast(`Could not open: ${String(error)}`, true);
+    }
+    fileInput.value = "";
+  });
 
   const refreshToolbar = (): void => {
     const active = editor.active_tool();
@@ -266,6 +343,16 @@ async function boot(): Promise<void> {
     ) {
       return;
     }
+    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") {
+      event.preventDefault();
+      saveFile();
+      return;
+    }
+    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "o") {
+      event.preventDefault();
+      fileInput.click();
+      return;
+    }
     const handled = editor.key_down(
       event.key,
       event.shiftKey,
@@ -293,6 +380,17 @@ async function boot(): Promise<void> {
   window.addEventListener("resize", redraw);
 
   redraw();
+
+  try {
+    const saved = await load_saved_json();
+    if (saved) {
+      editor.load_json(saved);
+      showToast("Restored your last drawing");
+    }
+  } catch (error) {
+    console.warn("could not restore autosave", error);
+  }
+
   refreshToolbar();
 
   window.__rsEditor = editor;

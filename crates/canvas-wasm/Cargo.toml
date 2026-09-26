@@ -10,9 +10,11 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 canvas-core = { path = "../canvas-core" }
 wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 serde_json = { workspace = true }
 console_error_panic_hook = "0.1"
+idb = "0.6"
 
 [dependencies.web-sys]
 version = "0.3"

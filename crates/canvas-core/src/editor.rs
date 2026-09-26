@@ -245,6 +245,28 @@ impl Editor {
         editor
     }
 
+    /// Whether a gesture is in progress (no committed save point yet).
+    pub fn is_interacting(&self) -> bool {
+        self.interaction != Interaction::Idle
+    }
+
+    /// Replace the whole document (used when opening a file or restoring).
+    pub fn replace_document(&mut self, doc: Document) -> Effects {
+        self.doc = doc;
+        self.history = History::new();
+        self.selection.clear();
+        self.interaction = Interaction::Idle;
+        self.tx = None;
+        self.marquee_current = None;
+        self.hover_anchors = None;
+        self.refresh_scene();
+        Effects {
+            repaint_all: true,
+            overlay_changed: true,
+            ..Effects::default()
+        }
+    }
+
     /// Install a real text measurer (the wasm façade does this).
     pub fn set_measurer(&mut self, measurer: Box<dyn TextMeasurer>) {
         self.measurer = measurer;

@@ -166,3 +166,28 @@ body {
   width: 100%;
   margin: 2px 0 0;
 }
+
+#toast {
+  position: absolute;
+  bottom: 18px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 8px 14px;
+  border-radius: 8px;
+  background: #343a40;
+  color: #ffffff;
+  font-family: system-ui, sans-serif;
+  font-size: 13px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s ease;
+  z-index: 20;
+}
+
+#toast.visible {
+  opacity: 1;
+}
+
+#toast.error {
+  background: #c92a2a;
+}

@@ -18,6 +18,8 @@ declare global {
       selection_bounds(): Float64Array | undefined;
       current_style(): string;
       update_style(patch: string): void;
+      save_json(): string;
+      load_json(json: string): void;
     };
   }
 }

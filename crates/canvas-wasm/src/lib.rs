@@ -3,6 +3,11 @@
 //! Owns the two canvases and forwards input into the core Editor; every
 //! input returns Effects that say what to repaint.
 
+mod storage;
+
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use canvas_core::{
     Affine, Document, DrawOp, Editor as CoreEditor, Effects, FillStyle, Modifiers, Point, Rect,
     Renderer, ShellAction, StrokeStyle, StylePatch, TextAlign, TextMeasurer, TextOp, Tool,
@@ -183,6 +188,7 @@ pub struct Editor {
     dpr: f64,
     core: CoreEditor,
     on_action: Option<js_sys::Function>,
+    pending_save: Rc<RefCell<Option<String>>>,
 }
 
 #[wasm_bindgen]
@@ -213,6 +219,7 @@ impl Editor {
             dpr,
             core,
             on_action: None,
+            pending_save: Rc::new(RefCell::new(None)),
         };
         let measurer = FontMeasurer {
             ctx,
@@ -241,11 +248,27 @@ impl Editor {
         };
         self.core.set_measurer(Box::new(measurer));
         self.render();
+        self.schedule_save();
     }
 
     /// The shell installs a callback for shell actions (text editor, …).
     pub fn set_action_handler(&mut self, handler: js_sys::Function) {
         self.on_action = Some(handler);
+    }
+
+    /// Serialize the document for saving to a file.
+    pub fn save_json(&self) -> String {
+        canvas_core::serialization::to_json_pretty(&self.core.doc).unwrap_or_default()
+    }
+
+    /// Replace the document from a JSON file; errors are user-facing messages.
+    pub fn load_json(&mut self, json: &str) -> Result<(), JsValue> {
+        let doc = canvas_core::serialization::from_json(json)
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        let effects = self.core.replace_document(doc);
+        self.apply(effects);
+        self.schedule_save();
+        Ok(())
     }
 
     pub fn double_click(&mut self, x: f64, y: f64) {
@@ -473,6 +496,8 @@ impl Editor {
 impl Editor {
     fn apply(&mut self, effects: Effects) {
         let actions = effects.actions.clone();
+        let durable =
+            !self.core.is_interacting() && (effects.repaint_all || !effects.changed.is_empty());
         if effects.repaint_all {
             self.render();
         } else {
@@ -485,6 +510,30 @@ impl Editor {
             }
         }
         self.dispatch_actions(&actions);
+        if durable {
+            self.schedule_save();
+        }
+    }
+
+    /// Debounced autosave: serialize now, write after a quiet period.
+    fn schedule_save(&mut self) {
+        let json = canvas_core::serialization::to_json(&self.core.doc).unwrap_or_default();
+        *self.pending_save.borrow_mut() = Some(json);
+        let cell = self.pending_save.clone();
+        let callback = wasm_bindgen::closure::Closure::once_into_js(move || {
+            let pending = cell.borrow_mut().take();
+            if let Some(json) = pending {
+                wasm_bindgen_futures::spawn_local(async move {
+                    let _ = storage::save_document(&json).await;
+                });
+            }
+        });
+        if let Some(window) = web_sys::window() {
+            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                callback.unchecked_ref(),
+                700,
+            );
+        }
     }
 
     fn dispatch_actions(&self, actions: &[ShellAction]) {
@@ -630,6 +679,12 @@ impl Editor {
         }
         self.overlay.restore();
     }
+}
+
+/// Load the autosaved document, if any (the shell calls this at boot).
+#[wasm_bindgen]
+pub async fn load_saved_json() -> Option<String> {
+    storage::load_document().await.ok().flatten()
 }
 
 fn parse_modifiers(value: &JsValue) -> Modifiers {
