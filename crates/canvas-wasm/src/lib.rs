@@ -294,24 +294,27 @@ impl Editor {
             ctrl,
             meta,
         };
-        let handled = matches!(key, " " | "Escape" | "Delete" | "Backspace")
-            || mods.command()
-            || Tool::from_shortcut(key).is_some();
-        if matches!(key, " " | "Escape" | "Delete" | "Backspace") || mods.command() {
-            let effects = self.core.key_down(key, mods, now_ms());
-            self.apply(effects);
-        } else if let Some(tool) = Tool::from_shortcut(key) {
-            self.core.tool = tool;
-            self.draw_overlay();
-        } else if key == "1" && shift {
+        if shift && !mods.command() && key == "1" {
             self.zoom_to_fit();
-        } else if key == "0" && shift {
-            self.reset_zoom();
-        } else {
-            let effects = self.core.key_down(key, mods, now_ms());
-            self.apply(effects);
+            return true;
         }
-        handled
+        if shift && !mods.command() && key == "0" {
+            self.reset_zoom();
+            return true;
+        }
+        let effects = self.core.key_down(key, mods, now_ms());
+        self.apply(effects);
+        matches!(
+            key,
+            " " | "Escape"
+                | "Delete"
+                | "Backspace"
+                | "ArrowUp"
+                | "ArrowDown"
+                | "ArrowLeft"
+                | "ArrowRight"
+        ) || mods.command()
+            || Tool::from_shortcut(key).is_some()
     }
 
     pub fn key_up(&mut self, key: &str) {
