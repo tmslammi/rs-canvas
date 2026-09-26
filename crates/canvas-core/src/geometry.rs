@@ -1,7 +1,7 @@
 //! Basic 2D geometry used across the core.
 
 /// A point in world or screen space. Coordinates are y-down, canvas-style.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Point {
     pub x: f64,
     pub y: f64,
@@ -55,7 +55,7 @@ impl std::ops::Sub for Point {
 }
 
 /// An axis-aligned rectangle.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Rect {
     pub x: f64,
     pub y: f64,
