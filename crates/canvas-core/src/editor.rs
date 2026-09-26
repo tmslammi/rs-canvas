@@ -404,7 +404,7 @@ impl Editor {
             Tool::Line => self.begin_line(world, now),
             Tool::Arrow => self.begin_connector(world, now),
             Tool::Eraser => self.begin_erase(world, now),
-            Tool::Text => self.start_text(world, now),
+            Tool::Text => self.begin_text_tool(world, now),
             Tool::Hand => {
                 self.nav.start_pan(screen);
                 Effects::default()
@@ -916,6 +916,22 @@ impl Editor {
             }
             _ => Effects::default(),
         }
+    }
+
+    /// The text tool: clicking existing text edits it; clicking empty canvas
+    /// starts a new point-text element.
+    fn begin_text_tool(&mut self, world: Point, now: u64) -> Effects {
+        let tolerance = self.tolerance();
+        if let Some(id) = hit_test(&self.doc, world, tolerance) {
+            let is_text = matches!(
+                self.doc.element(&id).map(|e| &e.kind),
+                Some(ElementKind::Text { .. })
+            );
+            if is_text {
+                return self.begin_text_edit(self.doc.element(&id).cloned(), now);
+            }
+        }
+        self.start_text(world, now)
     }
 
     /// Create a point-text element and open the editor.
@@ -3389,6 +3405,30 @@ mod tests {
         match &e.doc.element(&frame_id).unwrap().kind {
             ElementKind::Frame { name, .. } => assert_eq!(name, "us-central1"),
             other => panic!("expected frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn text_tool_click_on_existing_text_edits_instead_of_stacking() {
+        let mut e = editor();
+        let mods = Modifiers::default();
+        press(&mut e, "t", mods, 1);
+        e.pointer_down(Point::new(50.0, 50.0), 0, mods, 2);
+        let id = e.doc.ordered_live()[0].id.clone();
+        e.commit_text(&id, "hello", 3);
+        assert_eq!(e.doc.ordered_live().len(), 1);
+
+        e.pointer_down(Point::new(55.0, 55.0), 0, mods, 4);
+        assert_eq!(
+            e.doc.ordered_live().len(),
+            1,
+            "clicking existing text does not stack a new element"
+        );
+        e.commit_text(&id, "hello world", 5);
+        assert_eq!(e.doc.ordered_live().len(), 1);
+        match &e.doc.element(&id).unwrap().kind {
+            ElementKind::Text { text, .. } => assert_eq!(text, "hello world"),
+            other => panic!("expected text, got {other:?}"),
         }
     }
 
