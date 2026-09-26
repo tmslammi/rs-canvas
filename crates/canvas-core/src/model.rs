@@ -80,7 +80,7 @@ pub struct Style {
 impl Default for Style {
     fn default() -> Self {
         Self {
-            stroke_color: "#1e1e1e".into(),
+            stroke_color: "#ece4d6".into(),
             fill_color: "transparent".into(),
             fill_style: FillPattern::Hachure,
             stroke_width: 2.0,
@@ -500,7 +500,7 @@ mod tests {
     #[test]
     fn style_defaults_are_sane() {
         let style = Style::default();
-        assert_eq!(style.stroke_color, "#1e1e1e");
+        assert_eq!(style.stroke_color, "#ece4d6");
         assert_eq!(style.opacity, 1.0);
         assert!((0..=2).contains(&style.roughness));
     }

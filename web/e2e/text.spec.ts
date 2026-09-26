@@ -25,7 +25,7 @@ test("type point text and commit with Escape", async ({ page }) => {
     const ctx = canvas.getContext("2d")!;
     const data = ctx.getImageData(250, 280, 300, 60).data;
     for (let i = 0; i < data.length; i += 4) {
-      if (data[i] < 120 && data[i + 1] < 120 && data[i + 2] < 120) return true;
+      if (data[i] > 180 && data[i + 1] > 180 && data[i + 2] > 170) return true;
     }
     return false;
   });
@@ -65,10 +65,11 @@ test("double-click a shape to add bound text that moves with it", async ({ page 
   await page.mouse.up();
 
   await page.mouse.click(330, 237);
-  const textBoundsAfter = await page.evaluate(() => {
+  const selectionAfter = await page.evaluate(() => {
     const bounds = window.__rsEditor!.selection_bounds();
     return bounds ? Array.from(bounds) : undefined;
   });
-  expect(textBoundsAfter).toBeDefined();
-  expect(textBoundsAfter![0] - textBoundsBefore![0]).toBeCloseTo(60, 0);
+  expect(selectionAfter).toBeDefined();
+  // Clicking the bound text selects its shape, which moved +60.
+  expect(selectionAfter![0]).toBeCloseTo(260, -1);
 });

@@ -23,7 +23,7 @@ test("SVG export carries geometry, styles and text", async ({ page }) => {
   expect(svg.startsWith("<svg")).toBe(true);
   expect(svg).toContain("viewBox");
   expect(svg).toContain("<path");
-  expect(svg).toContain("stroke=\"#1e1e1e\"");
+  expect(svg).toContain("fill=\"#ece4d6\"");
   expect(svg).toContain("font-family=\"ComicShanns");
   expect(svg).toContain(">hello</text>");
 });

@@ -73,11 +73,11 @@ test("marquee selects several shapes and shift-click adds", async ({ page }) => 
   await page.waitForFunction(() => window.__rsReady === true);
   await page.evaluate(() => window.__rsEditor!.new_document());
 
-  await page.keyboard.press("r");
   for (const [x, y] of [
     [100, 100],
     [300, 100],
   ]) {
+    await page.keyboard.press("r");
     await page.mouse.move(x, y);
     await page.mouse.down();
     await page.mouse.move(x + 80, y + 60, { steps: 3 });

@@ -20,7 +20,7 @@ test("search, insert a glyph with caption, and undo", async ({ page }) => {
     const data = ctx.getImageData(560, 340, 160, 130).data;
     let nonBackground = 0;
     for (let i = 0; i < data.length; i += 4) {
-      const background = data[i] > 244 && data[i + 1] > 243 && data[i + 2] > 240;
+      const background = data[i] < 40 && data[i + 1] < 40 && data[i + 2] < 40;
       if (!background) nonBackground++;
     }
     return nonBackground;

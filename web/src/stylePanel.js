@@ -1,27 +1,11 @@
-interface Style {
-  strokeColor: string;
-  fillColor: string;
-  fillStyle: string;
-  strokeWidth: number;
-  roughness: number;
-  dash: string;
-  opacity: number;
-  fontSize: number;
-}
-
-export interface StyleEditor {
-  current_style(): string;
-  update_style(patch: string): void;
-}
-
 const STROKE_COLORS = [
-  "#1e1e1e",
-  "#e03131",
-  "#2f9e44",
-  "#1971c2",
-  "#f08c00",
-  "#9c36b5",
-  "#0c8599",
+  "#ece4d6",
+  "#ff8787",
+  "#69db7c",
+  "#74c0fc",
+  "#ffc078",
+  "#d0bfff",
+  "#66d9e8",
 ];
 
 const FILL_COLORS = [
@@ -34,14 +18,11 @@ const FILL_COLORS = [
   "#ffd8a8",
 ];
 
-export function createStylePanel(
-  container: HTMLElement,
-  editor: StyleEditor,
-): { refresh(): void } {
-  const matchers: Array<{ el: HTMLElement; match: (style: Style) => boolean }> = [];
-  let opacity: HTMLInputElement;
+export function createStylePanel(container, editor) {
+  const matchers = [];
+  let opacity;
 
-  const row = (label: string): HTMLDivElement => {
+  const row = (label) => {
     const section = document.createElement("div");
     section.className = "style-section";
     const title = document.createElement("div");
@@ -55,13 +36,7 @@ export function createStylePanel(
     return options;
   };
 
-  const button = (
-    parent: HTMLElement,
-    glyph: string,
-    title: string,
-    match: (style: Style) => boolean,
-    run: () => void,
-  ): HTMLButtonElement => {
+  const button = (parent, glyph, title, match, run) => {
     const el = document.createElement("button");
     el.textContent = glyph;
     el.title = title;
@@ -73,16 +48,15 @@ export function createStylePanel(
     return el;
   };
 
-  const swatches = (
-    label: string,
-    colors: string[],
-    field: "strokeColor" | "fillColor",
-  ): void => {
+  const swatches = (label, colors, field) => {
     const options = row(label);
     for (const color of colors) {
       const el = document.createElement("button");
       el.className = "swatch";
-      el.title = color === "transparent" ? `${field === "strokeColor" ? "Stroke" : "Fill"} transparent` : `${field === "strokeColor" ? "Stroke" : "Fill"} ${color}`;
+      el.title =
+        color === "transparent"
+          ? `${field === "strokeColor" ? "Stroke" : "Fill"} transparent`
+          : `${field === "strokeColor" ? "Stroke" : "Fill"} ${color}`;
       if (color === "transparent") {
         el.classList.add("swatch-transparent");
       } else {
@@ -100,8 +74,8 @@ export function createStylePanel(
   swatches("Stroke", STROKE_COLORS, "strokeColor");
   swatches("Fill", FILL_COLORS, "fillColor");
 
-  const fills = row("Fill style");
-  const fillOptions: Array<[string, string, string]> = [
+  const fills = row("Ink fill");
+  const fillOptions = [
     ["▨", "Hachure", "hachure"],
     ["▩", "Cross-hatch", "crosshatch"],
     ["■", "Solid", "solid"],
@@ -113,9 +87,10 @@ export function createStylePanel(
     });
   }
 
-  const widths = row("Stroke width");
+  const widths = row("Pen width");
+  const widthGlyphs = { 1: "·", 2: "•", 4: "⬤" };
   for (const value of [1, 2, 4]) {
-    button(widths, ["·", "•", "⬤"][value === 1 ? 0 : value === 2 ? 1 : 2], `Stroke width ${value}`, (style) => style.strokeWidth === value, () => {
+    button(widths, widthGlyphs[value], `Stroke width ${value}`, (style) => style.strokeWidth === value, () => {
       editor.update_style(JSON.stringify({ strokeWidth: value }));
       refresh();
     });
@@ -129,12 +104,12 @@ export function createStylePanel(
     });
   }
 
-  const dashes = row("Stroke style");
+  const dashes = row("Line style");
   for (const [glyph, title, value] of [
     ["—", "Solid", "solid"],
     ["– –", "Dashed", "dashed"],
     ["··", "Dotted", "dotted"],
-  ] as const) {
+  ]) {
     button(dashes, glyph, `Stroke style ${title}`, (style) => style.dash === value, () => {
       editor.update_style(JSON.stringify({ dash: value }));
       refresh();
@@ -153,22 +128,22 @@ export function createStylePanel(
   });
   opacityRow.appendChild(opacity);
 
-  const fonts = row("Font size");
+  const fonts = row("Lettering");
   for (const [glyph, value] of [
     ["S", 16],
     ["M", 20],
     ["L", 28],
-  ] as Array<[string, number]>) {
+  ]) {
     button(fonts, glyph, `Font size ${value}`, (style) => style.fontSize === value, () => {
       editor.update_style(JSON.stringify({ fontSize: value }));
       refresh();
     });
   }
 
-  const refresh = (): void => {
-    let style: Style;
+  const refresh = () => {
+    let style;
     try {
-      style = JSON.parse(editor.current_style()) as Style;
+      style = JSON.parse(editor.current_style());
     } catch {
       return;
     }

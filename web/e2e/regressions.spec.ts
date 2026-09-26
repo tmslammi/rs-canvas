@@ -97,7 +97,8 @@ test("clicking placed text with the text tool edits it instead of stacking a new
   await placeText(page);
   expect(await count(page)).toBe(1);
 
-  // Text tool is still active; clicking the placed text should edit it.
+  // Re-arm the text tool; clicking the placed text should edit it.
+  await page.keyboard.press("t");
   await page.mouse.click(320, 310);
   await expect(page.locator("#text-editor")).toBeVisible();
   const textarea = page.locator("#text-editor");
@@ -154,8 +155,144 @@ test("undo and redo cover connectors", async ({ page }) => {
   expect(await count(page), "redo restores the connector").toBe(3);
 });
 
-test("text committed by clicking away is one undo step", async ({ page }) => {
+test("dragging a resize handle past the opposite corner flips the shape", async ({ page }) => {
   await page.goto("/");
+  await page.waitForFunction(() => window.__rsReady === true);
+  await page.evaluate(() => window.__rsEditor!.new_document());
+
+  await page.keyboard.press("r");
+  await page.mouse.move(200, 200);
+  await page.mouse.down();
+  await page.mouse.move(400, 300, { steps: 5 });
+  await page.mouse.up();
+
+  // NE handle at (400, 200); drag it past the SW corner (200, 300).
+  await page.mouse.move(400, 200);
+  await page.mouse.down();
+  await page.mouse.move(150, 350, { steps: 6 });
+  await page.mouse.up();
+
+  const flipped = await selectionBounds(page);
+  expect(flipped).toBeDefined();
+  expect(flipped![0]).toBeCloseTo(150, -1);
+  expect(flipped![1]).toBeCloseTo(300, -1);
+  expect(flipped![2]).toBeCloseTo(50, -1);
+  expect(flipped![3]).toBeCloseTo(50, -1);
+
+  await page.keyboard.press("ControlOrMeta+z");
+  await page.keyboard.press("v");
+  await page.mouse.click(300, 250);
+  const restored = await selectionBounds(page);
+  expect(restored![0]).toBeCloseTo(200, -1);
+  expect(restored![2]).toBeCloseTo(200, -1);
+});
+
+test("after drawing, the shape can be resized without re-picking a tool", async ({ page }) => {
+  await page.goto("/");
+  await page.waitForFunction(() => window.__rsReady === true);
+  await page.evaluate(() => window.__rsEditor!.new_document());
+
+  await page.keyboard.press("r");
+  await page.mouse.move(200, 200);
+  await page.mouse.down();
+  await page.mouse.move(400, 300, { steps: 5 });
+  await page.mouse.up();
+
+  expect(
+    await page.evaluate(() => window.__rsEditor!.active_tool()),
+    "the draw tool hands back to select",
+  ).toBe("select");
+
+  // Grab the SE handle straight away: no tool switch.
+  await page.mouse.move(400, 300);
+  await page.mouse.down();
+  await page.mouse.move(500, 350, { steps: 5 });
+  await page.mouse.up();
+
+  const resized = await selectionBounds(page);
+  expect(resized![2]).toBeCloseTo(300, -1);
+  expect(resized![3]).toBeCloseTo(150, -1);
+});
+
+test("a locked tool draws repeatedly; unlocking returns to select", async ({ page }) => {
+  await page.goto("/");
+  await page.waitForFunction(() => window.__rsReady === true);
+  await page.evaluate(() => window.__rsEditor!.new_document());
+
+  const rectangle = page.getByTitle("Rectangle — R");
+  await rectangle.click();
+  await rectangle.dblclick();
+  expect(await page.evaluate(() => window.__rsEditor!.is_tool_locked())).toBe(true);
+
+  for (const x of [100, 400]) {
+    await page.mouse.move(x, 150);
+    await page.mouse.down();
+    await page.mouse.move(x + 120, 230, { steps: 4 });
+    await page.mouse.up();
+  }
+  expect(await count(page)).toBe(2);
+  expect(await page.evaluate(() => window.__rsEditor!.active_tool())).toBe("rectangle");
+
+  await rectangle.dblclick();
+  expect(await page.evaluate(() => window.__rsEditor!.is_tool_locked())).toBe(false);
+  await page.mouse.move(700, 150);
+  await page.mouse.down();
+  await page.mouse.move(820, 230, { steps: 4 });
+  await page.mouse.up();
+  expect(await count(page)).toBe(3);
+  expect(await page.evaluate(() => window.__rsEditor!.active_tool())).toBe("select");
+});
+
+test("an inserted library glyph can be selected and moved", async ({ page }) => {
+  await page.goto("/");
+  await page.waitForFunction(() => window.__rsReady === true);
+  await page.evaluate(() => window.__rsEditor!.new_document());
+  await page.getByTitle("Shapes library").click();
+  await page.locator(".library-search").fill("cloud storage");
+  await page.getByTitle("Insert Cloud Storage").click();
+  expect(await count(page)).toBe(2);
+
+  await page.keyboard.press("v");
+  await page.mouse.click(950, 650);
+  expect(await selectionBounds(page)).toBeUndefined();
+
+  // The glyph is 96x96 at the viewport centre (1280x800 -> 592..688).
+  await page.mouse.click(640, 400);
+  const selected = await selectionBounds(page);
+  expect(selected, "clicking the glyph selects it").toBeDefined();
+  expect(selected![0]).toBeCloseTo(592, -1);
+  expect(selected![1]).toBeCloseTo(352, -1);
+  expect(selected![2]).toBeCloseTo(96, -1);
+
+  await page.mouse.move(640, 400);
+  await page.mouse.down();
+  await page.mouse.move(740, 450, { steps: 5 });
+  await page.mouse.up();
+  const moved = await selectionBounds(page);
+  expect(moved![0]).toBeCloseTo(692, -1);
+  expect(moved![1]).toBeCloseTo(402, -1);
+
+  // The caption belongs to the component: clicking it selects the glyph
+  // (which owns the caption), not the caption alone.
+  await page.keyboard.press("ControlOrMeta+z");
+  await page.mouse.click(950, 650);
+  expect(await selectionBounds(page)).toBeUndefined();
+  await page.mouse.click(640, 465);
+  const viaCaption = await selectionBounds(page);
+  expect(viaCaption, "clicking the caption selects the component").toBeDefined();
+  expect(viaCaption![2]).toBeCloseTo(96, -1);
+
+  // Dragging the caption moves the whole component.
+  await page.mouse.move(640, 465);
+  await page.mouse.down();
+  await page.mouse.move(540, 515, { steps: 5 });
+  await page.mouse.up();
+  const dragged = await selectionBounds(page);
+  expect(dragged![0]).toBeCloseTo(492, -1);
+  expect(dragged![1]).toBeCloseTo(402, -1);
+});
+
+test("text committed by clicking away is one undo step", async ({ page }) => {  await page.goto("/");
   await page.waitForFunction(() => window.__rsReady === true);
   await page.evaluate(() => window.__rsEditor!.new_document());
 

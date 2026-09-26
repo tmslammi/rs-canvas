@@ -221,11 +221,114 @@ fn stroke_of(style: &Style, width: f64) -> StrokeStyle {
     }
 }
 
-/// Rough outline ops for a polygon.
-pub fn outline_ops(polygon: &[Point], style: &Style, seed: u64, closed: bool) -> Vec<DrawOp> {
-    if style.stroke_color == "transparent" || polygon.len() < 2 {
+/// The outward normal at vertex `i` (averaged across adjacent segments).
+fn normal_at(points: &[Point], i: usize, closed: bool) -> Point {
+    let n = points.len();
+    let prev = if i > 0 {
+        Some(points[i - 1])
+    } else if closed {
+        Some(points[n - 1])
+    } else {
+        None
+    };
+    let next = if i + 1 < n {
+        Some(points[i + 1])
+    } else if closed {
+        Some(points[0])
+    } else {
+        None
+    };
+    let mut acc = Point::ZERO;
+    if let Some(p) = prev {
+        let d = points[i] - p;
+        if d.length() > 1e-9 {
+            acc = acc + Point::new(-d.y, d.x).scale(1.0 / d.length());
+        }
+    }
+    if let Some(q) = next {
+        let d = q - points[i];
+        if d.length() > 1e-9 {
+            acc = acc + Point::new(-d.y, d.x).scale(1.0 / d.length());
+        }
+    }
+    let len = acc.length();
+    if len < 1e-9 {
+        Point::new(0.0, 1.0)
+    } else {
+        acc.scale(1.0 / len)
+    }
+}
+
+/// A filled outline with per-vertex widths: the ink band of a pen stroke.
+/// Open paths taper toward both ends; closed paths keep their width.
+pub fn pen_band(
+    points: &[Point],
+    closed: bool,
+    widths: &[f64],
+    roughness: u8,
+    rng: &mut RoughRng,
+) -> Vec<Point> {
+    let n = points.len();
+    if n < 2 {
         return Vec::new();
     }
+    let mut arc = vec![0.0_f64; n];
+    if !closed {
+        for i in 1..n {
+            arc[i] = arc[i - 1] + points[i - 1].distance(points[i]);
+        }
+    }
+    let total = if closed {
+        (0..n)
+            .map(|i| points[i].distance(points[(i + 1) % n]))
+            .sum()
+    } else {
+        arc[n - 1]
+    };
+    let noise_amp = 0.10 + roughness as f64 * 0.06;
+    let taper_span = 0.12_f64;
+    let mut left = Vec::with_capacity(n);
+    let mut right = Vec::with_capacity(n);
+    for i in 0..n {
+        let width = widths
+            .get(i)
+            .copied()
+            .or_else(|| widths.last().copied())
+            .unwrap_or(2.0)
+            .max(0.3);
+        let taper = if closed || total <= 1e-6 {
+            1.0
+        } else {
+            let t = arc[i] / total;
+            let edge = (t / taper_span).min((1.0 - t) / taper_span).clamp(0.0, 1.0);
+            0.3 + 0.7 * edge
+        };
+        let half = width * 0.5 * taper * (1.0 + rng.signed() * noise_amp);
+        let normal = normal_at(points, i, closed);
+        left.push(points[i] + normal.scale(half));
+        right.push(points[i] - normal.scale(half));
+    }
+    let mut band = left;
+    band.extend(right.into_iter().rev());
+    band
+}
+
+fn ink_path(points: Vec<Point>, style: &Style) -> Option<DrawOp> {
+    if points.len() < 3 {
+        return None;
+    }
+    Some(DrawOp::Path(PathOp {
+        points,
+        closed: true,
+        stroke: None,
+        fill: Some(FillStyle::Solid {
+            color: style.stroke_color.clone(),
+            opacity: style.opacity,
+        }),
+    }))
+}
+
+fn stroked_paths(polygon: &[Point], style: &Style, seed: u64, closed: bool) -> Vec<DrawOp> {
     let mut rng = RoughRng::seeded(seed);
     let (main, extras) = rough_polyline(polygon, closed, style.roughness, &mut rng);
     let stroke = stroke_of(style, style.stroke_width);
@@ -245,6 +348,35 @@ pub fn outline_ops(polygon: &[Point], style: &Style, seed: u64, closed: bool) ->
             stroke: Some(stroke.clone()),
             fill: None,
         }));
+    }
+    ops
+}
+
+/// Rough outline ops for a polygon, drawn as pen ink.
+pub fn outline_ops(polygon: &[Point], style: &Style, seed: u64, closed: bool) -> Vec<DrawOp> {
+    if style.stroke_color == "transparent" || polygon.len() < 2 {
+        return Vec::new();
+    }
+    if style.dash != crate::model::StrokeDash::Solid {
+        // Dash patterns need geometric strokes; ink bands cannot be dashed.
+        return stroked_paths(polygon, style, seed, closed);
+    }
+    let mut rng = RoughRng::seeded(seed);
+    let (main, extras) = rough_polyline(polygon, closed, style.roughness, &mut rng);
+    let width = style.stroke_width.max(0.5);
+    let mut ops = Vec::new();
+    if main.len() >= 2 {
+        let widths = vec![width; main.len()];
+        let band = pen_band(&main, closed, &widths, style.roughness, &mut rng);
+        ops.extend(ink_path(band, style));
+    }
+    for seg in extras {
+        if seg.len() < 2 {
+            continue;
+        }
+        let widths = vec![width * 0.7; seg.len()];
+        let band = pen_band(&seg, false, &widths, style.roughness, &mut rng);
+        ops.extend(ink_path(band, style));
     }
     ops
 }
@@ -309,16 +441,33 @@ pub fn build_element_ops(
             ops.extend(outline_ops(&polygon, style, seed, true));
             ops
         }
-        ElementKind::Freehand { points, style, .. } => {
+        ElementKind::Freehand {
+            points,
+            pressures,
+            style,
+            ..
+        } => {
             if points.len() < 2 || style.stroke_color == "transparent" {
                 return Vec::new();
             }
-            vec![DrawOp::Path(PathOp {
-                points: points.clone(),
-                closed: false,
-                stroke: Some(stroke_of(style, style.stroke_width)),
-                fill: None,
-            })]
+            if style.dash != crate::model::StrokeDash::Solid {
+                return vec![DrawOp::Path(PathOp {
+                    points: points.clone(),
+                    closed: false,
+                    stroke: Some(stroke_of(style, style.stroke_width)),
+                    fill: None,
+                })];
+            }
+            let mut rng = RoughRng::seeded(seed ^ 0x55);
+            let base = style.stroke_width.max(0.5);
+            let widths: Vec<f64> = (0..points.len())
+                .map(|i| {
+                    let pressure = pressures.get(i).copied().unwrap_or(0.5).clamp(0.0, 1.0);
+                    base * (0.45 + 0.95 * pressure)
+                })
+                .collect();
+            let band = pen_band(points, false, &widths, 0, &mut rng);
+            ink_path(band, style).into_iter().collect()
         }
         ElementKind::Arrow {
             start,
@@ -333,26 +482,7 @@ pub fn build_element_ops(
             if style.stroke_color == "transparent" || points.len() < 2 {
                 return Vec::new();
             }
-            let mut rng = RoughRng::seeded(seed ^ 0xA22);
-            let (main, extras) = rough_polyline(&points, false, style.roughness, &mut rng);
-            let stroke = stroke_of(style, style.stroke_width);
-            let mut ops = Vec::new();
-            if main.len() >= 2 {
-                ops.push(DrawOp::Path(PathOp {
-                    points: main,
-                    closed: false,
-                    stroke: Some(stroke.clone()),
-                    fill: None,
-                }));
-            }
-            for seg in extras {
-                ops.push(DrawOp::Path(PathOp {
-                    points: seg,
-                    closed: false,
-                    stroke: Some(stroke.clone()),
-                    fill: None,
-                }));
-            }
+            let mut ops = outline_ops(&points, style, seed ^ 0xA22, false);
             let head_fill = Some(FillStyle::Solid {
                 color: style.stroke_color.clone(),
                 opacity: style.opacity,
@@ -583,7 +713,7 @@ mod tests {
             0,
         );
         let ops = build_element_ops(&element, &doc, &ApproxMeasurer);
-        let heads = ops
+        let filled = ops
             .iter()
             .filter(|op| {
                 matches!(
@@ -592,9 +722,25 @@ mod tests {
                 )
             })
             .count();
-        assert_eq!(heads, 1, "exactly one arrowhead");
-        assert!(ops
-            .iter()
-            .any(|op| matches!(op, DrawOp::Path(path) if !path.closed)));
+        assert!(filled >= 2, "ink band plus arrowhead: {filled}");
+    }
+
+    #[test]
+    fn ink_bands_taper_toward_open_ends() {
+        let points = vec![
+            Point::new(0.0, 0.0),
+            Point::new(50.0, 0.0),
+            Point::new(100.0, 0.0),
+        ];
+        let mut rng = RoughRng::seeded(7);
+        let widths = vec![4.0; 3];
+        let band = pen_band(&points, false, &widths, 0, &mut rng);
+        assert_eq!(band.len(), 6);
+        let spread_end = (band[0] - band[5]).length();
+        let spread_mid = (band[1] - band[4]).length();
+        assert!(
+            spread_end < spread_mid,
+            "ends taper: end spread {spread_end} < mid spread {spread_mid}"
+        );
     }
 }

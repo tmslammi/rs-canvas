@@ -3,9 +3,37 @@
 use crate::geometry::{Point, Rect};
 use crate::model::{Document, Element, ElementId, ElementKind, ShapeKind};
 
+/// Resolve a bound text to the element that owns it; other ids pass through.
+pub fn resolve_container(doc: &Document, id: &str) -> ElementId {
+    match doc.element(id).map(|e| &e.kind) {
+        Some(ElementKind::Text {
+            container_id: Some(container),
+            ..
+        }) if doc
+            .element(container)
+            .map(|e| !e.is_deleted)
+            .unwrap_or(false) =>
+        {
+            container.clone()
+        }
+        _ => id.to_string(),
+    }
+}
+
 /// The topmost live element under `point`, or `None`. `tolerance` is in
 /// world units (screen tolerance divided by zoom).
+///
+/// Bound text (glyph captions, shape labels, connector labels) resolves to
+/// the element that owns it: clicking a component's caption selects the
+/// component.
 pub fn hit_test(doc: &Document, point: Point, tolerance: f64) -> Option<ElementId> {
+    let id = hit_test_raw(doc, point, tolerance)?;
+    Some(resolve_container(doc, &id))
+}
+
+/// Hit testing without the bound-text-to-container mapping (text editing,
+/// text tool), so the caption itself can be edited in place.
+pub fn hit_test_raw(doc: &Document, point: Point, tolerance: f64) -> Option<ElementId> {
     for id in doc.ordered_ids().into_iter().rev() {
         let Some(element) = doc.element(&id) else {
             continue;
@@ -201,6 +229,43 @@ mod tests {
         );
         assert!(hit_test(&doc, Point::new(50.0, 1.0), 3.0).is_some());
         assert!(hit_test(&doc, Point::new(50.0, 40.0), 3.0).is_none());
+    }
+
+    #[test]
+    fn bound_text_selects_its_container() {
+        use crate::model::{ElementKind, TextAlign};
+        let mut doc = Document::new();
+        let glyph = doc.add(
+            ElementKind::Glyph {
+                glyph: "cloud_storage".into(),
+                rect: Rect::new(0.0, 0.0, 96.0, 96.0),
+                style: Style::default(),
+                caption_id: None,
+            },
+            0,
+        );
+        let caption = doc.add(
+            ElementKind::Text {
+                rect: Rect::new(-48.0, 100.0, 192.0, 26.0),
+                text: "Cloud Storage".into(),
+                align: TextAlign::Center,
+                fixed_width: true,
+                container_id: Some(glyph.clone()),
+                style: Style::default(),
+            },
+            0,
+        );
+        if let ElementKind::Glyph { caption_id, .. } = &mut doc.element_mut(&glyph).unwrap().kind {
+            *caption_id = Some(caption.clone());
+        }
+
+        let on_caption = Point::new(0.0, 110.0);
+        assert_eq!(hit_test(&doc, on_caption, 2.0), Some(glyph.clone()));
+        assert_eq!(hit_test_raw(&doc, on_caption, 2.0), Some(caption.clone()));
+
+        // A dangling container falls back to the text itself.
+        doc.element_mut(&glyph).unwrap().is_deleted = true;
+        assert_eq!(hit_test(&doc, on_caption, 2.0), Some(caption));
     }
 
     #[test]

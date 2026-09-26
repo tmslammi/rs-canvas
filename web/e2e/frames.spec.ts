@@ -81,7 +81,7 @@ test("renaming a frame through the text overlay", async ({ page }) => {
     const ctx = canvas.getContext("2d")!;
     const data = ctx.getImageData(195, 175, 150, 25).data;
     for (let i = 0; i < data.length; i += 4) {
-      if (data[i] < 200 && data[i + 1] < 200) return true;
+      if (data[i] > 150 && data[i + 1] > 140) return true;
     }
     return false;
   });

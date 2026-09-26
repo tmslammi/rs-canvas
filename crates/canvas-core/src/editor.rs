@@ -11,7 +11,7 @@ use crate::connector;
 use crate::delta::Delta;
 use crate::geometry::{Point, Rect};
 use crate::history::{History, Transaction};
-use crate::hit::{elements_in_rect, hit_test};
+use crate::hit::{elements_in_rect, hit_test, hit_test_raw};
 use crate::id::{new_element_id, new_version_nonce};
 use crate::model::{
     Binding, Document, Element, ElementId, ElementKind, Endpoint, Routing, ShapeKind, Style,
@@ -211,6 +211,7 @@ pub struct Editor {
     pub history: History,
     pub nav: NavigationState,
     pub tool: Tool,
+    pub tool_locked: bool,
     pub style: Style,
     pub selection: BTreeSet<ElementId>,
     interaction: Interaction,
@@ -232,6 +233,7 @@ impl Editor {
             history: History::new(),
             nav: NavigationState::new(),
             tool: Tool::default(),
+            tool_locked: false,
             style: Style::default(),
             selection: BTreeSet::new(),
             interaction: Interaction::Idle,
@@ -250,6 +252,25 @@ impl Editor {
     /// The shell reports its viewport size (used for insert-at-centre).
     pub fn set_viewport(&mut self, width: f64, height: f64) {
         self.viewport_size = (width.max(1.0), height.max(1.0));
+    }
+
+    /// Select a tool (single-shot: reverts to Select after one use).
+    pub fn set_tool(&mut self, tool: Tool) {
+        self.tool = tool;
+        self.tool_locked = false;
+    }
+
+    /// Select a tool and keep it armed for repeated use.
+    pub fn set_tool_locked(&mut self, tool: Tool) {
+        self.tool = tool;
+        self.tool_locked = true;
+    }
+
+    /// After a finished gesture, single-shot tools hand back to Select.
+    fn finish_tool_use(&mut self) {
+        if !self.tool_locked {
+            self.tool = Tool::Select;
+        }
     }
 
     /// Whether a gesture is in progress (no committed save point yet).
@@ -651,6 +672,7 @@ impl Editor {
                     if let Some(tx) = self.tx.take() {
                         tx.commit(&mut self.history);
                     }
+                    self.finish_tool_use();
                     let selection_effects = self.select([id.clone()]);
                     effects.changed.insert(id);
                     effects.merge(selection_effects);
@@ -661,7 +683,13 @@ impl Editor {
                 let rect = Rect::from_points(start, end);
                 self.interaction = Interaction::Idle;
                 self.marquee_current = None;
-                let mut hits = elements_in_rect(&self.doc, rect);
+                let hits: Vec<ElementId> = elements_in_rect(&self.doc, rect)
+                    .into_iter()
+                    .map(|id| crate::hit::resolve_container(&self.doc, &id))
+                    .collect();
+                let mut hits = hits;
+                hits.sort();
+                hits.dedup();
                 if mods.shift {
                     hits.retain(|id| !self.selection.contains(id));
                     self.selection.extend(hits);
@@ -813,6 +841,7 @@ impl Editor {
                     if let Some(tx) = self.tx.take() {
                         tx.commit(&mut self.history);
                     }
+                    self.finish_tool_use();
                     let selection_effects = self.select([id.clone()]);
                     effects.changed.insert(id);
                     effects.merge(selection_effects);
@@ -845,6 +874,7 @@ impl Editor {
                     if let Some(tx) = self.tx.take() {
                         tx.commit(&mut self.history);
                     }
+                    self.finish_tool_use();
                     let selection_effects = self.select([id.clone()]);
                     effects.changed.insert(id);
                     effects.merge(selection_effects);
@@ -861,7 +891,7 @@ impl Editor {
         }
         let world = self.camera.screen_to_world(screen);
         let tolerance = self.tolerance();
-        let Some(id) = hit_test(&self.doc, world, tolerance) else {
+        let Some(id) = hit_test_raw(&self.doc, world, tolerance) else {
             return Effects::default();
         };
         match self.doc.element(&id).map(|e| e.kind.clone()) {
@@ -922,7 +952,7 @@ impl Editor {
     /// starts a new point-text element.
     fn begin_text_tool(&mut self, world: Point, now: u64) -> Effects {
         let tolerance = self.tolerance();
-        if let Some(id) = hit_test(&self.doc, world, tolerance) {
+        if let Some(id) = hit_test_raw(&self.doc, world, tolerance) {
             let is_text = matches!(
                 self.doc.element(&id).map(|e| &e.kind),
                 Some(ElementKind::Text { .. })
@@ -1169,6 +1199,7 @@ impl Editor {
         }
 
         let new_rect = self.text_rect_for(id, text);
+        let was_new_text = original.is_none();
         if let (Some(mut tx), Some(new_rect)) = (tx, new_rect) {
             let content = text.to_string();
             let _ = tx.update(&mut self.doc, id, now, |element| {
@@ -1180,6 +1211,9 @@ impl Editor {
             tx.commit(&mut self.history);
             self.selection = [id.to_string()].into_iter().collect();
             effects.changed.insert(id.to_string());
+            if was_new_text {
+                self.finish_tool_use();
+            }
         }
         effects
     }
@@ -1306,7 +1340,11 @@ impl Editor {
                     return Effects::default();
                 }
                 if let Some(tool) = Tool::from_shortcut(key) {
-                    self.tool = tool;
+                    if tool == self.tool {
+                        self.tool_locked = !self.tool_locked;
+                    } else {
+                        self.set_tool(tool);
+                    }
                     return Effects {
                         overlay_changed: true,
                         ..Effects::default()
@@ -2025,11 +2063,17 @@ impl Editor {
     ) {
         let tolerance = self.tolerance();
         if let Some(id) = hit_test(&self.doc, world, tolerance) {
-            if !erased.contains(&id) {
+            let targets: Vec<ElementId> = std::iter::once(id.clone())
+                .chain(self.followers(&id))
+                .collect();
+            for target in targets {
+                if erased.contains(&target) {
+                    continue;
+                }
                 if let Some(tx) = self.tx.as_mut() {
-                    if tx.remove(&mut self.doc, &id, now).is_ok() {
-                        effects.changed.insert(id.clone());
-                        erased.insert(id);
+                    if tx.remove(&mut self.doc, &target, now).is_ok() {
+                        effects.changed.insert(target.clone());
+                        erased.insert(target);
                     }
                 }
             }
@@ -2422,7 +2466,8 @@ pub fn scale_element(element: &mut Element, from: Rect, to: Rect) {
     }
 }
 
-/// Compute resized bounds from a handle drag.
+/// Compute resized bounds from a handle drag. Dragging an edge or corner
+/// past the opposite side flips the rectangle (the anchor point stays put).
 fn resized_bounds(
     bounds: Rect,
     handle: Handle,
@@ -2430,66 +2475,96 @@ fn resized_bounds(
     current: Point,
     keep_aspect: bool,
 ) -> Rect {
-    let mut dx = current.x - start.x;
-    let mut dy = current.y - start.y;
-    if !handle.moves_x() {
-        dx = 0.0;
-    }
-    if !handle.moves_y() {
-        dy = 0.0;
-    }
-    let mut r = bounds;
+    let dx = if handle.moves_x() {
+        current.x - start.x
+    } else {
+        0.0
+    };
+    let dy = if handle.moves_y() {
+        current.y - start.y
+    } else {
+        0.0
+    };
+
+    // The fixed point: opposite corner for corner handles, opposite edge for
+    // edge handles.
+    let anchor_x = if handle.affects_left() {
+        bounds.max_x()
+    } else {
+        bounds.x
+    };
+    let anchor_y = if handle.affects_top() {
+        bounds.max_y()
+    } else {
+        bounds.y
+    };
+
+    let (mut left, mut right) = (bounds.x, bounds.max_x());
+    let (mut top, mut bottom) = (bounds.y, bounds.max_y());
     if handle.affects_left() {
-        r.x += dx;
-        r.w -= dx;
+        left += dx;
     }
     if handle.affects_right() {
-        r.w += dx;
+        right += dx;
     }
     if handle.affects_top() {
-        r.y += dy;
-        r.h -= dy;
+        top += dy;
     }
     if handle.affects_bottom() {
-        r.h += dy;
+        bottom += dy;
     }
-    let min = MIN_RESIZE_PX;
-    if keep_aspect && bounds.w > 0.001 && bounds.h > 0.001 {
-        let scale = if handle.moves_x() && handle.moves_y() {
-            (r.w / bounds.w).abs().max((r.h / bounds.h).abs())
-        } else if handle.moves_x() {
-            (r.w / bounds.w).abs()
-        } else {
-            (r.h / bounds.h).abs()
-        }
-        .max(min / bounds.w.min(bounds.h));
-        let w = bounds.w * scale;
-        let h = bounds.h * scale;
-        let x = if handle.affects_left() {
-            bounds.max_x() - w
-        } else {
-            bounds.x
-        };
-        let y = if handle.affects_top() {
-            bounds.max_y() - h
-        } else {
-            bounds.y
-        };
-        return Rect::new(x, y, w.max(min), h.max(min));
-    }
-    if r.w < min {
+
+    if keep_aspect && handle.moves_x() && handle.moves_y() && bounds.w > 0.001 && bounds.h > 0.001 {
+        // Scale about the anchor, preserving each axis's drag direction.
+        let dir_x = if right < left { -1.0 } else { 1.0 };
+        let dir_y = if bottom < top { -1.0 } else { 1.0 };
+        let width = (right - left).abs();
+        let height = (bottom - top).abs();
+        let scale = (width / bounds.w).max(height / bounds.h).max(0.05);
+        let new_w = bounds.w * scale;
+        let new_h = bounds.h * scale;
         if handle.affects_left() {
-            r.x = bounds.max_x() - min;
+            left = anchor_x - dir_x * new_w;
+            right = anchor_x;
+        } else {
+            left = anchor_x;
+            right = anchor_x + dir_x * new_w;
         }
-        r.w = min;
-    }
-    if r.h < min {
         if handle.affects_top() {
-            r.y = bounds.max_y() - min;
+            top = anchor_y - dir_y * new_h;
+            bottom = anchor_y;
+        } else {
+            top = anchor_y;
+            bottom = anchor_y + dir_y * new_h;
         }
-        r.h = min;
     }
-    r
+
+    // Minimum size measured from the anchor; flips are preserved.
+    let min = MIN_RESIZE_PX;
+    if handle.moves_x() {
+        let sign = if right < left { -1.0 } else { 1.0 };
+        let width = (right - left).abs().max(min);
+        if handle.affects_left() {
+            left = anchor_x - sign * width;
+            right = anchor_x;
+        } else {
+            left = anchor_x;
+            right = anchor_x + sign * width;
+        }
+    }
+    if handle.moves_y() {
+        let sign = if bottom < top { -1.0 } else { 1.0 };
+        let height = (bottom - top).abs().max(min);
+        if handle.affects_top() {
+            top = anchor_y - sign * height;
+            bottom = anchor_y;
+        } else {
+            top = anchor_y;
+            bottom = anchor_y + sign * height;
+        }
+    }
+
+    Rect::from_points(Point::new(left, top), Point::new(right, bottom))
 }
 
 /// Point copied elements' references at copied elements where they can.
@@ -2716,6 +2791,61 @@ mod tests {
         assert_eq!(
             e.doc.ordered_live()[0].bounds(),
             Rect::new(0.0, 0.0, 100.0, 50.0)
+        );
+    }
+
+    #[test]
+    fn dragging_a_handle_past_the_opposite_corner_flips_the_shape() {
+        let mut e = editor();
+        drag_shape(
+            &mut e,
+            Point::new(200.0, 200.0),
+            Point::new(400.0, 300.0),
+            1,
+        );
+        press(&mut e, "v", Modifiers::default(), 2);
+        let mods = Modifiers::default();
+
+        // NE handle sits at (400, 200); drag it past the SW corner (200, 300).
+        e.pointer_down(Point::new(400.0, 200.0), 0, mods, 3);
+        e.pointer_move(Point::new(150.0, 350.0), mods, 4);
+        e.pointer_up(Point::new(150.0, 350.0), mods, 5);
+
+        let flipped = e.doc.ordered_live()[0].bounds();
+        assert_eq!(
+            flipped,
+            Rect::new(150.0, 300.0, 50.0, 50.0),
+            "the rectangle flipped to the far side of its SW anchor"
+        );
+
+        let cmd = Modifiers {
+            meta: true,
+            ..Modifiers::default()
+        };
+        press(&mut e, "z", cmd, 6);
+        assert_eq!(
+            e.doc.ordered_live()[0].bounds(),
+            Rect::new(200.0, 200.0, 200.0, 100.0)
+        );
+    }
+
+    #[test]
+    fn resizing_stops_at_a_minimum_against_the_anchor() {
+        let mut e = editor();
+        drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(100.0, 50.0), 1);
+        press(&mut e, "v", Modifiers::default(), 2);
+        let mods = Modifiers::default();
+
+        // Drag the SE handle almost onto the NW anchor.
+        e.pointer_down(Point::new(100.0, 50.0), 0, mods, 3);
+        e.pointer_move(Point::new(1.0, 1.0), mods, 4);
+        e.pointer_up(Point::new(1.0, 1.0), mods, 5);
+        let bounds = e.doc.ordered_live()[0].bounds();
+        assert_eq!(bounds.x, 0.0);
+        assert_eq!(bounds.y, 0.0);
+        assert!(
+            bounds.w >= 4.0 && bounds.h >= 4.0,
+            "min size kept: {bounds:?}"
         );
     }
 
@@ -3100,7 +3230,7 @@ mod tests {
         };
         press(&mut e, "z", cmd, 3);
         match &e.doc.element(&id).unwrap().kind {
-            ElementKind::Shape { style, .. } => assert_eq!(style.stroke_color, "#1e1e1e"),
+            ElementKind::Shape { style, .. } => assert_eq!(style.stroke_color, "#ece4d6"),
             other => panic!("expected shape, got {other:?}"),
         }
     }
@@ -3128,7 +3258,7 @@ mod tests {
         use crate::model::StylePatch;
         let mut e = editor();
         drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(50.0, 50.0), 1);
-        assert_eq!(e.current_style().stroke_color, "#1e1e1e");
+        assert_eq!(e.current_style().stroke_color, "#ece4d6");
         e.update_style(
             &StylePatch {
                 stroke_color: Some("#2f9e44".into()),
@@ -3409,6 +3539,143 @@ mod tests {
     }
 
     #[test]
+    fn drawing_with_a_single_shot_tool_returns_to_select() {
+        let mut e = editor();
+        let mods = Modifiers::default();
+        press(&mut e, "r", mods, 1);
+        let id = {
+            e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
+            e.pointer_move(Point::new(100.0, 60.0), mods, 3);
+            e.pointer_up(Point::new(100.0, 60.0), mods, 4);
+            let live = e.doc.ordered_live();
+            assert_eq!(live.len(), 1);
+            live[0].id.clone()
+        };
+        assert_eq!(e.tool, Tool::Select, "the draw tool is single-shot");
+        assert_eq!(e.selection.iter().next(), Some(&id));
+
+        // The placed shape is selectable after deselecting.
+        e.clear_selection();
+        e.pointer_down(Point::new(50.0, 30.0), 0, mods, 5);
+        e.pointer_up(Point::new(50.0, 30.0), mods, 6);
+        assert_eq!(e.selection.len(), 1, "clicking the drawn shape selects it");
+    }
+
+    #[test]
+    fn pressing_the_active_tool_shortcut_locks_it() {
+        let mut e = editor();
+        let mods = Modifiers::default();
+        press(&mut e, "r", mods, 1);
+        press(&mut e, "r", mods, 2);
+        assert!(e.tool_locked, "second press locks the tool");
+        assert_eq!(e.tool, Tool::Rectangle);
+
+        for (i, start) in [0.0_f64, 200.0].iter().enumerate() {
+            let now = 10 + i as u64 * 10;
+            e.pointer_down(Point::new(*start, 0.0), 0, mods, now);
+            e.pointer_move(Point::new(start + 80.0, 60.0), mods, now + 1);
+            e.pointer_up(Point::new(start + 80.0, 60.0), mods, now + 2);
+        }
+        assert_eq!(e.doc.ordered_live().len(), 2, "locked tool keeps drawing");
+        assert_eq!(e.tool, Tool::Rectangle);
+
+        let cmd = Modifiers {
+            meta: true,
+            ..Modifiers::default()
+        };
+        let _ = press(&mut e, "z", cmd, 99);
+        let _ = cmd;
+        press(&mut e, "v", mods, 100);
+        assert_eq!(e.tool, Tool::Select);
+        assert!(!e.tool_locked);
+    }
+
+    #[test]
+    fn placing_text_returns_to_select_but_editing_does_not() {
+        let mut e = editor();
+        let mods = Modifiers::default();
+        press(&mut e, "t", mods, 1);
+        e.pointer_down(Point::new(50.0, 50.0), 0, mods, 2);
+        let id = e.doc.ordered_live()[0].id.clone();
+        e.commit_text(&id, "hello", 3);
+        assert_eq!(e.tool, Tool::Select, "new text is single-shot");
+
+        press(&mut e, "t", mods, 4);
+        let effects = e.pointer_down(Point::new(55.0, 55.0), 0, mods, 5);
+        assert!(!effects.actions.is_empty(), "editing opens the overlay");
+        e.commit_text(&id, "hello again", 6);
+        assert_eq!(e.tool, Tool::Text, "editing existing text keeps the tool");
+    }
+
+    #[test]
+    fn clicking_a_caption_selects_and_moves_the_component() {
+        let mut e = editor();
+        e.set_viewport(800.0, 600.0);
+        e.insert_glyph("cloud_storage", 1);
+        let glyph = e
+            .doc
+            .ordered_live()
+            .into_iter()
+            .find(|element| matches!(element.kind, ElementKind::Glyph { .. }))
+            .expect("glyph")
+            .clone();
+        let caption_centre = e
+            .doc
+            .ordered_live()
+            .into_iter()
+            .find(|element| element.is_text())
+            .expect("caption")
+            .bounds()
+            .center();
+
+        press(&mut e, "v", Modifiers::default(), 2);
+        let mods = Modifiers::default();
+        e.pointer_down(caption_centre, 0, mods, 3);
+        e.pointer_up(caption_centre, mods, 4);
+        assert_eq!(
+            e.selection.iter().next().map(String::as_str),
+            Some(glyph.id.as_str()),
+            "clicking the caption selects the glyph"
+        );
+
+        let before = glyph.bounds();
+        e.pointer_down(caption_centre, 0, mods, 5);
+        e.pointer_move(
+            Point::new(caption_centre.x + 40.0, caption_centre.y),
+            mods,
+            6,
+        );
+        e.pointer_up(
+            Point::new(caption_centre.x + 40.0, caption_centre.y),
+            mods,
+            7,
+        );
+        let after = e.doc.element(&glyph.id).unwrap().bounds();
+        assert!((after.x - before.x - 40.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn erasing_a_caption_removes_the_component() {
+        let mut e = editor();
+        e.set_viewport(800.0, 600.0);
+        e.insert_glyph("cloud_storage", 1);
+        let caption_centre = e
+            .doc
+            .ordered_live()
+            .into_iter()
+            .find(|element| element.is_text())
+            .expect("caption")
+            .bounds()
+            .center();
+
+        press(&mut e, "e", Modifiers::default(), 2);
+        let mods = Modifiers::default();
+        e.pointer_down(caption_centre, 0, mods, 3);
+        e.pointer_up(caption_centre, mods, 4);
+        assert_eq!(e.doc.ordered_live().len(), 0, "glyph and caption both go");
+    }
+
+    #[test]
     fn text_tool_click_on_existing_text_edits_instead_of_stacking() {
         let mut e = editor();
         let mods = Modifiers::default();
@@ -3417,8 +3684,10 @@ mod tests {
         let id = e.doc.ordered_live()[0].id.clone();
         e.commit_text(&id, "hello", 3);
         assert_eq!(e.doc.ordered_live().len(), 1);
+        assert_eq!(e.tool, Tool::Select, "placing text is single-shot");
 
-        e.pointer_down(Point::new(55.0, 55.0), 0, mods, 4);
+        press(&mut e, "t", mods, 4);
+        e.pointer_down(Point::new(55.0, 55.0), 0, mods, 5);
         assert_eq!(
             e.doc.ordered_live().len(),
             1,

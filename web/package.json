@@ -5,14 +5,12 @@
   "type": "module",
   "scripts": {
     "build:wasm": "bash scripts/build-wasm.sh",
-    "dev": "npm run build:wasm && vite",
-    "build": "npm run build:wasm && vite build",
-    "preview": "vite preview",
-    "test:e2e": "npm run build && playwright test"
+    "stage": "bash scripts/stage.sh",
+    "build": "npm run build:wasm && npm run stage",
+    "dev": "npm run build:wasm && bash scripts/dev.sh",
+    "test:e2e": "npm run build:wasm && playwright test"
   },
   "devDependencies": {
-    "@playwright/test": "^1.63.0",
-    "typescript": "^7.0.2",
-    "vite": "^8.3.1"
+    "@playwright/test": "^1.63.0"
   }
 }

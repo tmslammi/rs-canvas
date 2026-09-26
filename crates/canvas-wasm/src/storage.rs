@@ -6,7 +6,9 @@ use wasm_bindgen::JsValue;
 
 const DB_NAME: &str = "rs-canvas";
 const STORE: &str = "documents";
-const KEY: &str = "current";
+/// v2: the handmade-dark theme flipped the default ink to light, so old
+/// autosaves are ignored rather than loaded invisible.
+const KEY: &str = "current-v2";
 
 fn error_string<E: std::fmt::Debug>(error: E) -> String {
     format!("{error:?}")

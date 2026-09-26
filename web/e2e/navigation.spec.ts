@@ -53,6 +53,7 @@ test("trackpad scroll pans, ctrl+wheel zooms around the cursor", async ({ page }
 test("shift+1 fits the drawing, shift+0 resets to 100%", async ({ page }) => {
   await page.goto("/");
   await page.waitForFunction(() => window.__rsReady === true);
+  await page.getByTitle("Seed demo").click();
 
   await page.keyboard.press("Shift+1");
   const fitZoom = await zoom(page);

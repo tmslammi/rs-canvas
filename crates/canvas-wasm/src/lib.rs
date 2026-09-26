@@ -16,8 +16,8 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement};
 
-const BACKGROUND: &str = "#f8f7f4";
-const ACCENT: &str = "#1971c2";
+const BACKGROUND: &str = "#1a1815";
+const ACCENT: &str = "#d98e32";
 
 fn now_ms() -> u64 {
     js_sys::Date::now() as u64
@@ -210,7 +210,7 @@ impl Editor {
         let dpr = web_sys::window()
             .map(|w| w.device_pixel_ratio())
             .unwrap_or(1.0);
-        let core = CoreEditor::new(canvas_core::demo_document());
+        let core = CoreEditor::new(Document::new());
         let mut editor = Editor {
             scene_canvas,
             overlay_canvas,
@@ -309,7 +309,7 @@ impl Editor {
             .dyn_into::<CanvasRenderingContext2d>()?;
 
         let mut renderer = Canvas2dRenderer { ctx };
-        renderer.clear("#ffffff");
+        renderer.clear(BACKGROUND);
         renderer.set_transform(
             Affine::translate(-bounds.x * scale, -bounds.y * scale).then(Affine::scale(scale)),
         );
@@ -404,9 +404,32 @@ impl Editor {
 
     pub fn set_tool(&mut self, name: &str) {
         if let Some(tool) = Tool::from_name(name) {
-            self.core.tool = tool;
+            self.core.set_tool(tool);
             self.draw_overlay();
         }
+    }
+
+    /// Select a tool and keep it armed for repeated use.
+    pub fn set_tool_locked(&mut self, name: &str) {
+        if let Some(tool) = Tool::from_name(name) {
+            self.core.set_tool_locked(tool);
+            self.draw_overlay();
+        }
+    }
+
+    pub fn toggle_tool_lock(&mut self) {
+        self.core.tool_locked = !self.core.tool_locked;
+    }
+
+    pub fn is_tool_locked(&self) -> bool {
+        self.core.tool_locked
+    }
+
+    /// Load the seed demo: a small cloud architecture to explore.
+    pub fn seed_demo(&mut self) {
+        let doc = canvas_core::demo_document();
+        let effects = self.core.replace_document(doc);
+        self.apply(effects);
     }
 
     pub fn undo(&mut self) {
@@ -682,7 +705,7 @@ impl Editor {
             let a = camera.world_to_screen(Point::new(rect.x, rect.y));
             let b = camera.world_to_screen(Point::new(rect.max_x(), rect.max_y()));
             let r = Rect::from_points(a, b);
-            self.overlay.set_fill_style_str("rgba(25, 113, 194, 0.08)");
+            self.overlay.set_fill_style_str("rgba(217, 142, 50, 0.12)");
             self.overlay.set_stroke_style_str(ACCENT);
             self.overlay.set_line_width(self.dpr);
             self.overlay.fill_rect(

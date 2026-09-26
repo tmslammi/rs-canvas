@@ -199,8 +199,7 @@ mod tests {
         );
         let svg = to_svg(&doc, &ApproxMeasurer);
         assert!(svg.contains("<path"));
-        assert!(svg.contains("stroke=\"#e03131\""));
-        assert!(svg.contains("fill=\"none\""));
+        assert!(svg.contains("fill=\"#e03131\""));
     }
 
     #[test]

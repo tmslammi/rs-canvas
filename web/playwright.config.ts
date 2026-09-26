@@ -11,7 +11,7 @@ export default defineConfig({
     viewport: { width: 1280, height: 800 },
   },
   webServer: {
-    command: "npm run preview",
+    command: "python3 -m http.server 4173 --bind 127.0.0.1",
     url: "http://localhost:4173",
     reuseExistingServer: !process.env.CI,
     timeout: 30_000,

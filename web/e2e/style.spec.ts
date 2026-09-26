@@ -14,15 +14,15 @@ test("style panel applies stroke colour to the selection and undo restores", asy
   await page.mouse.move(400, 300, { steps: 5 });
   await page.mouse.up();
 
-  expect((await style(page)).strokeColor).toBe("#1e1e1e");
+  expect((await style(page)).strokeColor).toBe("#ece4d6");
 
-  await page.getByTitle("Stroke #e03131").click();
-  expect((await style(page)).strokeColor).toBe("#e03131");
+  await page.getByTitle("Stroke #ff8787").click();
+  expect((await style(page)).strokeColor).toBe("#ff8787");
 
   await page.keyboard.press("ControlOrMeta+z");
   await page.keyboard.press("v");
   await page.mouse.click(300, 250);
-  expect((await style(page)).strokeColor).toBe("#1e1e1e");
+  expect((await style(page)).strokeColor).toBe("#ece4d6");
 });
 
 test("fill style and roughness buttons update the selection", async ({ page }) => {
@@ -50,7 +50,7 @@ test("fill style and roughness buttons update the selection", async ({ page }) =
     let nonBackground = 0;
     for (let i = 0; i < data.length; i += 4) {
       const isBackground =
-        data[i] > 244 && data[i + 1] > 243 && data[i + 2] > 240;
+        data[i] < 40 && data[i + 1] < 40 && data[i + 2] < 40;
       if (!isBackground) nonBackground++;
     }
     return nonBackground;
@@ -63,12 +63,12 @@ test("style defaults apply to the next drawn shape", async ({ page }) => {
   await page.waitForFunction(() => window.__rsReady === true);
   await page.evaluate(() => window.__rsEditor!.new_document());
 
-  await page.getByTitle("Stroke #2f9e44").click();
+  await page.getByTitle("Stroke #69db7c").click();
   await page.keyboard.press("r");
   await page.mouse.move(200, 200);
   await page.mouse.down();
   await page.mouse.move(300, 260, { steps: 4 });
   await page.mouse.up();
 
-  expect((await style(page)).strokeColor).toBe("#2f9e44");
+  expect((await style(page)).strokeColor).toBe("#69db7c");
 });

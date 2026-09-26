@@ -23,6 +23,7 @@ declare global {
       export_svg(): string;
       export_png(scale: number): string;
       load_benchmark_fixture(count: number): void;
+      is_tool_locked(): boolean;
     };
   }
 }

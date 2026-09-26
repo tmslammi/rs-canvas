@@ -30,7 +30,7 @@ Without the secrets the workflow fails immediately with a message pointing back 
 
 ## What gets deployed
 
-- `web/dist` produced by `npm run build` (wasm via `wasm-bindgen`, then Vite).
+- `web/dist`, staged by `npm run build` (wasm via `wasm-bindgen`, then a plain file copy — there is no bundler).
 - Production deploys from `master` use the `main` branch on Pages (the production branch of the Pages project).
 - Custom domain: Pages → project → Custom domains → add yours once the project exists.
 

@@ -1,23 +1,8 @@
 import init, { Editor, glyph_catalog, load_saved_json } from "./wasm/canvas_wasm.js";
-import { createLibraryPanel } from "./libraryPanel";
-import { createStylePanel } from "./stylePanel";
-import "./styles.css";
+import { createLibraryPanel } from "./libraryPanel.js";
+import { createStylePanel } from "./stylePanel.js";
 
-declare global {
-  interface Window {
-    __rsReady?: boolean;
-    __rsEditor?: Editor;
-  }
-}
-
-interface ToolbarTool {
-  name: string;
-  label: string;
-  glyph: string;
-  shortcut: string;
-}
-
-const TOOLS: ToolbarTool[] = [
+const TOOLS = [
   { name: "select", label: "Select", glyph: "↖", shortcut: "V" },
   { name: "hand", label: "Hand", glyph: "✋", shortcut: "H" },
   { name: "rectangle", label: "Rectangle", glyph: "▭", shortcut: "R" },
@@ -29,21 +14,21 @@ const TOOLS: ToolbarTool[] = [
   { name: "text", label: "Text", glyph: "T", shortcut: "T" },
 ];
 
-async function loadFonts(): Promise<void> {
+async function loadFonts() {
   const face = new FontFace("ComicShanns", "url(/fonts/ComicShanns-Regular.ttf)");
   await face.load();
   document.fonts.add(face);
 }
 
-async function boot(): Promise<void> {
+async function boot() {
   await init();
   await loadFonts();
 
-  const scene = document.getElementById("scene") as HTMLCanvasElement;
-  const overlay = document.getElementById("overlay") as HTMLCanvasElement;
-  const toolbar = document.getElementById("toolbar") as HTMLElement;
-  const stylePanelHost = document.getElementById("style-panel") as HTMLElement;
-  const libraryPanelHost = document.getElementById("library-panel") as HTMLElement;
+  const scene = document.getElementById("scene");
+  const overlay = document.getElementById("overlay");
+  const toolbar = document.getElementById("toolbar");
+  const stylePanelHost = document.getElementById("style-panel");
+  const libraryPanelHost = document.getElementById("library-panel");
   const editor = new Editor(scene, overlay);
   const stylePanel = createStylePanel(stylePanelHost, editor);
   createLibraryPanel(libraryPanelHost, editor, glyph_catalog());
@@ -61,7 +46,7 @@ async function boot(): Promise<void> {
   toast.id = "toast";
   document.body.appendChild(toast);
   let toastTimer = 0;
-  const showToast = (message: string, isError = false): void => {
+  const showToast = (message, isError = false) => {
     toast.textContent = message;
     toast.classList.toggle("error", isError);
     toast.classList.add("visible");
@@ -69,26 +54,36 @@ async function boot(): Promise<void> {
     toastTimer = window.setTimeout(() => toast.classList.remove("visible"), 3200);
   };
 
-  const updateCursor = (): void => {
+  const updateCursor = () => {
     scene.style.cursor = editor.cursor();
   };
 
-  const redraw = (): void => {
+  const redraw = () => {
     editor.resize();
     editor.render();
   };
 
   // -- toolbar ------------------------------------------------------------
 
-  const toolButtons = new Map<string, HTMLButtonElement>();
+  const toolButtons = new Map();
   for (const tool of TOOLS) {
     const button = document.createElement("button");
     button.textContent = tool.glyph;
     button.title = `${tool.label} — ${tool.shortcut}`;
     button.addEventListener("click", () => {
+      if (editor.active_tool() === tool.name) return;
       editor.set_tool(tool.name);
       refreshToolbar();
       updateCursor();
+    });
+    button.addEventListener("dblclick", () => {
+      editor.toggle_tool_lock();
+      refreshToolbar();
+      showToast(
+        editor.is_tool_locked()
+          ? `${tool.label} locked — keeps drawing`
+          : `${tool.label} unlocked`,
+      );
     });
     toolbar.appendChild(button);
     toolButtons.set(tool.name, button);
@@ -132,6 +127,16 @@ async function boot(): Promise<void> {
     showToast("New drawing");
   });
 
+  const seedButton = document.createElement("button");
+  seedButton.textContent = "🌱";
+  seedButton.title = "Seed demo";
+  seedButton.addEventListener("click", () => {
+    editor.seed_demo();
+    refreshToolbar();
+    updateCursor();
+    showToast("Demo architecture loaded — a VPC with GKE, Cloud SQL, Cloud Storage and Pub/Sub");
+  });
+
   const openButton = document.createElement("button");
   openButton.textContent = "📂";
   openButton.title = "Open… (⌘O)";
@@ -153,20 +158,21 @@ async function boot(): Promise<void> {
   copyButton.title = "Copy PNG";
 
   toolbar.appendChild(newButton);
+  toolbar.appendChild(seedButton);
   toolbar.appendChild(openButton);
   toolbar.appendChild(saveButton);
   toolbar.appendChild(pngButton);
   toolbar.appendChild(svgButton);
   toolbar.appendChild(copyButton);
 
-  const downloadDataUrl = (dataUrl: string, filename: string): void => {
+  const downloadDataUrl = (dataUrl, filename) => {
     const anchor = document.createElement("a");
     anchor.href = dataUrl;
     anchor.download = filename;
     anchor.click();
   };
 
-  const exportStamp = (): string =>
+  const exportStamp = () =>
     new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-");
 
   pngButton.addEventListener("click", () => {
@@ -192,9 +198,7 @@ async function boot(): Promise<void> {
     try {
       const dataUrl = editor.export_png(2);
       const blob = await (await fetch(dataUrl)).blob();
-      await navigator.clipboard.write([
-        new ClipboardItem({ "image/png": blob }),
-      ]);
+      await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
       showToast("Copied PNG to clipboard");
     } catch (error) {
       showToast(`Copy failed: ${String(error)}`, true);
@@ -208,14 +212,13 @@ async function boot(): Promise<void> {
   fileInput.style.display = "none";
   document.body.appendChild(fileInput);
 
-  const saveFile = (): void => {
+  const saveFile = () => {
     const json = editor.save_json();
     const blob = new Blob([json], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement("a");
-    const stamp = new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-");
     anchor.href = url;
-    anchor.download = `rs-canvas-${stamp}.json`;
+    anchor.download = `rs-canvas-${exportStamp()}.json`;
     anchor.click();
     URL.revokeObjectURL(url);
     showToast("Saved");
@@ -239,10 +242,13 @@ async function boot(): Promise<void> {
     fileInput.value = "";
   });
 
-  const refreshToolbar = (): void => {
+  const refreshToolbar = () => {
     const active = editor.active_tool();
+    const locked = editor.is_tool_locked();
     for (const [name, button] of toolButtons) {
-      button.classList.toggle("active", name === active);
+      const isActive = name === active;
+      button.classList.toggle("active", isActive);
+      button.classList.toggle("locked", isActive && locked);
     }
     undoButton.disabled = !editor.can_undo();
     redoButton.disabled = !editor.can_redo();
@@ -251,16 +257,16 @@ async function boot(): Promise<void> {
 
   // -- text editor overlay ------------------------------------------------
 
-  const textEditor = document.getElementById("text-editor") as HTMLTextAreaElement;
-  let editingId: string | null = null;
+  const textEditor = document.getElementById("text-editor");
+  let editingId = null;
 
-  const closeTextEditor = (): void => {
+  const closeTextEditor = () => {
     textEditor.classList.remove("visible");
     textEditor.blur();
     editingId = null;
   };
 
-  const commitTextEditor = (): void => {
+  const commitTextEditor = () => {
     if (!editingId) return;
     const id = editingId;
     const content = textEditor.value;
@@ -270,20 +276,8 @@ async function boot(): Promise<void> {
     updateCursor();
   };
 
-  interface OpenTextEditorAction {
-    type: string;
-    id: string;
-    x: number;
-    y: number;
-    width: number;
-    height: number;
-    font_size: number;
-    text: string;
-    align: string;
-  }
-
-  editor.set_action_handler((json: string) => {
-    const action = JSON.parse(json) as OpenTextEditorAction;
+  editor.set_action_handler((json) => {
+    const action = JSON.parse(json);
     if (action.type !== "open_text_editor") return;
     editingId = action.id;
     textEditor.value = action.text;
@@ -325,14 +319,14 @@ async function boot(): Promise<void> {
 
   // -- pointer input ------------------------------------------------------
 
-  const modifiers = (event: PointerEvent | KeyboardEvent | WheelEvent) => ({
+  const modifiers = (event) => ({
     shift: event.shiftKey,
     alt: event.altKey,
     ctrl: event.ctrlKey,
     meta: event.metaKey,
   });
 
-  const activePointers = new Map<number, { x: number; y: number }>();
+  const activePointers = new Map();
   let pinchDistance = 0;
 
   scene.addEventListener("pointerdown", (event) => {
@@ -373,7 +367,7 @@ async function boot(): Promise<void> {
     updateCursor();
   });
 
-  const endPointer = (event: PointerEvent): void => {
+  const endPointer = (event) => {
     activePointers.delete(event.pointerId);
     if (activePointers.size < 2) {
       pinchDistance = 0;

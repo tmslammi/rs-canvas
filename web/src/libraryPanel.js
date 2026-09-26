@@ -1,14 +1,4 @@
-interface GlyphInfo {
-  id: string;
-  name: string;
-  category: string;
-}
-
-export interface LibraryEditor {
-  insert_glyph(id: string): void;
-}
-
-const CATEGORY_LABELS: Record<string, string> = {
+const CATEGORY_LABELS = {
   compute: "Compute",
   storage: "Storage & Data",
   networking: "Networking",
@@ -30,14 +20,10 @@ const CATEGORY_ORDER = [
   "generic",
 ];
 
-export function createLibraryPanel(
-  container: HTMLElement,
-  editor: LibraryEditor,
-  catalogJson: string,
-): { refresh(): void } {
-  let catalog: GlyphInfo[] = [];
+export function createLibraryPanel(container, editor, catalogJson) {
+  let catalog = [];
   try {
-    catalog = JSON.parse(catalogJson) as GlyphInfo[];
+    catalog = JSON.parse(catalogJson);
   } catch {
     catalog = [];
   }
@@ -52,7 +38,7 @@ export function createLibraryPanel(
   list.className = "library-list";
   container.appendChild(list);
 
-  const render = (): void => {
+  const render = () => {
     const query = search.value.trim().toLowerCase();
     list.replaceChildren();
     for (const category of CATEGORY_ORDER) {
