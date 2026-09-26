@@ -284,6 +284,11 @@ impl Editor {
             .update(&self.doc, changed, self.measurer.as_ref())
     }
 
+    /// The text measurer in use (for SVG export).
+    pub fn measurer(&self) -> &dyn TextMeasurer {
+        self.measurer.as_ref()
+    }
+
     /// The shell reports pointer pressure for freehand capture.
     pub fn set_pressure(&mut self, pressure: f64) {
         self.last_pressure = pressure.clamp(0.0, 1.0);

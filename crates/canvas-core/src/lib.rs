@@ -20,6 +20,7 @@ pub mod nav;
 pub mod rough;
 pub mod scene;
 pub mod serialization;
+pub mod svg;
 pub mod text;
 pub mod tool;
 

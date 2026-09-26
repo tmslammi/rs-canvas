@@ -128,9 +128,66 @@ async function boot(): Promise<void> {
   saveButton.textContent = "💾";
   saveButton.title = "Save (⌘S)";
 
+  const pngButton = document.createElement("button");
+  pngButton.textContent = "🖼";
+  pngButton.title = "Export PNG";
+
+  const svgButton = document.createElement("button");
+  svgButton.textContent = "⇱";
+  svgButton.title = "Export SVG";
+
+  const copyButton = document.createElement("button");
+  copyButton.textContent = "📋";
+  copyButton.title = "Copy PNG";
+
   toolbar.appendChild(newButton);
   toolbar.appendChild(openButton);
   toolbar.appendChild(saveButton);
+  toolbar.appendChild(pngButton);
+  toolbar.appendChild(svgButton);
+  toolbar.appendChild(copyButton);
+
+  const downloadDataUrl = (dataUrl: string, filename: string): void => {
+    const anchor = document.createElement("a");
+    anchor.href = dataUrl;
+    anchor.download = filename;
+    anchor.click();
+  };
+
+  const exportStamp = (): string =>
+    new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-");
+
+  pngButton.addEventListener("click", () => {
+    try {
+      const dataUrl = editor.export_png(2);
+      downloadDataUrl(dataUrl, `rs-canvas-${exportStamp()}.png`);
+      showToast("Exported PNG");
+    } catch (error) {
+      showToast(`Export failed: ${String(error)}`, true);
+    }
+  });
+
+  svgButton.addEventListener("click", () => {
+    const svg = editor.export_svg();
+    const blob = new Blob([svg], { type: "image/svg+xml" });
+    const url = URL.createObjectURL(blob);
+    downloadDataUrl(url, `rs-canvas-${exportStamp()}.svg`);
+    URL.revokeObjectURL(url);
+    showToast("Exported SVG");
+  });
+
+  copyButton.addEventListener("click", async () => {
+    try {
+      const dataUrl = editor.export_png(2);
+      const blob = await (await fetch(dataUrl)).blob();
+      await navigator.clipboard.write([
+        new ClipboardItem({ "image/png": blob }),
+      ]);
+      showToast("Copied PNG to clipboard");
+    } catch (error) {
+      showToast(`Copy failed: ${String(error)}`, true);
+    }
+  });
 
   const fileInput = document.createElement("input");
   fileInput.type = "file";

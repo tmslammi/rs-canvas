@@ -20,6 +20,8 @@ declare global {
       update_style(patch: string): void;
       save_json(): string;
       load_json(json: string): void;
+      export_svg(): string;
+      export_png(scale: number): string;
     };
   }
 }

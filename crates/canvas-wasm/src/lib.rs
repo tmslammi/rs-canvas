@@ -261,6 +261,62 @@ impl Editor {
         canvas_core::serialization::to_json_pretty(&self.core.doc).unwrap_or_default()
     }
 
+    /// Export the drawing as a standalone SVG.
+    pub fn export_svg(&self) -> String {
+        canvas_core::svg::to_svg(&self.core.doc, self.core.measurer())
+    }
+
+    /// Export the drawing as a PNG data URL at the requested scale.
+    pub fn export_png(&self, scale: f64) -> Result<String, JsValue> {
+        let bounds = self
+            .core
+            .scene
+            .bounds()
+            .unwrap_or(Rect::new(0.0, 0.0, 100.0, 100.0))
+            .expand(16.0);
+        let scale = scale.clamp(0.25, 4.0);
+        let width = (bounds.w * scale).ceil().max(1.0);
+        let height = (bounds.h * scale).ceil().max(1.0);
+
+        let document = web_sys::window()
+            .and_then(|window| window.document())
+            .ok_or_else(|| JsValue::from_str("no document"))?;
+        let canvas: HtmlCanvasElement = document
+            .create_element("canvas")
+            .map_err(|_| JsValue::from_str("cannot create canvas"))?
+            .dyn_into()
+            .map_err(|_| JsValue::from_str("cannot create canvas"))?;
+        canvas.set_width(width as u32);
+        canvas.set_height(height as u32);
+        let ctx = canvas
+            .get_context("2d")?
+            .ok_or_else(|| JsValue::from_str("no 2d context"))?
+            .dyn_into::<CanvasRenderingContext2d>()?;
+
+        let mut renderer = Canvas2dRenderer { ctx };
+        renderer.clear("#ffffff");
+        renderer.set_transform(
+            Affine::translate(-bounds.x * scale, -bounds.y * scale).then(Affine::scale(scale)),
+        );
+        let layers: Vec<DrawOp> = self
+            .core
+            .scene
+            .layers
+            .iter()
+            .flat_map(|layer| layer.ops.clone())
+            .collect();
+        for op in &layers {
+            match op {
+                DrawOp::Path(path) => renderer.draw_path(path),
+                DrawOp::LineBatch { segments, stroke } => {
+                    renderer.draw_line_batch(segments, stroke)
+                }
+                DrawOp::Text(text) => renderer.draw_text(text),
+            }
+        }
+        canvas.to_data_url_with_type("image/png")
+    }
+
     /// Replace the document from a JSON file; errors are user-facing messages.
     pub fn load_json(&mut self, json: &str) -> Result<(), JsValue> {
         let doc = canvas_core::serialization::from_json(json)
