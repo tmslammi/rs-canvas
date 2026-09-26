@@ -3,8 +3,8 @@
 use std::collections::BTreeSet;
 
 use canvas_core::{
-    demo_document, Affine, Camera, Document, DrawOp, ElementId, FillStyle, History, PathOp,
-    Renderer, Scene, StrokeStyle,
+    demo_document, Affine, Camera, Document, DrawOp, ElementId, FillStyle, History,
+    NavigationState, PathOp, Point, Renderer, Scene, StrokeStyle,
 };
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -132,6 +132,7 @@ pub struct Editor {
     dpr: f64,
     doc: Document,
     scene: Scene,
+    nav: NavigationState,
     /// Undo/redo stacks; wired to the UI in the interaction ticket.
     #[allow(dead_code)]
     history: History,
@@ -159,6 +160,7 @@ impl Editor {
             dpr,
             doc,
             scene,
+            nav: NavigationState::new(),
             history: History::new(),
         })
     }
@@ -211,6 +213,96 @@ impl Editor {
     pub fn screen_to_world(&self, x: f64, y: f64) -> Vec<f64> {
         let p = self.camera.screen_to_world(canvas_core::Point::new(x, y));
         vec![p.x, p.y]
+    }
+
+    /// Start a pointer interaction. Button: 0 left, 1 middle, 2 right.
+    pub fn pointer_down(&mut self, x: f64, y: f64, button: u8) {
+        self.nav.pointer_down(Point::new(x, y), button);
+    }
+
+    pub fn pointer_move(&mut self, x: f64, y: f64) {
+        if self.nav.pointer_move(&mut self.camera, Point::new(x, y)) {
+            self.render();
+        }
+    }
+
+    pub fn pointer_up(&mut self, x: f64, y: f64, button: u8) {
+        let _ = (x, y);
+        self.nav.pointer_up(button);
+    }
+
+    /// Wheel/trackpad event. Ctrl means pinch-zoom.
+    pub fn wheel(&mut self, x: f64, y: f64, dx: f64, dy: f64, ctrl: bool) {
+        self.nav
+            .wheel(&mut self.camera, Point::new(x, y), dx, dy, ctrl);
+        self.render();
+    }
+
+    /// Pinch zoom from a shell-level touch gesture.
+    pub fn zoom_at(&mut self, x: f64, y: f64, factor: f64) {
+        self.camera.zoom_at(Point::new(x, y), factor);
+        self.render();
+    }
+
+    /// Keyboard input. Returns true when the key was handled.
+    pub fn key_down(&mut self, key: &str, shift: bool) -> bool {
+        match key {
+            " " => {
+                self.nav.set_space(true);
+                true
+            }
+            "1" if shift => {
+                self.zoom_to_fit();
+                true
+            }
+            "0" if shift => {
+                self.reset_zoom();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn key_up(&mut self, key: &str) {
+        if key == " " {
+            self.nav.set_space(false);
+        }
+    }
+
+    /// Reset held state when the window loses focus.
+    pub fn blur(&mut self) {
+        self.nav.set_space(false);
+        self.nav.cancel();
+    }
+
+    /// The CSS cursor the shell should apply.
+    pub fn cursor(&self) -> String {
+        if self.nav.is_panning() {
+            "grabbing".into()
+        } else if self.nav.space_held() {
+            "grab".into()
+        } else {
+            "default".into()
+        }
+    }
+
+    /// Fit the drawing into the viewport (Shift+1).
+    pub fn zoom_to_fit(&mut self) {
+        if let Some(bounds) = self.scene.bounds() {
+            self.camera
+                .zoom_to_fit(bounds, (self.css_width(), self.css_height()), 48.0);
+        } else {
+            self.reset_zoom();
+            return;
+        }
+        self.render();
+    }
+
+    /// Snap back to 100% around the viewport centre (Shift+0).
+    pub fn reset_zoom(&mut self) {
+        let center = Point::new(self.css_width() / 2.0, self.css_height() / 2.0);
+        self.camera.set_zoom_at(center, 1.0);
+        self.render();
     }
 }
 

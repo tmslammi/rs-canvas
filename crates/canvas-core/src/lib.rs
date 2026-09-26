@@ -13,6 +13,7 @@ pub mod id;
 pub mod index;
 pub mod merge;
 pub mod model;
+pub mod nav;
 pub mod rough;
 pub mod scene;
 pub mod serialization;
@@ -28,4 +29,5 @@ pub use model::{
     Binding, Document, Element, ElementId, ElementKind, Endpoint, FillPattern, Routing, ShapeKind,
     StrokeDash, Style, TextAlign, SCHEMA_VERSION,
 };
+pub use nav::NavigationState;
 pub use scene::{Scene, SceneLayer};
