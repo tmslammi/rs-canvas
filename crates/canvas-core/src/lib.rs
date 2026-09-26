@@ -13,11 +13,13 @@ pub mod id;
 pub mod index;
 pub mod merge;
 pub mod model;
+pub mod rough;
+pub mod scene;
 pub mod serialization;
 
 pub use camera::Camera;
 pub use delta::{Delta, EditError};
-pub use demo::demo_display_list;
+pub use demo::demo_document;
 pub use display::{Dash, DisplayList, DrawOp, FillStyle, PathOp, Renderer, StrokeStyle};
 pub use geometry::{Affine, Point, Rect};
 pub use history::{History, Transaction};
@@ -26,3 +28,4 @@ pub use model::{
     Binding, Document, Element, ElementId, ElementKind, Endpoint, FillPattern, Routing, ShapeKind,
     StrokeDash, Style, TextAlign, SCHEMA_VERSION,
 };
+pub use scene::{Scene, SceneLayer};
