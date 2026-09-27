@@ -332,3 +332,68 @@ test("redo is cleared by a new edit after undo", async ({ page }) => {  await pa
   await page.keyboard.press("ControlOrMeta+z");
   expect(await count(page)).toBe(0);
 });
+
+test("after a freehand stroke, the tool hands back and the stroke is selectable", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.waitForFunction(() => window.__rsReady === true);
+  await page.evaluate(() => window.__rsEditor!.new_document());
+
+  await page.keyboard.press("p");
+  await page.mouse.move(300, 400);
+  await page.mouse.down();
+  await page.mouse.move(500, 400, { steps: 6 });
+  await page.mouse.up();
+  expect(await count(page)).toBe(1);
+  expect(
+    await page.evaluate(() => window.__rsEditor!.active_tool()),
+    "the pencil is single-shot",
+  ).toBe("select");
+
+  await page.mouse.click(800, 600);
+  expect(await selectionBounds(page)).toBeUndefined();
+  await page.mouse.click(400, 400);
+  const selected = await selectionBounds(page);
+  expect(selected, "the stroke is selectable right after drawing").toBeDefined();
+});
+
+test("dragging a bound connector keeps it attached to its shapes", async ({ page }) => {
+  await page.goto("/");
+  await page.waitForFunction(() => window.__rsReady === true);
+  await page.evaluate(() => window.__rsEditor!.new_document());
+
+  await drawRect(page);
+  await page.keyboard.press("r");
+  await page.mouse.move(500, 200);
+  await page.mouse.down();
+  await page.mouse.move(700, 300, { steps: 5 });
+  await page.mouse.up();
+
+  await page.keyboard.press("a");
+  await page.mouse.move(360, 250);
+  await page.mouse.down();
+  await page.mouse.move(540, 250, { steps: 5 });
+  await page.mouse.up();
+  expect(await count(page)).toBe(3);
+
+  // Drag the connector's shaft by its middle.
+  await page.mouse.move(450, 250);
+  await page.mouse.down();
+  await page.mouse.move(460, 310, { steps: 4 });
+  await page.mouse.up();
+
+  // Move the right shape down by 100px.
+  await page.mouse.move(600, 250);
+  await page.mouse.down();
+  await page.mouse.move(600, 350, { steps: 5 });
+  await page.mouse.up();
+
+  // Re-select the connector where it still passes: the endpoint must have
+  // followed the shape, so the selection is now 100px tall.
+  await page.mouse.click(450, 250);
+  const bounds = await selectionBounds(page);
+  expect(bounds, "the connector is selectable where it always was").toBeDefined();
+  expect(bounds![1]).toBeCloseTo(250, -1);
+  expect(bounds![3], "the connector stretched down with the shape").toBeGreaterThan(50);
+});

@@ -39,8 +39,10 @@ test("10,000 elements stay interactive", async ({ page }) => {
     `scale: load 10k in ${loadMs.toFixed(0)}ms; pan frame p50 ${p50.toFixed(1)}ms, p95 ${p95.toFixed(1)}ms, max ${max.toFixed(1)}ms`,
   );
 
-  expect(p95).toBeLessThan(50);
-  expect(max).toBeLessThan(150);
+  // Panning must stay inside a 60fps frame: it shifts existing pixels and
+  // repaints only the newly exposed strips.
+  expect(p95).toBeLessThan(8);
+  expect(max).toBeLessThan(60);
 
   // Editing stays responsive: pan back, draw one shape, undo.
   await page.keyboard.press("r");

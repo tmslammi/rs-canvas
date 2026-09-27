@@ -286,12 +286,20 @@ impl Element {
             | ElementKind::Frame { rect, .. } => *rect,
             ElementKind::Freehand { points, .. } => {
                 let mut iter = points.iter();
-                match iter.next() {
-                    None => Rect::ZERO,
-                    Some(first) => iter.fold(Rect::new(first.x, first.y, 0.0, 0.0), |acc, p| {
-                        acc.union(&Rect::new(p.x, p.y, 0.0, 0.0))
-                    }),
+                let Some(first) = iter.next() else {
+                    return Rect::ZERO;
+                };
+                let mut min_x = first.x;
+                let mut min_y = first.y;
+                let mut max_x = first.x;
+                let mut max_y = first.y;
+                for p in iter {
+                    min_x = min_x.min(p.x);
+                    min_y = min_y.min(p.y);
+                    max_x = max_x.max(p.x);
+                    max_y = max_y.max(p.y);
                 }
+                Rect::new(min_x, min_y, max_x - min_x, max_y - min_y)
             }
             ElementKind::Arrow { start, end, .. } => Rect::from_points(start.point(), end.point()),
         }
@@ -366,25 +374,41 @@ impl Document {
         self.elements.len()
     }
 
+    /// Every element in z-order, tombstones included, as references.
+    pub fn ordered_refs(&self) -> Vec<&Element> {
+        let mut elements: Vec<&Element> = self.elements.values().collect();
+        elements.sort_unstable_by(|a, b| a.index.cmp(&b.index).then_with(|| a.id.cmp(&b.id)));
+        elements
+    }
+
     /// Every element ID in z-order, tombstones included.
     pub fn ordered_ids(&self) -> Vec<ElementId> {
-        let mut ids: Vec<&Element> = self.elements.values().collect();
-        ids.sort_by(|a, b| a.index.cmp(&b.index).then_with(|| a.id.cmp(&b.id)));
-        ids.into_iter().map(|e| e.id.clone()).collect()
+        self.ordered_refs()
+            .into_iter()
+            .map(|e| e.id.clone())
+            .collect()
     }
 
     /// Live (non-tombstoned) elements in z-order.
     pub fn ordered_live(&self) -> Vec<&Element> {
-        self.ordered_ids()
+        self.ordered_refs()
             .into_iter()
-            .filter_map(|id| self.elements.get(&id))
             .filter(|e| !e.is_deleted)
             .collect()
     }
 
+    /// Number of live (non-tombstoned) elements.
+    pub fn live_count(&self) -> usize {
+        self.elements.values().filter(|e| !e.is_deleted).count()
+    }
+
     /// Highest order key currently in the document, tombstones included.
     pub fn top_index(&self) -> Option<String> {
-        self.elements.values().map(|e| e.index.clone()).max()
+        self.elements
+            .values()
+            .map(|e| e.index.as_str())
+            .max()
+            .map(str::to_string)
     }
 
     /// The largest element bounds, or `None` for an empty document.

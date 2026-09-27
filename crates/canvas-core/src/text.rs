@@ -79,14 +79,16 @@ fn wrap_paragraph(
     }
     let mut lines = Vec::new();
     let mut current = String::new();
+    let mut candidate = String::new();
     for word in paragraph.split_whitespace() {
         if current.is_empty() {
             if measurer.measure_width(word, font_size) <= max_width {
-                current = word.to_string();
+                current.push_str(word);
             } else {
                 let mut chunk = String::new();
                 for ch in word.chars() {
-                    let mut candidate = chunk.clone();
+                    candidate.clear();
+                    candidate.push_str(&chunk);
                     candidate.push(ch);
                     if !chunk.is_empty()
                         && measurer.measure_width(&candidate, font_size) > max_width
@@ -99,14 +101,15 @@ fn wrap_paragraph(
             }
             continue;
         }
-        let mut candidate = current.clone();
+        candidate.clear();
+        candidate.push_str(&current);
         candidate.push(' ');
         candidate.push_str(word);
         if measurer.measure_width(&candidate, font_size) <= max_width {
-            current = candidate;
+            std::mem::swap(&mut current, &mut candidate);
         } else {
             lines.push(std::mem::take(&mut current));
-            current = word.to_string();
+            current.push_str(word);
         }
     }
     if !current.is_empty() {

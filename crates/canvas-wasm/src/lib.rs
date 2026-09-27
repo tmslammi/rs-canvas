@@ -5,12 +5,12 @@
 
 mod storage;
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 
 use canvas_core::{
-    Affine, Document, DrawOp, Editor as CoreEditor, Effects, FillStyle, Modifiers, Point, Rect,
-    Renderer, ShellAction, StrokeStyle, StylePatch, TextAlign, TextMeasurer, TextOp, Tool,
+    Affine, Dash, Document, DrawOp, Editor as CoreEditor, Effects, FillStyle, Modifiers, Point,
+    Rect, Renderer, ShellAction, StrokeStyle, StylePatch, TextAlign, TextMeasurer, TextOp, Tool,
 };
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -23,20 +23,37 @@ fn now_ms() -> u64 {
     js_sys::Date::now() as u64
 }
 
-/// `measureText`-backed measurer with a small cache.
+/// `measureText`-backed measurer with a small cache, on its own offscreen
+/// context so measuring never disturbs the scene canvas state.
 struct FontMeasurer {
     ctx: CanvasRenderingContext2d,
-    cache: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<(u64, String), f64>>>,
+    cache: RefCell<HashMap<String, Vec<(u64, f64)>>>,
+    font_size_bits: Cell<u64>,
+}
+
+impl FontMeasurer {
+    fn new(ctx: CanvasRenderingContext2d) -> Self {
+        Self {
+            ctx,
+            cache: RefCell::new(HashMap::new()),
+            font_size_bits: Cell::new(f64::NAN.to_bits()),
+        }
+    }
 }
 
 impl TextMeasurer for FontMeasurer {
     fn measure_width(&self, text: &str, font_size: f64) -> f64 {
-        let key = (font_size.to_bits(), text.to_string());
-        if let Some(width) = self.cache.borrow().get(&key) {
-            return *width;
+        let key = font_size.to_bits();
+        if let Some(entries) = self.cache.borrow().get(text) {
+            if let Some((_, width)) = entries.iter().find(|(bits, _)| *bits == key) {
+                return *width;
+            }
         }
-        self.ctx
-            .set_font(&format!("{font_size}px ComicShanns, sans-serif"));
+        if self.font_size_bits.get() != key {
+            self.ctx
+                .set_font(&format!("{font_size}px ComicShanns, sans-serif"));
+            self.font_size_bits.set(key);
+        }
         let width = self
             .ctx
             .measure_text(text)
@@ -46,7 +63,10 @@ impl TextMeasurer for FontMeasurer {
         if cache.len() > 4096 {
             cache.clear();
         }
-        cache.insert(key, width);
+        cache
+            .entry(text.to_string())
+            .or_default()
+            .push((key, width));
         width
     }
 }
@@ -54,18 +74,34 @@ impl TextMeasurer for FontMeasurer {
 /// A Canvas2D implementation of the core's renderer seam.
 struct Canvas2dRenderer {
     ctx: CanvasRenderingContext2d,
+    /// The last dash pattern pushed to the context, so repeated strokes with
+    /// the same style skip the JS array construction and the state call.
+    last_dash: Option<Dash>,
+    /// The last font size pushed to the context for text.
+    last_font_bits: u64,
 }
 
 impl Canvas2dRenderer {
-    fn apply_stroke(&self, stroke: &StrokeStyle) {
+    fn new(ctx: CanvasRenderingContext2d) -> Self {
+        Self {
+            ctx,
+            last_dash: None,
+            last_font_bits: f64::NAN.to_bits(),
+        }
+    }
+
+    fn apply_stroke(&mut self, stroke: &StrokeStyle) {
         self.ctx.set_stroke_style_str(&stroke.color);
         self.ctx.set_line_width(stroke.width);
         self.ctx.set_global_alpha(stroke.opacity);
-        let pattern = js_sys::Array::new();
-        for value in stroke.dash.pattern() {
-            pattern.push(&JsValue::from_f64(*value));
+        if self.last_dash != Some(stroke.dash) {
+            let pattern = js_sys::Array::new();
+            for value in stroke.dash.pattern() {
+                pattern.push(&JsValue::from_f64(*value));
+            }
+            let _ = self.ctx.set_line_dash(pattern.as_ref());
+            self.last_dash = Some(stroke.dash);
         }
-        let _ = self.ctx.set_line_dash(pattern.as_ref());
     }
 
     fn draw_ops(&mut self, ops: &[DrawOp]) {
@@ -163,8 +199,12 @@ impl Renderer for Canvas2dRenderer {
     }
 
     fn draw_text(&mut self, op: &TextOp) {
-        self.ctx
-            .set_font(&format!("{}px ComicShanns, sans-serif", op.font_size));
+        let bits = op.font_size.to_bits();
+        if self.last_font_bits != bits {
+            self.ctx
+                .set_font(&format!("{}px ComicShanns, sans-serif", op.font_size));
+            self.last_font_bits = bits;
+        }
         self.ctx.set_fill_style_str(&op.color);
         self.ctx.set_global_alpha(op.opacity);
         let align = match op.align {
@@ -178,6 +218,16 @@ impl Renderer for Canvas2dRenderer {
     }
 }
 
+/// The camera the scene canvas currently shows, so a pan can shift the
+/// existing pixels instead of redrawing the whole document.
+#[derive(Clone, Copy)]
+struct ViewSnapshot {
+    scroll: Point,
+    zoom: f64,
+    width: u32,
+    height: u32,
+}
+
 /// The editor handle the shell talks to.
 #[wasm_bindgen]
 pub struct Editor {
@@ -185,10 +235,30 @@ pub struct Editor {
     overlay_canvas: HtmlCanvasElement,
     renderer: Canvas2dRenderer,
     overlay: CanvasRenderingContext2d,
+    /// Offscreen context for text measurement (never painted).
+    measure_ctx: CanvasRenderingContext2d,
     dpr: f64,
     core: CoreEditor,
     on_action: Option<js_sys::Function>,
-    pending_save: Rc<RefCell<Option<String>>>,
+    /// Where the scene canvas pixels currently sit in world space.
+    last_paint: Option<ViewSnapshot>,
+}
+
+fn offscreen_ctx() -> Result<CanvasRenderingContext2d, JsValue> {
+    let document = web_sys::window()
+        .and_then(|window| window.document())
+        .ok_or_else(|| JsValue::from_str("no document"))?;
+    let canvas: HtmlCanvasElement = document
+        .create_element("canvas")
+        .map_err(|_| JsValue::from_str("cannot create measure canvas"))?
+        .dyn_into()
+        .map_err(|_| JsValue::from_str("cannot create measure canvas"))?;
+    let ctx = canvas
+        .get_context("2d")?
+        .ok_or_else(|| JsValue::from_str("measure canvas has no 2d context"))?
+        .dyn_into::<CanvasRenderingContext2d>()
+        .map_err(|_| JsValue::from_str("measure canvas has no 2d context"))?;
+    Ok(ctx)
 }
 
 #[wasm_bindgen]
@@ -211,21 +281,21 @@ impl Editor {
             .map(|w| w.device_pixel_ratio())
             .unwrap_or(1.0);
         let core = CoreEditor::new(Document::new());
+        let measure_ctx = offscreen_ctx()?;
         let mut editor = Editor {
             scene_canvas,
             overlay_canvas,
-            renderer: Canvas2dRenderer { ctx: ctx.clone() },
+            renderer: Canvas2dRenderer::new(ctx),
             overlay,
+            measure_ctx: measure_ctx.clone(),
             dpr,
             core,
             on_action: None,
-            pending_save: Rc::new(RefCell::new(None)),
+            last_paint: None,
         };
-        let measurer = FontMeasurer {
-            ctx,
-            cache: Default::default(),
-        };
-        editor.core.set_measurer(Box::new(measurer));
+        editor
+            .core
+            .set_measurer(Box::new(FontMeasurer::new(measure_ctx)));
         Ok(editor)
     }
 
@@ -238,6 +308,7 @@ impl Editor {
             canvas.set_height((h * self.dpr).round().max(1.0) as u32);
         }
         self.core.set_viewport(self.css_width(), self.css_height());
+        self.last_paint = None;
     }
 
     /// Insert a shape-library glyph at the viewport centre.
@@ -249,14 +320,11 @@ impl Editor {
     /// Replace the drawing with an empty one.
     pub fn new_document(&mut self) {
         self.core = CoreEditor::new(Document::new());
-        let measurer = FontMeasurer {
-            ctx: self.renderer.ctx.clone(),
-            cache: Default::default(),
-        };
-        self.core.set_measurer(Box::new(measurer));
+        self.core
+            .set_measurer(Box::new(FontMeasurer::new(self.measure_ctx.clone())));
         self.core.set_viewport(self.css_width(), self.css_height());
         self.render();
-        self.schedule_save();
+        self.notify_document_changed();
     }
 
     /// The shell installs a callback for shell actions (text editor, …).
@@ -274,6 +342,16 @@ impl Editor {
     /// Serialize the document for saving to a file.
     pub fn save_json(&self) -> String {
         canvas_core::serialization::to_json_pretty(&self.core.doc).unwrap_or_default()
+    }
+
+    /// Serialize the document and hand it to storage (the shell's debounced
+    /// autosave calls this; serializing inside input handlers is what makes
+    /// large documents stutter).
+    pub fn flush_save(&self) {
+        let json = canvas_core::serialization::to_json(&self.core.doc).unwrap_or_default();
+        wasm_bindgen_futures::spawn_local(async move {
+            let _ = storage::save_document(&json).await;
+        });
     }
 
     /// Export the drawing as a standalone SVG.
@@ -308,26 +386,11 @@ impl Editor {
             .ok_or_else(|| JsValue::from_str("no 2d context"))?
             .dyn_into::<CanvasRenderingContext2d>()?;
 
-        let mut renderer = Canvas2dRenderer { ctx };
+        let mut renderer = Canvas2dRenderer::new(ctx);
         renderer.clear(BACKGROUND);
-        renderer.set_transform(
-            Affine::translate(-bounds.x * scale, -bounds.y * scale).then(Affine::scale(scale)),
-        );
-        let layers: Vec<DrawOp> = self
-            .core
-            .scene
-            .layers
-            .iter()
-            .flat_map(|layer| layer.ops.clone())
-            .collect();
-        for op in &layers {
-            match op {
-                DrawOp::Path(path) => renderer.draw_path(path),
-                DrawOp::LineBatch { segments, stroke } => {
-                    renderer.draw_line_batch(segments, stroke)
-                }
-                DrawOp::Text(text) => renderer.draw_text(text),
-            }
+        renderer.set_transform(Affine::translate(-bounds.x, -bounds.y).then(Affine::scale(scale)));
+        for layer in &self.core.scene.layers {
+            renderer.draw_ops(&layer.ops);
         }
         canvas.to_data_url_with_type("image/png")
     }
@@ -338,7 +401,6 @@ impl Editor {
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
         let effects = self.core.replace_document(doc);
         self.apply(effects);
-        self.schedule_save();
         Ok(())
     }
 
@@ -380,7 +442,7 @@ impl Editor {
     }
 
     pub fn element_count(&self) -> usize {
-        self.core.doc.ordered_live().len()
+        self.core.doc.live_count()
     }
 
     pub fn active_tool(&self) -> String {
@@ -444,10 +506,8 @@ impl Editor {
 
     /// Draw everything visible for this frame.
     pub fn render(&mut self) {
-        let viewport = self.core.camera.viewport(
-            self.scene_canvas.client_width() as f64,
-            self.scene_canvas.client_height() as f64,
-        );
+        let (w, h) = self.core.viewport_size();
+        let viewport = self.core.camera.viewport(w, h);
         self.renderer.begin_frame();
         self.renderer.clear(BACKGROUND);
         self.renderer
@@ -457,6 +517,7 @@ impl Editor {
         }
         self.renderer.end_frame();
         self.draw_overlay();
+        self.remember_view();
     }
 
     // -- input -------------------------------------------------------------
@@ -485,13 +546,18 @@ impl Editor {
         let effects = self.core.pointer_up(Point::new(x, y), mods, now_ms());
         let _ = button;
         self.apply(effects);
+        // End of a pan gesture: replace the shifted approximation with a
+        // crisp render.
+        self.settle_view();
     }
 
     pub fn wheel(&mut self, x: f64, y: f64, dx: f64, dy: f64, ctrl: bool) {
         self.core
             .nav
             .wheel(&mut self.core.camera, Point::new(x, y), dx, dy, ctrl);
-        self.render();
+        if !self.try_paint_pan_current() {
+            self.render();
+        }
     }
 
     pub fn zoom_at(&mut self, x: f64, y: f64, factor: f64) {
@@ -517,6 +583,27 @@ impl Editor {
         }
         let effects = self.core.key_down(key, mods, now_ms());
         self.apply(effects);
+        // Claim only the command chords the editor actually handles; anything
+        // else (Cmd+R, Cmd+W, …) must reach the browser.
+        let command_chord = mods.command()
+            && matches!(
+                key,
+                "a" | "A"
+                    | "z"
+                    | "Z"
+                    | "d"
+                    | "D"
+                    | "c"
+                    | "C"
+                    | "x"
+                    | "X"
+                    | "v"
+                    | "V"
+                    | "]"
+                    | "}"
+                    | "["
+                    | "{"
+            );
         matches!(
             key,
             " " | "Escape"
@@ -526,8 +613,8 @@ impl Editor {
                 | "ArrowDown"
                 | "ArrowLeft"
                 | "ArrowRight"
-        ) || mods.command()
-            || Tool::from_shortcut(key).is_some()
+        ) || command_chord
+            || (!mods.command() && !mods.alt && Tool::from_shortcut(key).is_some())
     }
 
     pub fn key_up(&mut self, key: &str) {
@@ -538,6 +625,7 @@ impl Editor {
     pub fn blur(&mut self) {
         self.core.nav.set_space(false);
         self.core.nav.cancel();
+        self.settle_view();
         self.draw_overlay();
     }
 
@@ -596,12 +684,138 @@ impl Editor {
         self.scene_canvas.client_height() as f64
     }
 
+    fn remember_view(&mut self) {
+        self.last_paint = Some(ViewSnapshot {
+            scroll: self.core.camera.scroll,
+            zoom: self.core.camera.zoom,
+            width: self.scene_canvas.width(),
+            height: self.scene_canvas.height(),
+        });
+    }
+
+    /// Snap back to a crisp full render if the canvas is showing a panned or
+    /// zoomed approximation.
+    fn settle_view(&mut self) {
+        if let Some(from) = self.last_paint {
+            if from.scroll != self.core.camera.scroll || from.zoom != self.core.camera.zoom {
+                self.render();
+            }
+        }
+    }
+
+    /// Shift the existing scene pixels by a pure pan and repaint only the
+    /// exposed strips. Returns false when a full render is required (zoom
+    /// changed, canvas resized, no valid snapshot).
+    ///
+    /// Cost is proportional to the freshly exposed edge pixels, not to the
+    /// number of visible elements.
+    fn try_paint_pan_current(&mut self) -> bool {
+        let Some(from) = self.last_paint else {
+            return false;
+        };
+        let camera = self.core.camera;
+        if camera.zoom != from.zoom {
+            return false;
+        }
+        let w = self.scene_canvas.width();
+        let h = self.scene_canvas.height();
+        if w == 0 || h == 0 || w != from.width || h != from.height {
+            return false;
+        }
+        let dx = ((from.scroll.x - camera.scroll.x) * camera.zoom * self.dpr).round() as i64;
+        let dy = ((from.scroll.y - camera.scroll.y) * camera.zoom * self.dpr).round() as i64;
+        if dx == 0 && dy == 0 {
+            return true;
+        }
+        if dx.abs() >= w as i64 || dy.abs() >= h as i64 {
+            return false;
+        }
+
+        // Shift existing pixels (Canvas2D snapshots the source when the
+        // destination canvas is also the source).
+        self.renderer.ctx.save();
+        let _ = self
+            .renderer
+            .ctx
+            .set_transform(1.0, 0.0, 0.0, 1.0, 0.0, 0.0);
+        let _ = self.renderer.ctx.draw_image_with_html_canvas_element(
+            &self.scene_canvas,
+            dx as f64,
+            dy as f64,
+        );
+        self.renderer.ctx.restore();
+
+        // Exposed strips in device space, padded to swallow rounding seams.
+        let pad = 2.0;
+        let mut strips: Vec<Rect> = Vec::with_capacity(2);
+        if dx > 0 {
+            strips.push(Rect::new(0.0, 0.0, dx as f64 + pad, h as f64));
+        } else if dx < 0 {
+            strips.push(Rect::new(
+                (w as i64 + dx) as f64 - pad,
+                0.0,
+                -dx as f64 + pad,
+                h as f64,
+            ));
+        }
+        if dy > 0 {
+            strips.push(Rect::new(0.0, 0.0, w as f64, dy as f64 + pad));
+        } else if dy < 0 {
+            strips.push(Rect::new(
+                0.0,
+                (h as i64 + dy) as f64 - pad,
+                w as f64,
+                -dy as f64 + pad,
+            ));
+        }
+
+        let world: Vec<Rect> = strips
+            .iter()
+            .map(|strip| {
+                let a = camera.screen_to_world(Point::new(strip.x / self.dpr, strip.y / self.dpr));
+                let b = camera.screen_to_world(Point::new(
+                    strip.max_x() / self.dpr,
+                    strip.max_y() / self.dpr,
+                ));
+                Rect::from_points(a, b)
+            })
+            .collect();
+
+        self.renderer.begin_frame();
+        for strip in &strips {
+            self.renderer.clear_rect(*strip, BACKGROUND);
+        }
+        self.renderer
+            .set_transform(camera.transform().then(Affine::scale(self.dpr)));
+        for layer in self.core.scene.layers.iter() {
+            if world.iter().any(|rect| layer.bounds.intersects(rect)) {
+                self.renderer.draw_ops(&layer.ops);
+            }
+        }
+        self.renderer.end_frame();
+        self.draw_overlay();
+        // Record where the shifted pixels now sit, so the next pan composes
+        // exactly; `settle_view` later snaps to the true camera.
+        self.last_paint = Some(ViewSnapshot {
+            scroll: Point::new(
+                from.scroll.x - dx as f64 / (camera.zoom * self.dpr),
+                from.scroll.y - dy as f64 / (camera.zoom * self.dpr),
+            ),
+            zoom: camera.zoom,
+            width: w,
+            height: h,
+        });
+        true
+    }
+
     fn apply(&mut self, effects: Effects) {
-        let actions = effects.actions.clone();
-        let durable =
-            !self.core.is_interacting() && (effects.repaint_all || !effects.changed.is_empty());
+        let durable = !self.core.is_interacting()
+            && (effects.document_changed || !effects.changed.is_empty());
         if effects.repaint_all {
-            self.render();
+            let can_pan = !effects.document_changed && effects.changed.is_empty();
+            if !(can_pan && self.try_paint_pan_current()) {
+                self.render();
+            }
         } else {
             if !effects.changed.is_empty() {
                 let dirty = self.core.rebuild_changed(&effects.changed);
@@ -611,30 +825,21 @@ impl Editor {
                 self.draw_overlay();
             }
         }
-        self.dispatch_actions(&actions);
+        self.dispatch_actions(&effects.actions);
         if durable {
-            self.schedule_save();
+            self.notify_document_changed();
         }
     }
 
-    /// Debounced autosave: serialize now, write after a quiet period.
-    fn schedule_save(&mut self) {
-        let json = canvas_core::serialization::to_json(&self.core.doc).unwrap_or_default();
-        *self.pending_save.borrow_mut() = Some(json);
-        let cell = self.pending_save.clone();
-        let callback = wasm_bindgen::closure::Closure::once_into_js(move || {
-            let pending = cell.borrow_mut().take();
-            if let Some(json) = pending {
-                wasm_bindgen_futures::spawn_local(async move {
-                    let _ = storage::save_document(&json).await;
-                });
-            }
-        });
-        if let Some(window) = web_sys::window() {
-            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-                callback.unchecked_ref(),
-                700,
-            );
+    /// Ask the shell to debounce, then call `flush_save`.
+    ///
+    /// Serializing here would put a full-document `serde_json` pass inside the
+    /// pointer/keystroke handler; on a large document that is the single
+    /// biggest source of dropped frames.
+    fn notify_document_changed(&self) {
+        if self.on_action.is_some() {
+            let action = canvas_core::ShellAction::DocumentChanged;
+            self.dispatch_actions(&[action]);
         }
     }
 
@@ -650,20 +855,32 @@ impl Editor {
     }
 
     fn paint_dirty(&mut self, dirty: &[Rect]) {
-        let viewport = self.core.camera.viewport(
-            self.scene_canvas.client_width() as f64,
-            self.scene_canvas.client_height() as f64,
-        );
-        let visible_dirty: Vec<Rect> = dirty
+        if let Some(from) = self.last_paint {
+            if from.scroll != self.core.camera.scroll || from.zoom != self.core.camera.zoom {
+                // The canvas no longer corresponds to the snapshot; the next
+                // pan must fall back to a full render.
+                self.last_paint = None;
+            }
+        }
+        let (w, h) = self.core.viewport_size();
+        let viewport = self.core.camera.viewport(w, h);
+        let visible: Vec<Rect> = dirty
             .iter()
             .filter(|r| r.intersects(&viewport))
             .copied()
             .collect();
-        if visible_dirty.is_empty() {
+        if visible.is_empty() {
             return;
         }
+        let merged = merge_rects(&visible);
+        // One bounding box culls the layer list; the merged rects then decide
+        // exactly which layers to repaint.
+        let mut union = merged[0];
+        for rect in &merged[1..] {
+            union = union.union(rect);
+        }
         self.renderer.begin_frame();
-        for rect in &visible_dirty {
+        for rect in &merged {
             let top_left = self.core.camera.world_to_screen(Point::new(rect.x, rect.y));
             let bottom_right = self
                 .core
@@ -681,10 +898,10 @@ impl Editor {
         self.renderer
             .set_transform(self.core.camera.transform().then(Affine::scale(self.dpr)));
         for layer in self.core.scene.layers.iter() {
-            let intersects_dirty = visible_dirty
-                .iter()
-                .any(|rect| layer.bounds.intersects(rect));
-            if intersects_dirty && layer.bounds.intersects(&viewport) {
+            if !layer.bounds.intersects(&union) {
+                continue;
+            }
+            if merged.iter().any(|rect| layer.bounds.intersects(rect)) {
                 self.renderer.draw_ops(&layer.ops);
             }
         }
@@ -727,7 +944,7 @@ impl Editor {
             self.overlay.set_fill_style_str("#ffffff");
             self.overlay.set_stroke_style_str(ACCENT);
             self.overlay.set_line_width(self.dpr * 1.5);
-            for point in anchors {
+            for &point in anchors {
                 let screen = self.core.camera.world_to_screen(point);
                 let (x, y) = (screen.x * self.dpr, screen.y * self.dpr);
                 let radius = 4.0 * self.dpr;
@@ -793,6 +1010,29 @@ pub async fn load_saved_json() -> Option<String> {
 #[wasm_bindgen]
 pub fn glyph_catalog() -> String {
     serde_json::to_string(&canvas_core::glyph_catalog()).unwrap_or_else(|_| "[]".into())
+}
+
+/// Merge overlapping dirty rectangles so a repaint clears and redraws each
+/// region once instead of once per contributing element.
+fn merge_rects(rects: &[Rect]) -> Vec<Rect> {
+    let mut merged: Vec<Rect> = Vec::with_capacity(rects.len());
+    for &rect in rects {
+        let mut current = rect;
+        'merge: loop {
+            let mut i = 0;
+            while i < merged.len() {
+                if merged[i].intersects(&current) {
+                    current = merged[i].union(&current);
+                    merged.swap_remove(i);
+                    continue 'merge;
+                }
+                i += 1;
+            }
+            break;
+        }
+        merged.push(current);
+    }
+    merged
 }
 
 fn parse_modifiers(value: &JsValue) -> Modifiers {

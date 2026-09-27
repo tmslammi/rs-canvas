@@ -83,19 +83,14 @@ impl Document {
             Delta::Purge { element } => {
                 self.elements.remove(&element.id);
             }
-            Delta::Remove { tombstoned, .. } => {
-                if !self.elements.contains_key(&tombstoned.id) {
-                    return Err(EditError::UnknownElement(tombstoned.id.clone()));
-                }
-                self.elements
-                    .insert(tombstoned.id.clone(), tombstoned.clone());
-            }
-            Delta::Update { after, .. } => {
-                if !self.elements.contains_key(&after.id) {
-                    return Err(EditError::UnknownElement(after.id.clone()));
-                }
-                self.elements.insert(after.id.clone(), after.clone());
-            }
+            Delta::Remove { tombstoned, .. } => match self.elements.get_mut(&tombstoned.id) {
+                Some(slot) => *slot = tombstoned.clone(),
+                None => return Err(EditError::UnknownElement(tombstoned.id.clone())),
+            },
+            Delta::Update { after, .. } => match self.elements.get_mut(&after.id) {
+                Some(slot) => *slot = after.clone(),
+                None => return Err(EditError::UnknownElement(after.id.clone())),
+            },
         }
         Ok(())
     }

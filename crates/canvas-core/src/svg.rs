@@ -13,7 +13,12 @@ pub fn to_svg(doc: &Document, measurer: &dyn TextMeasurer) -> String {
     let layers: Vec<(Rect, Vec<DrawOp>)> = doc
         .ordered_live()
         .into_iter()
-        .map(|element| (element.bounds(), build_element_ops(element, doc, measurer)))
+        .map(|element| {
+            let ops = build_element_ops(element, doc, measurer);
+            // Painted bounds, not model bounds, so frame labels and stroke
+            // jitter are inside the viewBox instead of clipped by it.
+            (crate::scene::layer_bounds(element, &ops, measurer), ops)
+        })
         .collect();
     let bounds = layers
         .iter()

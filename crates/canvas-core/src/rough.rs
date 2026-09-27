@@ -178,9 +178,10 @@ pub fn hachure_lines(
         .fold(f64::NEG_INFINITY, f64::max);
 
     let mut segments = Vec::new();
+    let mut xs: Vec<f64> = Vec::new();
     let mut y = (min_y / gap).ceil() * gap;
     while y <= max_y {
-        let mut xs: Vec<f64> = Vec::new();
+        xs.clear();
         for i in 0..rotated.len() {
             let p1 = rotated[i];
             let p2 = rotated[(i + 1) % rotated.len()];
@@ -189,7 +190,7 @@ pub fn hachure_lines(
                 xs.push(p1.x + t * (p2.x - p1.x));
             }
         }
-        xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        xs.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let mut i = 0;
         while i + 1 < xs.len() {
             let (x0, x1) = (xs[i], xs[i + 1]);

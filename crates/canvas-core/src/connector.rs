@@ -235,55 +235,62 @@ pub fn arrowhead(tip: Point, from: Point, stroke_width: f64) -> Vec<Point> {
 /// Auto-anchor a free endpoint drag to a nearby element, if any. `approach`
 /// is the other endpoint, used to break distance ties toward the incoming
 /// direction (so dropping at a shape's centre connects the facing side).
+/// `exclude` skips the element being edited — an arrow's bounds grow as it is
+/// drawn, so without the exclusion an endpoint dropped inside its own bounds
+/// would bind the connector to itself.
 pub fn binding_candidate(
     doc: &Document,
     point: Point,
     tolerance: f64,
     approach: Option<Point>,
+    exclude: Option<&str>,
 ) -> Option<(String, AnchorSide, Point)> {
-    for id in doc.ordered_ids().into_iter().rev() {
-        let Some(element) = doc.element(&id) else {
-            continue;
-        };
-        if element.is_deleted || element.is_frame() {
+    let mut best: Option<&crate::model::Element> = None;
+    for element in doc.elements.values() {
+        if element.is_deleted || element.is_frame() || exclude == Some(element.id.as_str()) {
             continue;
         }
-        let rect = element.bounds();
-        if rect.expand(tolerance).contains(point) {
-            let approach_dir = approach
-                .map(|start| {
-                    let d = start - rect.center();
-                    let len = d.length();
-                    if len > 1e-6 {
-                        d.scale(1.0 / len)
-                    } else {
-                        Point::ZERO
-                    }
-                })
-                .unwrap_or(Point::ZERO);
-            let (side, anchor) = anchor_points(rect)
-                .into_iter()
-                .max_by(|(sa, pa), (sb, pb)| {
-                    let bias = |side: AnchorSide| {
-                        if matches!(side, AnchorSide::E | AnchorSide::W) {
-                            1.0
-                        } else {
-                            0.0
-                        }
-                    };
-                    let score_a =
-                        -pa.distance(point) + approach_dir.dot(sa.focus()) * 30.0 + bias(*sa);
-                    let score_b =
-                        -pb.distance(point) + approach_dir.dot(sb.focus()) * 30.0 + bias(*sb);
-                    score_a
-                        .partial_cmp(&score_b)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .unwrap_or((AnchorSide::E, rect.center()));
-            return Some((id, side, anchor));
+        if !element.bounds().expand(tolerance).contains(point) {
+            continue;
+        }
+        let topmost = best.is_none_or(|b| {
+            (element.index.as_str(), element.id.as_str()) > (b.index.as_str(), b.id.as_str())
+        });
+        if topmost {
+            best = Some(element);
         }
     }
-    None
+    let element = best?;
+    let rect = element.bounds();
+    let approach_dir = approach
+        .map(|start| {
+            let d = start - rect.center();
+            let len = d.length();
+            if len > 1e-6 {
+                d.scale(1.0 / len)
+            } else {
+                Point::ZERO
+            }
+        })
+        .unwrap_or(Point::ZERO);
+    let (side, anchor) = anchor_points(rect)
+        .into_iter()
+        .max_by(|(sa, pa), (sb, pb)| {
+            let bias = |side: AnchorSide| {
+                if matches!(side, AnchorSide::E | AnchorSide::W) {
+                    1.0
+                } else {
+                    0.0
+                }
+            };
+            let score_a = -pa.distance(point) + approach_dir.dot(sa.focus()) * 30.0 + bias(*sa);
+            let score_b = -pb.distance(point) + approach_dir.dot(sb.focus()) * 30.0 + bias(*sb);
+            score_a
+                .partial_cmp(&score_b)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .unwrap_or((AnchorSide::E, rect.center()));
+    Some((element.id.clone(), side, anchor))
 }
 
 #[cfg(test)]
@@ -431,13 +438,18 @@ mod tests {
             Point::new(95.0, 45.0),
             6.0,
             Some(Point::new(0.0, 0.0)),
+            None,
         );
         assert!(candidate.is_some());
         let (found, side, point) = candidate.unwrap();
         assert_eq!(found, id);
         assert_eq!(side, AnchorSide::E);
         assert_eq!(point, Point::new(100.0, 25.0));
-        assert!(binding_candidate(&doc, Point::new(500.0, 500.0), 6.0, None).is_none());
+        assert!(binding_candidate(&doc, Point::new(500.0, 500.0), 6.0, None, None).is_none());
+        assert!(
+            binding_candidate(&doc, Point::new(95.0, 45.0), 6.0, None, Some(&id)).is_none(),
+            "the excluded element is never a binding candidate"
+        );
     }
 
     #[test]
@@ -450,6 +462,7 @@ mod tests {
             Point::new(350.0, 50.0),
             6.0,
             Some(Point::new(50.0, 50.0)),
+            None,
         )
         .unwrap();
         assert_eq!(side, AnchorSide::W);

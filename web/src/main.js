@@ -12,6 +12,8 @@ const TOOLS = [
   { name: "line", label: "Line", glyph: "╱", shortcut: "L" },
   { name: "arrow", label: "Arrow", glyph: "→", shortcut: "A" },
   { name: "text", label: "Text", glyph: "T", shortcut: "T" },
+  { name: "frame", label: "Frame", glyph: "⬚", shortcut: "F" },
+  { name: "eraser", label: "Eraser", glyph: "⌦", shortcut: "E" },
 ];
 
 async function loadFonts() {
@@ -54,8 +56,11 @@ async function boot() {
     toastTimer = window.setTimeout(() => toast.classList.remove("visible"), 3200);
   };
 
-  const updateCursor = () => {
-    scene.style.cursor = editor.cursor();
+  let updateCursor = () => {
+    const cursor = editor.cursor();
+    if (scene.style.cursor !== cursor) {
+      scene.style.cursor = cursor;
+    }
   };
 
   const redraw = () => {
@@ -259,11 +264,13 @@ async function boot() {
 
   const textEditor = document.getElementById("text-editor");
   let editingId = null;
+  let editingSingleLine = false;
 
   const closeTextEditor = () => {
     textEditor.classList.remove("visible");
     textEditor.blur();
     editingId = null;
+    editingSingleLine = false;
   };
 
   const commitTextEditor = () => {
@@ -278,8 +285,13 @@ async function boot() {
 
   editor.set_action_handler((json) => {
     const action = JSON.parse(json);
+    if (action.type === "document_changed") {
+      scheduleAutosave();
+      return;
+    }
     if (action.type !== "open_text_editor") return;
     editingId = action.id;
+    editingSingleLine = !!action.single_line;
     textEditor.value = action.text;
     textEditor.style.left = `${action.x}px`;
     textEditor.style.top = `${action.y}px`;
@@ -293,6 +305,14 @@ async function boot() {
     textEditor.setSelectionRange(action.text.length, action.text.length);
   });
 
+  // Autosave is debounced in the shell so serializing a large document never
+  // happens inside a pointer or keyboard handler.
+  let autosaveTimer = 0;
+  const scheduleAutosave = () => {
+    window.clearTimeout(autosaveTimer);
+    autosaveTimer = window.setTimeout(() => editor.flush_save(), 700);
+  };
+
   textEditor.addEventListener("input", () => {
     textEditor.style.height = "auto";
     textEditor.style.height = `${Math.max(textEditor.scrollHeight, 24)}px`;
@@ -300,7 +320,8 @@ async function boot() {
 
   textEditor.addEventListener("keydown", (event) => {
     const composing = event.isComposing || event.keyCode === 229;
-    if (event.key === "Escape" && !composing) {
+    if (composing) return;
+    if (event.key === "Escape" || (event.key === "Enter" && editingSingleLine)) {
       event.preventDefault();
       commitTextEditor();
     }
@@ -333,6 +354,13 @@ async function boot() {
     event.preventDefault();
     if (editingId) {
       commitTextEditor();
+    }
+    // preventDefault above also suppresses the focus change, so a form
+    // control (opacity slider, library search) would otherwise keep focus
+    // forever and swallow every canvas shortcut. Blur it explicitly.
+    const focused = document.activeElement;
+    if (focused instanceof HTMLElement && focused !== document.body) {
+      focused.blur();
     }
     if (event.pointerType === "touch") {
       activePointers.set(event.pointerId, { x: event.offsetX, y: event.offsetY });
@@ -379,6 +407,14 @@ async function boot() {
   scene.addEventListener("pointerup", endPointer);
   scene.addEventListener("pointercancel", endPointer);
 
+  // Wheel panning shifts existing pixels; snap to a crisp full render once
+  // the gesture pauses.
+  let viewSettleTimer = 0;
+  const settleView = () => {
+    window.clearTimeout(viewSettleTimer);
+    viewSettleTimer = window.setTimeout(() => editor.render(), 140);
+  };
+
   scene.addEventListener(
     "wheel",
     (event) => {
@@ -390,6 +426,7 @@ async function boot() {
         event.deltaY,
         event.ctrlKey,
       );
+      settleView();
       updateCursor();
     },
     { passive: false },

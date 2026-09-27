@@ -5,7 +5,7 @@
 //! bounds, expanded for stroke and jitter overflow). This is what keeps
 //! Canvas2D smooth on large documents.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 
 use crate::display::DrawOp;
 use crate::geometry::Rect;
@@ -25,10 +25,69 @@ fn margin(element: &Element) -> f64 {
     }
 }
 
+/// Bounds of the geometry the draw ops actually touch. This is the truth the
+/// renderer paints, which can differ from `Element::bounds` (routed arrows,
+/// frame name labels).
+fn ops_bounds(ops: &[DrawOp], measurer: &dyn TextMeasurer) -> Option<Rect> {
+    let mut min_x = f64::INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    let mut include = |x: f64, y: f64| {
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(x);
+        max_y = max_y.max(y);
+    };
+    for op in ops {
+        match op {
+            DrawOp::Path(path) => {
+                for p in &path.points {
+                    include(p.x, p.y);
+                }
+            }
+            DrawOp::LineBatch { segments, .. } => {
+                for [a, b] in segments {
+                    include(a.x, a.y);
+                    include(b.x, b.y);
+                }
+            }
+            DrawOp::Text(text) => {
+                let width = measurer.measure_width(&text.text, text.font_size);
+                let x = match text.align {
+                    crate::model::TextAlign::Left => text.x,
+                    crate::model::TextAlign::Center => text.x - width / 2.0,
+                    crate::model::TextAlign::Right => text.x - width,
+                };
+                include(x, text.y - text.font_size);
+                include(x + width, text.y + text.font_size * 0.3);
+            }
+        }
+    }
+    if min_x.is_finite() {
+        Some(Rect::new(min_x, min_y, max_x - min_x, max_y - min_y))
+    } else {
+        None
+    }
+}
+
+/// The painted bounds of an element: its model bounds unioned with the draw
+/// ops (frame labels, routed arrows, text extents) plus stroke margin. Used
+/// by the scene for dirty regions and by exporters for the output bounds.
+pub(crate) fn layer_bounds(element: &Element, ops: &[DrawOp], measurer: &dyn TextMeasurer) -> Rect {
+    let geometry = match ops_bounds(ops, measurer) {
+        Some(op_bounds) => element.bounds().union(&op_bounds),
+        None => element.bounds(),
+    };
+    geometry.expand(margin(element))
+}
+
 /// One element's cached drawing instructions.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SceneLayer {
     pub element_id: ElementId,
+    /// The element's z-order key, kept so `update` can splice in place.
+    pub index: String,
     pub version: u64,
     pub bounds: Rect,
     pub ops: Vec<DrawOp>,
@@ -47,16 +106,55 @@ impl Scene {
 
     /// Rebuild every layer. Returns the world rects that changed.
     pub fn rebuild_all(&mut self, doc: &Document, measurer: &dyn TextMeasurer) -> Vec<Rect> {
-        let old: Vec<Rect> = self.layers.iter().map(|l| l.bounds).collect();
+        let mut dirty: Vec<Rect> = self.layers.iter().map(|l| l.bounds).collect();
         self.layers.clear();
-        let ids: BTreeSet<ElementId> = doc.elements.keys().cloned().collect();
-        let mut dirty = self.update(doc, &ids, measurer);
-        dirty.extend(old);
+        for element in doc.elements.values() {
+            if element.is_deleted {
+                continue;
+            }
+            let ops = build_element_ops(element, doc, measurer);
+            let bounds = layer_bounds(element, &ops, measurer);
+            self.layers.push(SceneLayer {
+                element_id: element.id.clone(),
+                index: element.index.clone(),
+                version: element.version,
+                bounds,
+                ops,
+            });
+        }
+        self.layers.sort_unstable_by(|a, b| {
+            a.index
+                .cmp(&b.index)
+                .then_with(|| a.element_id.cmp(&b.element_id))
+        });
+        dirty.extend(self.layers.iter().map(|l| l.bounds));
         dirty
+    }
+
+    /// The layer position for an element, or where it would be inserted.
+    fn layer_position(&self, index: &str, id: &str) -> Result<usize, usize> {
+        self.layers.binary_search_by(|layer| {
+            layer
+                .index
+                .as_str()
+                .cmp(index)
+                .then_with(|| layer.element_id.as_str().cmp(id))
+        })
+    }
+
+    fn remove_layer(&mut self, id: &str, dirty: &mut Vec<Rect>) {
+        if let Some(pos) = self.layers.iter().position(|l| l.element_id == id) {
+            dirty.push(self.layers[pos].bounds);
+            self.layers.remove(pos);
+        }
     }
 
     /// Rebuild layers for the changed ids (added, updated or tombstoned
     /// elements), keep the rest, and report dirty rectangles in world space.
+    ///
+    /// Layers stay sorted by `(index, id)`, so an element whose order key did
+    /// not change is replaced in place in `O(log n)` with no re-sort. Only
+    /// structural changes (adds, deletes, reorders) touch the vector shape.
     pub fn update(
         &mut self,
         doc: &Document,
@@ -64,47 +162,47 @@ impl Scene {
         measurer: &dyn TextMeasurer,
     ) -> Vec<Rect> {
         let mut dirty: Vec<Rect> = Vec::new();
-        let order = doc.ordered_ids();
-        let mut position: HashMap<&ElementId, usize> = HashMap::new();
-        for (i, id) in order.iter().enumerate() {
-            position.insert(id, i);
-        }
-
         for id in changed {
-            let existing = self.layers.iter().position(|l| &l.element_id == id);
-            match doc.element(id) {
-                Some(element) if !element.is_deleted => {
-                    let ops = build_element_ops(element, doc, measurer);
-                    let bounds = element.bounds().expand(margin(element));
-                    if let Some(pos) = existing {
-                        dirty.push(self.layers[pos].bounds);
-                        self.layers[pos] = SceneLayer {
-                            element_id: id.clone(),
-                            version: element.version,
-                            bounds,
-                            ops,
-                        };
-                    } else {
-                        self.layers.push(SceneLayer {
-                            element_id: id.clone(),
-                            version: element.version,
-                            bounds,
-                            ops,
-                        });
-                    }
+            let Some(element) = doc.element(id).filter(|e| !e.is_deleted) else {
+                self.remove_layer(id, &mut dirty);
+                continue;
+            };
+            let ops = build_element_ops(element, doc, measurer);
+            let bounds = layer_bounds(element, &ops, measurer);
+            let insert_at = match self.layer_position(&element.index, id) {
+                Ok(pos) => {
+                    dirty.push(self.layers[pos].bounds);
+                    let layer = &mut self.layers[pos];
+                    layer.version = element.version;
+                    layer.bounds = bounds;
+                    layer.ops = ops;
                     dirty.push(bounds);
+                    continue;
                 }
-                _ => {
-                    if let Some(pos) = existing {
-                        dirty.push(self.layers[pos].bounds);
-                        self.layers.remove(pos);
-                    }
+                Err(pos) => pos,
+            };
+            dirty.push(bounds);
+            let layer = SceneLayer {
+                element_id: id.clone(),
+                index: element.index.clone(),
+                version: element.version,
+                bounds,
+                ops,
+            };
+            match self.layers.iter().position(|l| l.element_id == *id) {
+                Some(old) => {
+                    dirty.push(self.layers[old].bounds);
+                    self.layers.remove(old);
+                    let insert_at = if old < insert_at {
+                        insert_at - 1
+                    } else {
+                        insert_at
+                    };
+                    self.layers.insert(insert_at, layer);
                 }
+                None => self.layers.insert(insert_at, layer),
             }
         }
-
-        self.layers
-            .sort_by_key(|l| position.get(&l.element_id).copied().unwrap_or(usize::MAX));
         dirty
     }
 

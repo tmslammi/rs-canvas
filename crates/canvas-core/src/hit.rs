@@ -33,39 +33,61 @@ pub fn hit_test(doc: &Document, point: Point, tolerance: f64) -> Option<ElementI
 
 /// Hit testing without the bound-text-to-container mapping (text editing,
 /// text tool), so the caption itself can be edited in place.
+///
+/// Scans the flat store and keeps the topmost match by `(index, id)`; this
+/// needs no z-order sort, and every element is bounds-culled before its
+/// geometry is examined.
 pub fn hit_test_raw(doc: &Document, point: Point, tolerance: f64) -> Option<ElementId> {
-    for id in doc.ordered_ids().into_iter().rev() {
-        let Some(element) = doc.element(&id) else {
-            continue;
-        };
+    let mut best: Option<&Element> = None;
+    for element in doc.elements.values() {
         if element.is_deleted {
             continue;
         }
-        if hits(doc, element, point, tolerance) {
-            return Some(id);
+        if !hits(doc, element, point, tolerance) {
+            continue;
+        }
+        let topmost = best.is_none_or(|b| {
+            (element.index.as_str(), element.id.as_str()) > (b.index.as_str(), b.id.as_str())
+        });
+        if topmost {
+            best = Some(element);
         }
     }
-    None
+    best.map(|element| element.id.clone())
 }
 
 /// Live elements whose bounds intersect the rectangle, in z-order.
 pub fn elements_in_rect(doc: &Document, rect: Rect) -> Vec<ElementId> {
     doc.ordered_live()
         .into_iter()
-        .filter(|e| e.bounds().intersects(&rect) || e.bounds().expand(4.0).intersects(&rect))
+        .filter(|e| {
+            let bounds = e.bounds();
+            bounds.intersects(&rect) || bounds.expand(4.0).intersects(&rect)
+        })
         .map(|e| e.id.clone())
         .collect()
 }
 
 pub fn hits(doc: &Document, element: &Element, p: Point, tolerance: f64) -> bool {
     match &element.kind {
-        ElementKind::Shape { shape, rect, .. } => match shape {
-            ShapeKind::Rectangle => rect.expand(tolerance).contains(p),
-            ShapeKind::Diamond => point_in_diamond(*rect, p, tolerance),
-            ShapeKind::Ellipse => point_in_ellipse(*rect, p, tolerance),
-        },
+        ElementKind::Shape {
+            shape, rect, style, ..
+        } => {
+            if !rect.expand(tolerance + style.stroke_width).contains(p) {
+                return false;
+            }
+            match shape {
+                ShapeKind::Rectangle => rect.expand(tolerance).contains(p),
+                ShapeKind::Diamond => point_in_diamond(*rect, p, tolerance),
+                ShapeKind::Ellipse => point_in_ellipse(*rect, p, tolerance),
+            }
+        }
         ElementKind::Freehand { points, style, .. } => {
-            near_polyline(points, p, tolerance + style.stroke_width / 2.0)
+            let slack = tolerance + style.stroke_width / 2.0;
+            if !element.bounds().expand(slack).contains(p) {
+                return false;
+            }
+            near_polyline(points, p, slack)
         }
         ElementKind::Arrow {
             start,
@@ -75,7 +97,11 @@ pub fn hits(doc: &Document, element: &Element, p: Point, tolerance: f64) -> bool
             ..
         } => {
             let route = crate::connector::route(start, end, *routing, doc);
-            near_polyline(&route, p, tolerance + style.stroke_width / 2.0)
+            let slack = tolerance + style.stroke_width / 2.0;
+            if !polyline_bounds(&route).expand(slack).contains(p) {
+                return false;
+            }
+            near_polyline(&route, p, slack)
         }
         ElementKind::Text { rect, .. } | ElementKind::Glyph { rect, .. } => {
             rect.expand(tolerance).contains(p)
@@ -84,6 +110,23 @@ pub fn hits(doc: &Document, element: &Element, p: Point, tolerance: f64) -> bool
             near_rect_border(*rect, p, tolerance.max(4.0)) || frame_name_hit(*rect, p)
         }
     }
+}
+
+fn polyline_bounds(points: &[Point]) -> Rect {
+    let Some(first) = points.first() else {
+        return Rect::ZERO;
+    };
+    let mut min_x = first.x;
+    let mut min_y = first.y;
+    let mut max_x = first.x;
+    let mut max_y = first.y;
+    for p in points {
+        min_x = min_x.min(p.x);
+        min_y = min_y.min(p.y);
+        max_x = max_x.max(p.x);
+        max_y = max_y.max(p.y);
+    }
+    Rect::new(min_x, min_y, max_x - min_x, max_y - min_y)
 }
 
 fn frame_name_hit(rect: Rect, p: Point) -> bool {

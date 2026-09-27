@@ -5,7 +5,7 @@
 //! same element inside one transaction coalesce, so a drag is one undo step.
 
 use crate::delta::{Delta, EditError};
-use crate::model::{Document, Element};
+use crate::model::{Document, Element, ElementId};
 
 /// A recorded, closed group of deltas: one user gesture.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -40,31 +40,33 @@ impl Transaction {
     /// Record an already-applied delta (used for coalescing-friendly flows).
     pub fn push(&mut self, delta: Delta) {
         if let Some(last) = self.deltas.last_mut() {
-            match last {
-                Delta::Update { after, .. } => {
-                    if let Delta::Update {
+            let coalesces = match (&mut *last, &delta) {
+                (
+                    Delta::Update { after, .. },
+                    Delta::Update {
                         after: new_after, ..
-                    } = &delta
-                    {
-                        if after.id == new_after.id {
-                            *after = new_after.clone();
-                            return;
-                        }
-                    }
-                }
-                Delta::Add { element } => {
-                    if let Delta::Update {
+                    },
+                ) => after.id == new_after.id,
+                (
+                    Delta::Add { element },
+                    Delta::Update {
                         after: new_after, ..
-                    } = &delta
-                    {
-                        if element.id == new_after.id {
-                            *element = new_after.clone();
-                            return;
-                        }
-                    }
+                    },
+                ) => element.id == new_after.id,
+                _ => false,
+            };
+            if coalesces {
+                match delta {
+                    Delta::Update {
+                        after: new_after, ..
+                    } => match last {
+                        Delta::Update { after, .. } => *after = new_after,
+                        Delta::Add { element } => *element = new_after,
+                        _ => unreachable!("coalesce implies a recorded change"),
+                    },
+                    _ => unreachable!("coalesce implies an update delta"),
                 }
-                Delta::Remove { .. } => {}
-                Delta::Purge { .. } => {}
+                return;
             }
         }
         self.deltas.push(delta);
@@ -149,28 +151,42 @@ impl History {
         self.undo_stack.len()
     }
 
-    pub fn undo(&mut self, doc: &mut Document) -> Result<bool, EditError> {
+    /// Undo the most recent transaction; returns the ids it touched so the
+    /// caller can repaint exactly those layers. An empty vec means the stack
+    /// was empty.
+    pub fn undo(&mut self, doc: &mut Document) -> Result<Vec<ElementId>, EditError> {
         match self.undo_stack.pop() {
-            None => Ok(false),
+            None => Ok(Vec::new()),
             Some(tx) => {
+                let ids: Vec<ElementId> = tx
+                    .deltas()
+                    .iter()
+                    .map(|delta| delta.element_id().clone())
+                    .collect();
                 for delta in tx.deltas().iter().rev() {
                     doc.apply(&delta.invert())?;
                 }
                 self.redo_stack.push(tx);
-                Ok(true)
+                Ok(ids)
             }
         }
     }
 
-    pub fn redo(&mut self, doc: &mut Document) -> Result<bool, EditError> {
+    /// Redo the most recently undone transaction; returns the ids it touched.
+    pub fn redo(&mut self, doc: &mut Document) -> Result<Vec<ElementId>, EditError> {
         match self.redo_stack.pop() {
-            None => Ok(false),
+            None => Ok(Vec::new()),
             Some(tx) => {
+                let ids: Vec<ElementId> = tx
+                    .deltas()
+                    .iter()
+                    .map(|delta| delta.element_id().clone())
+                    .collect();
                 for delta in tx.deltas() {
                     doc.apply(delta)?;
                 }
                 self.undo_stack.push(tx);
-                Ok(true)
+                Ok(ids)
             }
         }
     }
@@ -220,9 +236,9 @@ mod tests {
         tx.commit(&mut history);
 
         assert_eq!(doc.ordered_live().len(), 1);
-        assert!(history.undo(&mut doc).unwrap());
+        assert!(!history.undo(&mut doc).unwrap().is_empty());
         assert_eq!(doc.ordered_live().len(), 0);
-        assert!(history.redo(&mut doc).unwrap());
+        assert!(!history.redo(&mut doc).unwrap().is_empty());
         assert_eq!(doc.ordered_live().len(), 1);
         assert_eq!(doc.ordered_live()[0].id, id);
     }
@@ -239,7 +255,7 @@ mod tests {
         tx.commit(&mut history);
         assert!(doc.element(&id).unwrap().is_deleted);
 
-        assert!(history.undo(&mut doc).unwrap());
+        assert!(!history.undo(&mut doc).unwrap().is_empty());
         assert_eq!(doc.element(&id), Some(&before));
     }
 
@@ -277,9 +293,9 @@ mod tests {
         assert_eq!(tx.len(), 1, "updates on one element coalesce");
         tx.commit(&mut history);
 
-        assert!(history.undo(&mut doc).unwrap());
+        assert!(!history.undo(&mut doc).unwrap().is_empty());
         assert_eq!(doc.element(&id), Some(&before));
-        assert!(history.redo(&mut doc).unwrap());
+        assert!(!history.redo(&mut doc).unwrap().is_empty());
         if let ElementKind::Shape { rect, .. } = &doc.element(&id).unwrap().kind {
             assert_eq!(rect.x, 25.0);
         } else {
@@ -312,7 +328,7 @@ mod tests {
             .unwrap();
         tx.commit(&mut history);
         assert!(!history.can_redo());
-        assert!(history.undo(&mut doc).unwrap());
+        assert!(!history.undo(&mut doc).unwrap().is_empty());
     }
 
     #[test]
@@ -374,15 +390,15 @@ mod tests {
         }
 
         for (k, expected) in snapshots.iter().enumerate().rev().skip(1) {
-            assert!(history.undo(&mut doc).unwrap());
+            assert!(!history.undo(&mut doc).unwrap().is_empty());
             assert_eq!(&to_json(&doc).unwrap(), expected, "undo to step {k}");
         }
-        assert!(!history.undo(&mut doc).unwrap());
+        assert!(history.undo(&mut doc).unwrap().is_empty());
 
         for expected in snapshots.iter().skip(1) {
-            assert!(history.redo(&mut doc).unwrap());
+            assert!(!history.redo(&mut doc).unwrap().is_empty());
             assert_eq!(&to_json(&doc).unwrap(), expected);
         }
-        assert!(!history.redo(&mut doc).unwrap());
+        assert!(history.redo(&mut doc).unwrap().is_empty());
     }
 }

@@ -36,7 +36,12 @@ pub enum ShellAction {
         font_size: f64,
         text: String,
         align: TextAlign,
+        /// True for one-line fields (frame names): Enter commits instead of
+        /// inserting a newline.
+        single_line: bool,
     },
+    /// The document changed: the shell should debounce and call `flush_save`.
+    DocumentChanged,
 }
 
 /// What the shell should repaint after an input.
@@ -48,13 +53,19 @@ pub struct Effects {
     pub repaint_all: bool,
     /// Selection or in-progress decoration changed (overlay repaint).
     pub overlay_changed: bool,
+    /// The document itself changed, as opposed to only the camera: this is
+    /// what makes an autosave due. Camera pans repaint without saving.
+    pub document_changed: bool,
     /// Shell actions to dispatch (text editor, later: dialogs).
     pub actions: Vec<ShellAction>,
 }
 
 impl Effects {
     fn changed(id: impl Into<ElementId>) -> Self {
-        let mut effects = Self::default();
+        let mut effects = Self {
+            document_changed: true,
+            ..Self::default()
+        };
         effects.changed.insert(id.into());
         effects
     }
@@ -63,6 +74,7 @@ impl Effects {
         self.changed.extend(other.changed);
         self.repaint_all |= other.repaint_all;
         self.overlay_changed |= other.overlay_changed;
+        self.document_changed |= other.document_changed;
         self.actions.extend(other.actions);
     }
 }
@@ -159,6 +171,13 @@ impl Handle {
     }
 }
 
+/// Which end of a connector an `ArrowEndpoint` drag is moving.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EndpointEnd {
+    Start,
+    End,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 enum Interaction {
     #[default]
@@ -191,6 +210,11 @@ enum Interaction {
         id: ElementId,
         start: Point,
     },
+    /// Dragging one endpoint of a selected connector to rebind or detach it.
+    ArrowEndpoint {
+        id: ElementId,
+        end: EndpointEnd,
+    },
     Erasing {
         erased: BTreeSet<ElementId>,
     },
@@ -218,6 +242,9 @@ pub struct Editor {
     tx: Option<Transaction>,
     marquee_current: Option<Point>,
     clipboard: Vec<Element>,
+    /// How many pastes the current clipboard has produced; each paste lands
+    /// further from the source so copies never stack invisibly.
+    paste_serial: u32,
     last_pressure: f64,
     measurer: Box<dyn TextMeasurer>,
     hover_anchors: Option<(ElementId, Vec<Point>)>,
@@ -240,6 +267,7 @@ impl Editor {
             tx: None,
             marquee_current: None,
             clipboard: Vec::new(),
+            paste_serial: 0,
             last_pressure: 0.5,
             measurer: Box::new(ApproxMeasurer),
             hover_anchors: None,
@@ -252,6 +280,11 @@ impl Editor {
     /// The shell reports its viewport size (used for insert-at-centre).
     pub fn set_viewport(&mut self, width: f64, height: f64) {
         self.viewport_size = (width.max(1.0), height.max(1.0));
+    }
+
+    /// The last viewport size the shell reported, in CSS pixels.
+    pub fn viewport_size(&self) -> (f64, f64) {
+        self.viewport_size
     }
 
     /// Select a tool (single-shot: reverts to Select after one use).
@@ -291,6 +324,7 @@ impl Editor {
         Effects {
             repaint_all: true,
             overlay_changed: true,
+            document_changed: true,
             ..Effects::default()
         }
     }
@@ -352,22 +386,15 @@ impl Editor {
     }
 
     pub fn select_all(&mut self) -> Effects {
-        let ids = self
-            .doc
-            .ordered_live()
+        let live = self.doc.ordered_live();
+        let mut ids: Vec<ElementId> = live
             .iter()
             .filter(|e| !e.is_frame())
             .map(|e| e.id.clone())
-            .collect::<Vec<_>>();
-        let ids = if ids.is_empty() {
-            self.doc
-                .ordered_live()
-                .iter()
-                .map(|e| e.id.clone())
-                .collect()
-        } else {
-            ids
-        };
+            .collect();
+        if ids.is_empty() {
+            ids = live.iter().map(|e| e.id.clone()).collect();
+        }
         self.select(ids)
     }
 
@@ -399,7 +426,8 @@ impl Editor {
         mods: Modifiers,
         now: u64,
     ) -> Effects {
-        if let Interaction::TextEditing { id, .. } = self.interaction.clone() {
+        if let Interaction::TextEditing { id, .. } = &self.interaction {
+            let id = id.clone();
             let current = self
                 .doc
                 .element(&id)
@@ -440,15 +468,25 @@ impl Editor {
                 ..Effects::default()
             };
         }
-        match self.interaction.clone() {
+        // The eraser mutates through `&mut self`, so handle it before the
+        // read-only match below (this also keeps the match clone-free).
+        if let Interaction::Erasing { erased } = &self.interaction {
+            let mut erased = erased.clone();
+            let world = self.camera.screen_to_world(screen);
+            let mut effects = Effects::default();
+            self.erase_at(world, &mut erased, &mut effects, now);
+            self.interaction = Interaction::Erasing { erased };
+            return effects;
+        }
+        match &self.interaction {
             Interaction::Idle => Effects::default(),
             Interaction::FrameNameEditing { .. } => Effects::default(),
             Interaction::Drawing { id, start } => {
                 let current = self.camera.screen_to_world(screen);
-                let rect = self.drawn_rect(start, current, mods);
+                let rect = self.drawn_rect(*start, current, mods);
                 if let Some(tx) = self.tx.as_mut() {
                     if let Err(err) =
-                        tx.update(&mut self.doc, &id, now, |element| match &mut element.kind {
+                        tx.update(&mut self.doc, id, now, |element| match &mut element.kind {
                             ElementKind::Shape { rect: r, .. }
                             | ElementKind::Frame { rect: r, .. } => *r = rect,
                             _ => {}
@@ -457,7 +495,7 @@ impl Editor {
                         debug_assert!(false, "drawing update failed: {err}");
                     }
                 }
-                Effects::changed(id)
+                Effects::changed(id.clone())
             }
             Interaction::Marquee { start: _ } => {
                 self.marquee_current = Some(self.camera.screen_to_world(screen));
@@ -470,22 +508,26 @@ impl Editor {
             Interaction::Moving { start, originals } => {
                 let current = self.camera.screen_to_world(screen);
                 let (dx, dy) = (current.x - start.x, current.y - start.y);
+                let moved_ids: BTreeSet<ElementId> =
+                    originals.iter().map(|o| o.id.clone()).collect();
                 let mut effects = Effects::default();
-                for original in &originals {
+                for original in originals {
                     let mut translated = original.clone();
-                    translate_element(&mut translated, dx, dy);
+                    // Bound endpoints stay glued to their element; only free
+                    // endpoints follow the drag. A fully bound connector
+                    // therefore holds still — drag one of its endpoints to
+                    // rewire or detach it.
+                    translate_element_keeping_bindings(&self.doc, &mut translated, dx, dy);
                     let kind = translated.kind;
                     if let Some(tx) = self.tx.as_mut() {
                         if let Err(err) = tx.update(&mut self.doc, &original.id, now, |element| {
-                            element.kind = kind.clone();
+                            element.kind = kind;
                         }) {
                             debug_assert!(false, "moving update failed: {err}");
                         }
                     }
                     effects.changed.insert(original.id.clone());
                 }
-                let moved_ids: BTreeSet<ElementId> =
-                    originals.iter().map(|o| o.id.clone()).collect();
                 let updates = self.connected_arrow_updates(&moved_ids);
                 if let Some(tx) = self.tx.as_mut() {
                     for (arrow_id, start_point, end_point) in updates {
@@ -509,15 +551,15 @@ impl Editor {
                 originals,
             } => {
                 let current = self.camera.screen_to_world(screen);
-                let target = resized_bounds(bounds, handle, start, current, mods.shift);
+                let target = resized_bounds(*bounds, *handle, *start, current, mods.shift);
                 let mut effects = Effects::default();
-                for original in &originals {
+                for original in originals {
                     let mut scaled = original.clone();
-                    scale_element(&mut scaled, bounds, target);
+                    scale_element(&mut scaled, *bounds, target);
                     let kind = scaled.kind;
                     if let Some(tx) = self.tx.as_mut() {
                         if let Err(err) = tx.update(&mut self.doc, &original.id, now, |element| {
-                            element.kind = kind.clone();
+                            element.kind = kind;
                         }) {
                             debug_assert!(false, "resize update failed: {err}");
                         }
@@ -526,18 +568,11 @@ impl Editor {
                 }
                 effects
             }
-            Interaction::Erasing { erased } => {
-                let world = self.camera.screen_to_world(screen);
-                let mut effects = Effects::default();
-                let mut erased = erased;
-                self.erase_at(world, &mut erased, &mut effects, now);
-                self.interaction = Interaction::Erasing { erased };
-                effects
-            }
+            Interaction::Erasing { .. } => unreachable!("handled above"),
             Interaction::TextEditing { .. } => Effects::default(),
             Interaction::Freehand { id } => {
                 let current = self.camera.screen_to_world(screen);
-                let last = self.doc.element(&id).and_then(|e| match &e.kind {
+                let last = self.doc.element(id).and_then(|e| match &e.kind {
                     ElementKind::Freehand { points, .. } => points.last().copied(),
                     _ => None,
                 });
@@ -548,7 +583,7 @@ impl Editor {
                 if far_enough {
                     let pressure = self.last_pressure;
                     if let Some(tx) = self.tx.as_mut() {
-                        let _ = tx.update(&mut self.doc, &id, now, |element| {
+                        let _ = tx.update(&mut self.doc, id, now, |element| {
                             if let ElementKind::Freehand {
                                 points, pressures, ..
                             } = &mut element.kind
@@ -558,35 +593,40 @@ impl Editor {
                             }
                         });
                     }
-                    effects.changed.insert(id);
+                    effects.changed.insert(id.clone());
                 }
                 effects
             }
             Interaction::Line { id, start } => {
                 let current = self.camera.screen_to_world(screen);
-                let end = constrain_angle(start, current, mods.shift);
+                let end = constrain_angle(*start, current, mods.shift);
                 if let Some(tx) = self.tx.as_mut() {
-                    let _ = tx.update(&mut self.doc, &id, now, |element| {
+                    let _ = tx.update(&mut self.doc, id, now, |element| {
                         if let ElementKind::Arrow { end: e, .. } = &mut element.kind {
                             e.x = end.x;
                             e.y = end.y;
                         }
                     });
                 }
-                Effects::changed(id)
+                Effects::changed(id.clone())
             }
             Interaction::Connecting { id, start } => {
                 let current = self.camera.screen_to_world(screen);
                 let tolerance = self.tolerance().max(4.0);
                 let approach = self
                     .doc
-                    .element(&id)
+                    .element(id)
                     .and_then(|element| match &element.kind {
                         ElementKind::Arrow { start, .. } => Some(start.point()),
                         _ => None,
                     });
-                let candidate =
-                    connector::binding_candidate(&self.doc, current, tolerance, approach);
+                let candidate = connector::binding_candidate(
+                    &self.doc,
+                    current,
+                    tolerance,
+                    approach,
+                    Some(id.as_str()),
+                );
                 let (end, binding, hover) = match candidate {
                     Some((target_id, side, point)) => {
                         let anchors = self
@@ -613,11 +653,81 @@ impl Editor {
                 self.hover_anchors = hover;
                 let _ = start;
                 if let Some(tx) = self.tx.as_mut() {
-                    let _ = tx.update(&mut self.doc, &id, now, |element| {
+                    let _ = tx.update(&mut self.doc, id, now, |element| {
                         if let ElementKind::Arrow { end: e, .. } = &mut element.kind {
                             e.x = end.x;
                             e.y = end.y;
                             e.binding = binding.clone();
+                        }
+                    });
+                }
+                Effects {
+                    changed: [id.clone()].into_iter().collect(),
+                    overlay_changed: true,
+                    ..Effects::default()
+                }
+            }
+            Interaction::ArrowEndpoint { id, end } => {
+                let current = self.camera.screen_to_world(screen);
+                let tolerance = self.tolerance().max(4.0);
+                let id = id.clone();
+                let end = *end;
+                let approach = self
+                    .doc
+                    .element(&id)
+                    .and_then(|element| match &element.kind {
+                        ElementKind::Arrow {
+                            start, end: tail, ..
+                        } => Some(match end {
+                            EndpointEnd::Start => tail.point(),
+                            EndpointEnd::End => start.point(),
+                        }),
+                        _ => None,
+                    });
+                let candidate = connector::binding_candidate(
+                    &self.doc,
+                    current,
+                    tolerance,
+                    approach,
+                    Some(&id),
+                );
+                let (point, binding, hover) = match candidate {
+                    Some((target_id, side, point)) => {
+                        let anchors = self
+                            .doc
+                            .element(&target_id)
+                            .map(|element| {
+                                connector::anchor_points(element.bounds())
+                                    .into_iter()
+                                    .map(|(_, p)| p)
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        (
+                            point,
+                            Some(Binding {
+                                element_id: target_id.clone(),
+                                focus: Some(side.focus()),
+                            }),
+                            Some((target_id, anchors)),
+                        )
+                    }
+                    None => (current, None, None),
+                };
+                self.hover_anchors = hover;
+                if let Some(tx) = self.tx.as_mut() {
+                    let _ = tx.update(&mut self.doc, &id, now, |element| {
+                        if let ElementKind::Arrow {
+                            start, end: tail, ..
+                        } = &mut element.kind
+                        {
+                            let endpoint = match end {
+                                EndpointEnd::Start => start,
+                                EndpointEnd::End => tail,
+                            };
+                            endpoint.x = point.x;
+                            endpoint.y = point.y;
+                            endpoint.binding = binding.clone();
                         }
                     });
                 }
@@ -634,17 +744,31 @@ impl Editor {
         if self.nav.pointer_up(0) || self.nav.pointer_up(1) {
             return Effects::default();
         }
-        let mut effects = match self.interaction {
+        // Take the interaction out rather than cloning it: `Moving`/`Resizing`
+        // carry the original elements, which must not be copied per event.
+        let interaction = std::mem::replace(&mut self.interaction, Interaction::Idle);
+        let mut effects = match interaction {
             Interaction::Drawing { .. }
             | Interaction::Moving { .. }
             | Interaction::Resizing { .. }
             | Interaction::Connecting { .. }
-            | Interaction::Line { .. } => self.pointer_move(screen, mods, now),
-            _ => Effects::default(),
+            | Interaction::ArrowEndpoint { .. }
+            | Interaction::Line { .. } => {
+                self.interaction = interaction;
+                self.pointer_move(screen, mods, now)
+            }
+            other => {
+                self.interaction = other;
+                Effects::default()
+            }
         };
-        match self.interaction.clone() {
+        let interaction = std::mem::replace(&mut self.interaction, Interaction::Idle);
+        match interaction {
             Interaction::Idle => {}
-            Interaction::FrameNameEditing { .. } => {}
+            Interaction::FrameNameEditing { id } => {
+                // The shell owns the frame-name editor; stay in the state.
+                self.interaction = Interaction::FrameNameEditing { id };
+            }
             Interaction::Drawing { id, .. } => {
                 let tiny = self
                     .doc
@@ -654,7 +778,6 @@ impl Editor {
                         b.w < self.min_draw_size() || b.h < self.min_draw_size()
                     })
                     .unwrap_or(true);
-                self.interaction = Interaction::Idle;
                 self.marquee_current = None;
                 if tiny {
                     self.tx = None;
@@ -681,7 +804,6 @@ impl Editor {
             Interaction::Marquee { start } => {
                 let end = self.camera.screen_to_world(screen);
                 let rect = Rect::from_points(start, end);
-                self.interaction = Interaction::Idle;
                 self.marquee_current = None;
                 let hits: Vec<ElementId> = elements_in_rect(&self.doc, rect)
                     .into_iter()
@@ -705,7 +827,6 @@ impl Editor {
                 }
             }
             Interaction::Moving { .. } => {
-                self.interaction = Interaction::Idle;
                 self.sync_frame_membership(now);
                 if let Some(tx) = self.tx.take() {
                     let changed: BTreeSet<ElementId> =
@@ -719,7 +840,6 @@ impl Editor {
                 }
             }
             Interaction::Resizing { .. } => {
-                self.interaction = Interaction::Idle;
                 let changed: BTreeSet<ElementId> = self
                     .tx
                     .as_ref()
@@ -760,16 +880,17 @@ impl Editor {
                 }
             }
             Interaction::Erasing { erased } => {
-                self.interaction = Interaction::Idle;
                 if let Some(tx) = self.tx.take() {
                     tx.commit(&mut self.history);
                 }
                 effects.changed.extend(erased);
                 effects.overlay_changed = true;
             }
-            Interaction::TextEditing { .. } => {}
+            Interaction::TextEditing { id, original } => {
+                // The shell owns the text editor; stay in the state.
+                self.interaction = Interaction::TextEditing { id, original };
+            }
             Interaction::Freehand { id } => {
-                self.interaction = Interaction::Idle;
                 if let Some(tx) = self.tx.as_mut() {
                     let _ = tx.update(&mut self.doc, &id, now, |element| {
                         if let ElementKind::Freehand {
@@ -810,13 +931,13 @@ impl Editor {
                     if let Some(tx) = self.tx.take() {
                         tx.commit(&mut self.history);
                     }
+                    self.finish_tool_use();
                     let selection_effects = self.select([id.clone()]);
                     effects.changed.insert(id);
                     effects.merge(selection_effects);
                 }
             }
             Interaction::Line { id, .. } => {
-                self.interaction = Interaction::Idle;
                 let tiny = self
                     .doc
                     .element(&id)
@@ -848,7 +969,6 @@ impl Editor {
                 }
             }
             Interaction::Connecting { id, .. } => {
-                self.interaction = Interaction::Idle;
                 self.hover_anchors = None;
                 let tiny = self
                     .doc
@@ -880,6 +1000,34 @@ impl Editor {
                     effects.merge(selection_effects);
                 }
             }
+            Interaction::ArrowEndpoint { id, .. } => {
+                self.hover_anchors = None;
+                // The connector's label rides along its new geometry.
+                let reflows = self.bound_text_reflows(&[id.clone()].into_iter().collect());
+                if let Some(tx) = self.tx.as_mut() {
+                    for (text_id, rect) in &reflows {
+                        let _ = tx.update(&mut self.doc, text_id, now, |element| {
+                            if let ElementKind::Text { rect: r, .. } = &mut element.kind {
+                                *r = *rect;
+                            }
+                        });
+                    }
+                }
+                self.sync_frame_membership(now);
+                if let Some(tx) = self.tx.take() {
+                    let changed: BTreeSet<ElementId> =
+                        tx.deltas().iter().map(|d| d.element_id().clone()).collect();
+                    tx.commit(&mut self.history);
+                    effects.merge(Effects {
+                        changed,
+                        overlay_changed: true,
+                        ..Effects::default()
+                    });
+                }
+                let selection_effects = self.select([id.clone()]);
+                effects.changed.insert(id);
+                effects.merge(selection_effects);
+            }
         }
         effects
     }
@@ -894,36 +1042,65 @@ impl Editor {
         let Some(id) = hit_test_raw(&self.doc, world, tolerance) else {
             return Effects::default();
         };
-        match self.doc.element(&id).map(|e| e.kind.clone()) {
-            Some(ElementKind::Text { .. }) => {
-                self.begin_text_edit(self.doc.element(&id).cloned(), now)
-            }
+        enum Target {
+            Existing(ElementId),
+            Bound {
+                container: ElementId,
+                rect: Rect,
+                existing: Option<ElementId>,
+            },
+            Frame {
+                id: ElementId,
+                rect: Rect,
+                name: String,
+            },
+        }
+        let arrow_bounds = self
+            .doc
+            .element(&id)
+            .map(|e| e.bounds())
+            .unwrap_or(Rect::ZERO);
+        let target = match self.doc.element(&id).map(|e| &e.kind) {
+            Some(ElementKind::Text { .. }) => Target::Existing(id.clone()),
             Some(ElementKind::Shape {
                 bound_text_id,
                 rect,
                 ..
-            }) => match bound_text_id {
-                Some(text_id) => self.begin_text_edit(self.doc.element(&text_id).cloned(), now),
-                None => self.create_bound_text(id, rect, now),
+            }) => Target::Bound {
+                container: id.clone(),
+                rect: *rect,
+                existing: bound_text_id.clone(),
             },
             Some(ElementKind::Glyph {
                 caption_id, rect, ..
-            }) => match caption_id {
-                Some(text_id) => self.begin_text_edit(self.doc.element(&text_id).cloned(), now),
-                None => self.create_bound_text(id, rect, now),
+            }) => Target::Bound {
+                container: id.clone(),
+                rect: *rect,
+                existing: caption_id.clone(),
             },
-            Some(ElementKind::Arrow { label_id, .. }) => match label_id {
-                Some(text_id) => self.begin_text_edit(self.doc.element(&text_id).cloned(), now),
-                None => {
-                    let bounds = self
-                        .doc
-                        .element(&id)
-                        .map(|e| e.bounds())
-                        .unwrap_or(Rect::ZERO);
-                    self.create_bound_text(id, bounds, now)
-                }
+            Some(ElementKind::Arrow { label_id, .. }) => Target::Bound {
+                container: id.clone(),
+                rect: arrow_bounds,
+                existing: label_id.clone(),
             },
-            Some(ElementKind::Frame { rect, name, .. }) => {
+            Some(ElementKind::Frame { rect, name, .. }) => Target::Frame {
+                id: id.clone(),
+                rect: *rect,
+                name: name.clone(),
+            },
+            _ => return Effects::default(),
+        };
+        match target {
+            Target::Existing(id)
+            | Target::Bound {
+                existing: Some(id), ..
+            } => self.begin_text_edit(self.doc.element(&id).cloned(), now),
+            Target::Bound {
+                container,
+                rect,
+                existing: None,
+            } => self.create_bound_text(container, rect, now),
+            Target::Frame { id, rect, name } => {
                 self.interaction = Interaction::FrameNameEditing { id: id.clone() };
                 let top_left = self
                     .camera
@@ -937,6 +1114,7 @@ impl Editor {
                     font_size: 14.0 * self.camera.zoom,
                     text: name,
                     align: TextAlign::Left,
+                    single_line: true,
                 };
                 Effects {
                     overlay_changed: true,
@@ -944,7 +1122,6 @@ impl Editor {
                     ..Effects::default()
                 }
             }
-            _ => Effects::default(),
         }
     }
 
@@ -1116,12 +1293,13 @@ impl Editor {
             font_size: font_size * self.camera.zoom,
             text: content,
             align,
+            single_line: false,
         })
     }
 
     /// Commit the open text edit with the shell's textarea contents.
     pub fn commit_text(&mut self, id: &str, text: &str, now: u64) -> Effects {
-        if let Interaction::FrameNameEditing { id: editing_id } = self.interaction.clone() {
+        if let Interaction::FrameNameEditing { id: editing_id } = &self.interaction {
             if editing_id != id {
                 return Effects::default();
             }
@@ -1143,12 +1321,16 @@ impl Editor {
             }
             return effects;
         }
+        if !matches!(self.interaction, Interaction::TextEditing { .. }) {
+            return Effects::default();
+        }
+        let interaction = std::mem::replace(&mut self.interaction, Interaction::Idle);
         let Interaction::TextEditing {
             id: editing_id,
             original,
-        } = self.interaction.clone()
+        } = interaction
         else {
-            return Effects::default();
+            unreachable!("checked above");
         };
         let original = *original;
         if editing_id != id {
@@ -1283,12 +1465,15 @@ impl Editor {
 
     /// Discard the open text edit, restoring the prior state.
     pub fn cancel_text(&mut self) -> Effects {
-        let Interaction::TextEditing { id, original } = self.interaction.clone() else {
+        if !matches!(self.interaction, Interaction::TextEditing { .. }) {
             return Effects::default();
+        }
+        let interaction = std::mem::replace(&mut self.interaction, Interaction::Idle);
+        let Interaction::TextEditing { id, original } = interaction else {
+            unreachable!("checked above");
         };
         let original = *original;
         self.tx = None;
-        self.interaction = Interaction::Idle;
         match original {
             Some(orig) => {
                 if let Some(current) = self.doc.element(&id).cloned() {
@@ -1392,7 +1577,10 @@ impl Editor {
                 overlay_changed: true,
                 ..Effects::default()
             },
-            Interaction::Moving { .. } | Interaction::Resizing { .. } => {
+            Interaction::Moving { .. }
+            | Interaction::Resizing { .. }
+            | Interaction::ArrowEndpoint { .. } => {
+                self.hover_anchors = None;
                 if let Some(tx) = self.tx.take() {
                     for delta in tx.deltas().iter().rev() {
                         let _ = self.doc.apply(&delta.invert());
@@ -1511,25 +1699,35 @@ impl Editor {
     }
 
     pub fn undo(&mut self) -> Effects {
-        if let Err(err) = self.history.undo(&mut self.doc) {
-            debug_assert!(false, "undo failed: {err}");
-        }
+        let changed: BTreeSet<ElementId> = match self.history.undo(&mut self.doc) {
+            Ok(ids) => ids.into_iter().collect(),
+            Err(err) => {
+                debug_assert!(false, "undo failed: {err}");
+                BTreeSet::new()
+            }
+        };
         self.selection.clear();
         Effects {
-            repaint_all: true,
+            changed,
             overlay_changed: true,
+            document_changed: true,
             ..Effects::default()
         }
     }
 
     pub fn redo(&mut self) -> Effects {
-        if let Err(err) = self.history.redo(&mut self.doc) {
-            debug_assert!(false, "redo failed: {err}");
-        }
+        let changed: BTreeSet<ElementId> = match self.history.redo(&mut self.doc) {
+            Ok(ids) => ids.into_iter().collect(),
+            Err(err) => {
+                debug_assert!(false, "redo failed: {err}");
+                BTreeSet::new()
+            }
+        };
         self.selection.clear();
         Effects {
-            repaint_all: true,
+            changed,
             overlay_changed: true,
+            document_changed: true,
             ..Effects::default()
         }
     }
@@ -1539,6 +1737,33 @@ impl Editor {
     fn begin_select(&mut self, screen: Point, world: Point, mods: Modifiers) -> Effects {
         if mods.command() {
             return Effects::default();
+        }
+        // Dragging a connector's endpoint rewires or detaches it; the grab
+        // radius matches the resize handles so the affordance is the same.
+        if !mods.shift {
+            if let Some((id, end)) = self.arrow_endpoint_at(world) {
+                self.tx = Some(Transaction::begin());
+                self.interaction = Interaction::ArrowEndpoint { id, end };
+                return Effects {
+                    overlay_changed: true,
+                    ..Effects::default()
+                };
+            }
+            // A lone connector's shaft: begin Moving directly. Otherwise the
+            // click lands on the degenerate bounding box's edge handles —
+            // and resizing a zero-height or zero-width box is a no-op, so the
+            // arrow would seem glued in place.
+            if let Some(originals) = self.lone_arrow_shaft_hit(world) {
+                self.tx = Some(Transaction::begin());
+                self.interaction = Interaction::Moving {
+                    start: world,
+                    originals,
+                };
+                return Effects {
+                    overlay_changed: true,
+                    ..Effects::default()
+                };
+            }
         }
         if let Some(bounds) = self.selection_bounds() {
             if let Some(handle) = self.handle_at(screen, bounds) {
@@ -1652,6 +1877,47 @@ impl Editor {
                 .find(|(_, p)| p.distance(screen) <= HANDLE_HIT_PX)
                 .map(|(h, _)| h)
         })
+    }
+
+    /// When the selection is a lone connector, which endpoint `world` grabs.
+    /// Returns the element id and the grabbed end.
+    fn arrow_endpoint_at(&self, world: Point) -> Option<(ElementId, EndpointEnd)> {
+        if self.selection.len() != 1 {
+            return None;
+        }
+        let id = self.selection.iter().next()?;
+        let element = self.doc.element(id)?;
+        let ElementKind::Arrow { start, end, .. } = &element.kind else {
+            return None;
+        };
+        let grab = HANDLE_HIT_PX / self.camera.zoom;
+        let start_point = connector::endpoint_point(start, end.point(), &self.doc);
+        if world.distance(start_point) <= grab {
+            return Some((id.clone(), EndpointEnd::Start));
+        }
+        let end_point = connector::endpoint_point(end, start.point(), &self.doc);
+        if world.distance(end_point) <= grab {
+            return Some((id.clone(), EndpointEnd::End));
+        }
+        None
+    }
+
+    /// When the selection is a lone connector and `world` is on its routed
+    /// shaft (but not an endpoint — `arrow_endpoint_at` covers those), the
+    /// originals for a body drag: the connector plus its followers.
+    fn lone_arrow_shaft_hit(&self, world: Point) -> Option<Vec<Element>> {
+        if self.selection.len() != 1 {
+            return None;
+        }
+        let id = self.selection.iter().next()?;
+        let element = self.doc.element(id)?;
+        if !matches!(element.kind, ElementKind::Arrow { .. }) {
+            return None;
+        }
+        if !crate::hit::hits(&self.doc, element, world, self.tolerance().max(4.0)) {
+            return None;
+        }
+        Some(self.selection_with_followers())
     }
 
     /// Apply a style patch to the selection (undoably) and to the defaults
@@ -1856,17 +2122,17 @@ impl Editor {
     }
 
     /// Anchor points to highlight during a connector drag.
-    pub fn hover_anchor_points(&self) -> Vec<Point> {
+    pub fn hover_anchor_points(&self) -> &[Point] {
         self.hover_anchors
             .as_ref()
-            .map(|(_, points)| points.clone())
+            .map(|(_, points)| points.as_slice())
             .unwrap_or_default()
     }
 
     fn begin_connector(&mut self, world: Point, now: u64) -> Effects {
         let mut tx = Transaction::begin();
         let tolerance = self.tolerance().max(4.0);
-        let candidate = connector::binding_candidate(&self.doc, world, tolerance, None);
+        let candidate = connector::binding_candidate(&self.doc, world, tolerance, None, None);
         let (start_point, start_binding) = match candidate {
             Some((target_id, side, point)) => (
                 point,
@@ -1936,25 +2202,32 @@ impl Editor {
     }
 
     /// New endpoint positions for arrows connected to the given elements.
+    ///
+    /// One pass over the document, not one pass per moved element.
     fn connected_arrow_updates(
         &self,
         moved: &BTreeSet<ElementId>,
     ) -> Vec<(ElementId, Point, Point)> {
         let mut updates = Vec::new();
-        for moved_id in moved {
-            for arrow_id in self.bound_arrows(moved_id) {
-                if moved.contains(&arrow_id) {
-                    continue;
-                }
-                let Some(ElementKind::Arrow { start, end, .. }) =
-                    self.doc.element(&arrow_id).map(|e| e.kind.clone())
-                else {
-                    continue;
-                };
-                let (s, _) = connector::resolve_endpoint(&start, end.point(), &self.doc);
-                let (e, _) = connector::resolve_endpoint(&end, start.point(), &self.doc);
-                updates.push((arrow_id, s, e));
+        for element in self.doc.elements.values() {
+            let ElementKind::Arrow { start, end, .. } = &element.kind else {
+                continue;
+            };
+            if element.is_deleted || moved.contains(&element.id) {
+                continue;
             }
+            let binds_moved = |endpoint: &Endpoint| {
+                endpoint
+                    .binding
+                    .as_ref()
+                    .is_some_and(|b| moved.contains(&b.element_id))
+            };
+            if !binds_moved(start) && !binds_moved(end) {
+                continue;
+            }
+            let (s, _) = connector::resolve_endpoint(start, end.point(), &self.doc);
+            let (e, _) = connector::resolve_endpoint(end, start.point(), &self.doc);
+            updates.push((element.id.clone(), s, e));
         }
         updates
     }
@@ -1964,6 +2237,16 @@ impl Editor {
         &self,
         ids: &BTreeSet<ElementId>,
     ) -> Vec<(ElementId, Option<ElementId>)> {
+        let frames: Vec<(&str, Rect)> = self
+            .doc
+            .elements
+            .values()
+            .filter(|e| !e.is_deleted)
+            .filter_map(|e| match &e.kind {
+                ElementKind::Frame { rect, .. } => Some((e.id.as_str(), *rect)),
+                _ => None,
+            })
+            .collect();
         let mut out = Vec::new();
         for id in ids {
             let Some(element) = self.doc.element(id) else {
@@ -1979,31 +2262,12 @@ impl Editor {
             {
                 continue;
             }
-            let target = self.frame_containing(element.bounds().center());
+            let target = smallest_frame_containing(&frames, element.bounds().center());
             if element.frame_id != target {
                 out.push((id.clone(), target));
             }
         }
         out
-    }
-
-    /// The smallest frame whose rectangle contains a point.
-    fn frame_containing(&self, point: Point) -> Option<ElementId> {
-        let mut best: Option<(f64, ElementId)> = None;
-        for element in self.doc.elements.values() {
-            if element.is_deleted {
-                continue;
-            }
-            if let ElementKind::Frame { rect, .. } = &element.kind {
-                if rect.contains(point) {
-                    let area = rect.w * rect.h;
-                    if best.as_ref().map(|(a, _)| area < *a).unwrap_or(true) {
-                        best = Some((area, element.id.clone()));
-                    }
-                }
-            }
-        }
-        best.map(|(_, id)| id)
     }
 
     /// Reconcile frame membership inside the open transaction.
@@ -2167,14 +2431,26 @@ impl Editor {
         let mut effects = Effects::default();
         for original in &originals {
             let mut translated = original.clone();
-            translate_element(&mut translated, dx, dy);
+            translate_element_keeping_bindings(&self.doc, &mut translated, dx, dy);
             let kind = translated.kind;
             if let Err(err) = tx.update(&mut self.doc, &original.id, now, |element| {
-                element.kind = kind.clone();
+                element.kind = kind;
             }) {
                 debug_assert!(false, "nudge failed: {err}");
             }
             effects.changed.insert(original.id.clone());
+        }
+        let moved_ids: BTreeSet<ElementId> = originals.iter().map(|o| o.id.clone()).collect();
+        for (arrow_id, start_point, end_point) in self.connected_arrow_updates(&moved_ids) {
+            let _ = tx.update(&mut self.doc, &arrow_id, now, |element| {
+                if let ElementKind::Arrow { start, end, .. } = &mut element.kind {
+                    start.x = start_point.x;
+                    start.y = start_point.y;
+                    end.x = end_point.x;
+                    end.y = end_point.y;
+                }
+            });
+            effects.changed.insert(arrow_id);
         }
         tx.commit(&mut self.history);
         effects
@@ -2192,12 +2468,14 @@ impl Editor {
     /// Copy the selection (with its followers) into the internal clipboard.
     pub fn copy(&mut self) -> Effects {
         self.clipboard = self.selection_with_followers();
+        self.paste_serial = 0;
         Effects::default()
     }
 
     /// Copy and delete the selection.
     pub fn cut(&mut self, now: u64) -> Effects {
         self.clipboard = self.selection_with_followers();
+        self.paste_serial = 0;
         self.delete_selection(now)
     }
 
@@ -2206,8 +2484,10 @@ impl Editor {
         if self.clipboard.is_empty() {
             return Effects::default();
         }
+        self.paste_serial += 1;
+        let offset = 12.0 * self.paste_serial as f64;
         let source = self.clipboard.clone();
-        self.insert_copies(source, 12.0, 12.0, now)
+        self.insert_copies(source, offset, offset, now)
     }
 
     fn insert_copies(&mut self, source: Vec<Element>, dx: f64, dy: f64, now: u64) -> Effects {
@@ -2399,6 +2679,41 @@ pub fn element_style(element: &Element) -> Option<&Style> {
     }
 }
 
+/// Translate an element by a world-space delta while a bound connector keeps
+/// its bindings: free endpoints move with the drag, bound endpoints stay glued
+/// to their element and only refresh their stored coordinates. Dragging a
+/// fully bound connector therefore holds it still — drag one of its endpoints
+/// to rewire or detach it.
+fn translate_element_keeping_bindings(doc: &Document, element: &mut Element, dx: f64, dy: f64) {
+    if !matches!(element.kind, ElementKind::Arrow { .. }) {
+        translate_element(element, dx, dy);
+        return;
+    }
+    let ElementKind::Arrow { start, end, .. } = &mut element.kind else {
+        return;
+    };
+    if start.binding.is_none() {
+        start.x += dx;
+        start.y += dy;
+    }
+    if end.binding.is_none() {
+        end.x += dx;
+        end.y += dy;
+    }
+    if start.binding.is_some() {
+        let other = Point::new(end.x, end.y);
+        let (resolved, _) = connector::resolve_endpoint(start, other, doc);
+        start.x = resolved.x;
+        start.y = resolved.y;
+    }
+    if end.binding.is_some() {
+        let other = Point::new(start.x, start.y);
+        let (resolved, _) = connector::resolve_endpoint(end, other, doc);
+        end.x = resolved.x;
+        end.y = resolved.y;
+    }
+}
+
 /// Translate every kind of element in place.
 pub fn translate_element(element: &mut Element, dx: f64, dy: f64) {
     match &mut element.kind {
@@ -2464,6 +2779,20 @@ pub fn scale_element(element: &mut Element, from: Rect, to: Rect) {
             };
         }
     }
+}
+
+/// The smallest frame whose rectangle contains a point.
+fn smallest_frame_containing(frames: &[(&str, Rect)], point: Point) -> Option<ElementId> {
+    let mut best: Option<(f64, &str)> = None;
+    for (id, rect) in frames {
+        if rect.contains(point) {
+            let area = rect.w * rect.h;
+            if best.as_ref().map(|(a, _)| area < *a).unwrap_or(true) {
+                best = Some((area, id));
+            }
+        }
+    }
+    best.map(|(_, id)| id.to_string())
 }
 
 /// Compute resized bounds from a handle drag. Dragging an edge or corner
@@ -3029,6 +3358,35 @@ mod tests {
     }
 
     #[test]
+    fn freehand_is_single_shot_and_the_stroke_stays_selectable() {
+        let mut e = editor();
+        let mods = Modifiers::default();
+        press(&mut e, "p", mods, 1);
+        e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
+        for i in 1..=20 {
+            e.pointer_move(
+                Point::new(i as f64 * 3.0, (i as f64 * 0.7).sin() * 4.0),
+                mods,
+                2 + i,
+            );
+        }
+        e.pointer_up(Point::new(57.0, 2.6), mods, 30);
+
+        assert_eq!(e.tool, Tool::Select, "the pencil is single-shot too");
+        assert_eq!(e.doc.ordered_live().len(), 1);
+        let id = e.doc.ordered_live()[0].id.clone();
+
+        e.clear_selection();
+        e.pointer_down(Point::new(0.0, 0.0), 0, mods, 31);
+        e.pointer_up(Point::new(0.0, 0.0), mods, 32);
+        assert_eq!(
+            e.selection.iter().next(),
+            Some(&id),
+            "clicking the stroke selects it once the tool handed back"
+        );
+    }
+
+    #[test]
     fn line_tool_creates_an_arrow_element() {
         let mut e = editor();
         press(&mut e, "l", Modifiers::default(), 1);
@@ -3350,6 +3708,71 @@ mod tests {
             after != before,
             "arrow endpoints followed the moved shape: {before:?} -> {after:?}"
         );
+    }
+
+    #[test]
+    fn dragging_a_bound_arrow_keeps_it_connected() {
+        let mut e = editor();
+        drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(100.0, 100.0), 1);
+        drag_shape(&mut e, Point::new(300.0, 0.0), Point::new(400.0, 100.0), 2);
+        let a = e.doc.ordered_live()[0].id.clone();
+        let b = e.doc.ordered_live()[1].id.clone();
+
+        let mods = Modifiers::default();
+        press(&mut e, "a", mods, 3);
+        e.pointer_down(Point::new(50.0, 50.0), 0, mods, 4);
+        e.pointer_move(Point::new(350.0, 50.0), mods, 5);
+        e.pointer_up(Point::new(350.0, 50.0), mods, 6);
+        let arrow_id = e
+            .doc
+            .ordered_live()
+            .iter()
+            .find(|element| matches!(element.kind, ElementKind::Arrow { .. }))
+            .unwrap()
+            .id
+            .clone();
+
+        let bindings = |element: &Element| match &element.kind {
+            ElementKind::Arrow { start, end, .. } => (
+                start.binding.as_ref().map(|b| b.element_id.clone()),
+                end.binding.as_ref().map(|b| b.element_id.clone()),
+            ),
+            other => panic!("expected an arrow, got {other:?}"),
+        };
+        let connected = (Some(a.clone()), Some(b.clone()));
+
+        // Dragging the shaft must not silently detach the connector.
+        e.pointer_down(Point::new(200.0, 50.0), 0, mods, 7);
+        e.pointer_move(Point::new(260.0, 110.0), mods, 8);
+        e.pointer_up(Point::new(260.0, 110.0), mods, 9);
+        assert_eq!(
+            bindings(e.doc.element(&arrow_id).unwrap()),
+            connected,
+            "a body drag keeps both bindings"
+        );
+
+        // Nudging is the same gesture, one pixel at a time.
+        e.select([arrow_id.clone()]);
+        press(&mut e, "ArrowRight", mods, 10);
+        assert_eq!(
+            bindings(e.doc.element(&arrow_id).unwrap()),
+            connected,
+            "nudging keeps both bindings"
+        );
+
+        // The link is still live: moving the target drags the endpoint along.
+        e.select([b.clone()]);
+        e.pointer_down(Point::new(350.0, 50.0), 0, mods, 11);
+        e.pointer_move(Point::new(350.0, 150.0), mods, 12);
+        e.pointer_up(Point::new(350.0, 150.0), mods, 13);
+
+        let arrow = e.doc.element(&arrow_id).unwrap();
+        let ElementKind::Arrow { end, .. } = &arrow.kind else {
+            panic!("expected an arrow");
+        };
+        let (point, side) = connector::resolve_endpoint(end, Point::new(100.0, 50.0), &e.doc);
+        assert_eq!(side, Some(connector::AnchorSide::W));
+        assert_eq!(point, Point::new(300.0, 150.0), "the endpoint follows b");
     }
 
     #[test]
