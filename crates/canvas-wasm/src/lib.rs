@@ -90,6 +90,15 @@ impl Canvas2dRenderer {
         }
     }
 
+    /// The cached dash/font only describe the context state while it is
+    /// untouched: any `restore()` resets them to the canvas defaults, so the
+    /// cache must be dropped or the next stroke/text silently reuses a stale
+    /// assumption (text came back at the default 10px size).
+    fn invalidate_state_cache(&mut self) {
+        self.last_dash = None;
+        self.last_font_bits = f64::NAN.to_bits();
+    }
+
     fn apply_stroke(&mut self, stroke: &StrokeStyle) {
         self.ctx.set_stroke_style_str(&stroke.color);
         self.ctx.set_line_width(stroke.width);
@@ -122,6 +131,7 @@ impl Renderer for Canvas2dRenderer {
 
     fn end_frame(&mut self) {
         self.ctx.restore();
+        self.invalidate_state_cache();
     }
 
     fn set_transform(&mut self, transform: Affine) {
@@ -144,6 +154,7 @@ impl Renderer for Canvas2dRenderer {
                 .fill_rect(0.0, 0.0, canvas.width() as f64, canvas.height() as f64);
         }
         self.ctx.restore();
+        self.invalidate_state_cache();
     }
 
     fn clear_rect(&mut self, rect: Rect, color: &str) {
@@ -153,6 +164,7 @@ impl Renderer for Canvas2dRenderer {
         self.ctx
             .fill_rect(rect.x, rect.y, rect.w.max(1.0), rect.h.max(1.0));
         self.ctx.restore();
+        self.invalidate_state_cache();
     }
 
     fn draw_path(&mut self, op: &canvas_core::PathOp) {
@@ -625,6 +637,7 @@ impl Editor {
     pub fn blur(&mut self) {
         self.core.nav.set_space(false);
         self.core.nav.cancel();
+        self.core.clear_hover();
         self.settle_view();
         self.draw_overlay();
     }
@@ -634,6 +647,12 @@ impl Editor {
             return "grabbing".into();
         }
         if self.core.nav.space_held() || self.core.tool == Tool::Hand {
+            return "grab".into();
+        }
+        if self.core.tool == Tool::Select && !self.core.hover_anchor_points().is_empty() {
+            return "crosshair".into();
+        }
+        if self.core.tool == Tool::Select && self.core.stack_pull_hover() {
             return "grab".into();
         }
         match self.core.tool {
@@ -744,6 +763,7 @@ impl Editor {
             dy as f64,
         );
         self.renderer.ctx.restore();
+        self.renderer.invalidate_state_cache();
 
         // Exposed strips in device space, padded to swallow rounding seams.
         let pad = 2.0;

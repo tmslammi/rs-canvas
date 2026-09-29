@@ -56,6 +56,54 @@ test("frame owns dropped shapes, moves them, and cascades deletes", async ({ pag
   expect(await count(page)).toBe(3);
 });
 
+test("arrows bind to two frames and follow them", async ({ page }) => {
+  await page.goto("/");
+  await page.waitForFunction(() => window.__rsReady === true);
+  await page.evaluate(() => window.__rsEditor!.new_document());
+
+  await page.keyboard.press("f");
+  await page.mouse.move(100, 100);
+  await page.mouse.down();
+  await page.mouse.move(300, 300, { steps: 5 });
+  await page.mouse.up();
+
+  await page.keyboard.press("f");
+  await page.mouse.move(500, 100);
+  await page.mouse.down();
+  await page.mouse.move(700, 300, { steps: 5 });
+  await page.mouse.up();
+
+  // Connect frame A's east border to frame B's west border.
+  await page.keyboard.press("a");
+  await page.mouse.move(300, 200);
+  await page.mouse.down();
+  await page.mouse.move(500, 200, { steps: 5 });
+  await page.mouse.up();
+
+  const arrow = async () =>
+    page.evaluate(() => {
+      const doc = JSON.parse(window.__rsEditor!.save_json());
+      return Object.values(
+        doc.elements as Record<string, Record<string, unknown>>,
+      ).find((e) => e.type === "arrow") as
+        | { start: { binding?: { elementId: string }; y: number }; end: { binding?: { elementId: string } } }
+        | undefined;
+    });
+  const drawn = await arrow();
+  expect(drawn?.start.binding, "the start binds to frame A").toBeDefined();
+  expect(drawn?.end.binding, "the end binds to frame B").toBeDefined();
+
+  // Move frame A down by 100px; the connector's start must follow.
+  await page.keyboard.press("v");
+  await page.mouse.move(200, 300);
+  await page.mouse.down();
+  await page.mouse.move(200, 400, { steps: 5 });
+  await page.mouse.up();
+
+  const moved = await arrow();
+  expect(moved?.start.y, "the bound endpoint followed the frame").toBeCloseTo(300, 0);
+});
+
 test("renaming a frame through the text overlay", async ({ page }) => {
   await page.goto("/");
   await page.waitForFunction(() => window.__rsReady === true);
@@ -76,14 +124,26 @@ test("renaming a frame through the text overlay", async ({ page }) => {
   await page.keyboard.press("Escape");
   await expect(textEditor).toBeHidden();
 
-  const painted = await page.evaluate(() => {
-    const canvas = document.getElementById("scene") as HTMLCanvasElement;
-    const ctx = canvas.getContext("2d")!;
-    const data = ctx.getImageData(195, 175, 150, 25).data;
-    for (let i = 0; i < data.length; i += 4) {
-      if (data[i] > 150 && data[i + 1] > 140) return true;
-    }
-    return false;
-  });
-  expect(painted).toBe(true);
+  const nameInDoc = () =>
+    page.evaluate(() => {
+      const doc = JSON.parse(window.__rsEditor!.save_json());
+      const frame = Object.values(
+        doc.elements as Record<string, { type: string; name?: string }>,
+      ).find((e) => e.type === "frame");
+      return frame?.name;
+    });
+  await expect.poll(nameInDoc, { message: "the frame name committed" }).toBe("us-central1");
+
+  const painted = () =>
+    page.evaluate(() => {
+      const canvas = document.getElementById("scene") as HTMLCanvasElement;
+      const ctx = canvas.getContext("2d")!;
+      // The name band above the frame border, where the grey label lands.
+      const data = ctx.getImageData(200, 178, 120, 16).data;
+      for (let i = 0; i < data.length; i += 4) {
+        if (data[i] > 110 && data[i] < 175 && data[i + 2] > 120) return true;
+      }
+      return false;
+    });
+  await expect.poll(painted, { message: "the frame name is painted" }).toBe(true);
 });

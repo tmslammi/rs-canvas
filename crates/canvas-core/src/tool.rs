@@ -13,12 +13,14 @@ pub enum Tool {
     Arrow,
     Line,
     Text,
+    Sticky,
+    StickyStack,
     Frame,
     Eraser,
 }
 
 impl Tool {
-    pub const ALL: [Tool; 11] = [
+    pub const ALL: [Tool; 13] = [
         Tool::Select,
         Tool::Hand,
         Tool::Rectangle,
@@ -28,6 +30,8 @@ impl Tool {
         Tool::Arrow,
         Tool::Line,
         Tool::Text,
+        Tool::Sticky,
+        Tool::StickyStack,
         Tool::Frame,
         Tool::Eraser,
     ];
@@ -44,6 +48,8 @@ impl Tool {
             Tool::Arrow => "a",
             Tool::Line => "l",
             Tool::Text => "t",
+            Tool::Sticky => "n",
+            Tool::StickyStack => "k",
             Tool::Frame => "f",
             Tool::Eraser => "e",
         }
@@ -64,6 +70,8 @@ impl Tool {
             Tool::Arrow => "Arrow",
             Tool::Line => "Line",
             Tool::Text => "Text",
+            Tool::Sticky => "Sticky note",
+            Tool::StickyStack => "Sticky stack",
             Tool::Frame => "Frame",
             Tool::Eraser => "Eraser",
         }
@@ -80,6 +88,8 @@ impl Tool {
             Tool::Arrow => "arrow",
             Tool::Line => "line",
             Tool::Text => "text",
+            Tool::Sticky => "sticky",
+            Tool::StickyStack => "stickyStack",
             Tool::Frame => "frame",
             Tool::Eraser => "eraser",
         }

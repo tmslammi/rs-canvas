@@ -78,6 +78,7 @@ pub fn hits(doc: &Document, element: &Element, p: Point, tolerance: f64) -> bool
             }
             match shape {
                 ShapeKind::Rectangle => rect.expand(tolerance).contains(p),
+                ShapeKind::Sticky => rect.expand(tolerance).contains(p),
                 ShapeKind::Diamond => point_in_diamond(*rect, p, tolerance),
                 ShapeKind::Ellipse => point_in_ellipse(*rect, p, tolerance),
             }
@@ -106,6 +107,7 @@ pub fn hits(doc: &Document, element: &Element, p: Point, tolerance: f64) -> bool
         ElementKind::Text { rect, .. } | ElementKind::Glyph { rect, .. } => {
             rect.expand(tolerance).contains(p)
         }
+        ElementKind::StickyStack { rect, .. } => rect.expand(tolerance).contains(p),
         ElementKind::Frame { rect, .. } => {
             near_rect_border(*rect, p, tolerance.max(4.0)) || frame_name_hit(*rect, p)
         }

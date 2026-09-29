@@ -67,7 +67,7 @@ test("Open a JSON file from disk, with a toast for invalid files", async ({ page
     mimeType: "application/json",
     buffer: Buffer.from(JSON.stringify({ schemaVersion: 1, elements: {} })),
   });
-  expect(await count(page)).toBe(0);
+  await expect.poll(() => count(page), { message: "the file replaced the document" }).toBe(0);
 
   await page.setInputFiles("#file-input", {
     name: "broken.json",

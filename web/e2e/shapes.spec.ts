@@ -106,3 +106,40 @@ test("marquee selects several shapes and shift-click adds", async ({ page }) => 
   await page.keyboard.press("ControlOrMeta+z");
   expect(await count(page)).toBe(2);
 });
+
+test("dragging inside a multi-selection moves the whole group", async ({ page }) => {
+  await page.goto("/");
+  await page.waitForFunction(() => window.__rsReady === true);
+  await page.evaluate(() => window.__rsEditor!.new_document());
+
+  for (const [x, y] of [
+    [100, 100],
+    [300, 100],
+  ]) {
+    await page.keyboard.press("r");
+    await page.mouse.move(x, y);
+    await page.mouse.down();
+    await page.mouse.move(x + 80, y + 60, { steps: 3 });
+    await page.mouse.up();
+  }
+  await page.keyboard.press("v");
+  await page.mouse.click(900, 600);
+
+  await page.mouse.move(60, 60);
+  await page.mouse.down();
+  await page.mouse.move(420, 220, { steps: 5 });
+  await page.mouse.up();
+  expect(await selectionBounds(page)).toEqual([100, 100, 280, 60]);
+
+  // Empty space between the shapes, inside their common bounding box.
+  await page.mouse.move(240, 130);
+  await page.mouse.down();
+  await page.mouse.move(290, 180, { steps: 5 });
+  await page.mouse.up();
+  const moved = await selectionBounds(page);
+  expect(moved, "the whole group moved together").toEqual([150, 150, 280, 60]);
+
+  // A click with no drag inside the box deselects instead of moving.
+  await page.mouse.click(290, 180);
+  expect(await selectionBounds(page)).toBeUndefined();
+});

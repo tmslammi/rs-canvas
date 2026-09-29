@@ -152,7 +152,44 @@ pub fn shape_polygon(shape: ShapeKind, rect: Rect) -> Vec<Point> {
                 })
                 .collect()
         }
+        ShapeKind::Sticky => rounded_rect_polygon(rect, (rect.w.min(rect.h) * 0.08).min(10.0)),
     }
+}
+
+/// A rectangle with rounded corners, sampled into a polygon.
+fn rounded_rect_polygon(rect: Rect, radius: f64) -> Vec<Point> {
+    let r = radius.clamp(0.0, rect.w.min(rect.h) / 2.0);
+    if r <= 0.5 {
+        return vec![
+            Point::new(rect.x, rect.y),
+            Point::new(rect.max_x(), rect.y),
+            Point::new(rect.max_x(), rect.max_y()),
+            Point::new(rect.x, rect.max_y()),
+        ];
+    }
+    let corners = [
+        (
+            Point::new(rect.max_x() - r, rect.y + r),
+            -std::f64::consts::FRAC_PI_2,
+        ),
+        (Point::new(rect.max_x() - r, rect.max_y() - r), 0.0),
+        (
+            Point::new(rect.x + r, rect.max_y() - r),
+            std::f64::consts::FRAC_PI_2,
+        ),
+        (Point::new(rect.x + r, rect.y + r), std::f64::consts::PI),
+    ];
+    let mut points = Vec::with_capacity(32);
+    for (center, start) in corners {
+        for step in 0..=6 {
+            let angle = start + std::f64::consts::FRAC_PI_2 * (step as f64 / 6.0);
+            points.push(Point::new(
+                center.x + r * angle.cos(),
+                center.y + r * angle.sin(),
+            ));
+        }
+    }
+    points
 }
 
 /// Hachure lines at `angle_deg` clipped to the polygon (even-odd rule).
@@ -314,6 +351,99 @@ pub fn pen_band(
     band
 }
 
+/// A brush stroke: the captured polyline is resampled through a Catmull-Rom
+/// spline (capture points are noisy and uneven), then widened by pressure and
+/// thinned by drawing speed, with both ends tapered like a lifted brush.
+///
+/// The brush reads bolder than a geometric outline of the same nominal width,
+/// so the style's stroke width is scaled up before the shaping factors apply.
+fn brush_band(points: &[Point], pressures: &[f64], width: f64, rng: &mut RoughRng) -> Vec<Point> {
+    let brush = width.max(0.5) * 1.8;
+    let samples = brush_samples(points, pressures);
+    let n = samples.len();
+    if n < 2 {
+        return Vec::new();
+    }
+    let centers: Vec<Point> = samples.iter().map(|(point, _, _)| *point).collect();
+    let mut arc = vec![0.0_f64; n];
+    for i in 1..n {
+        arc[i] = arc[i - 1] + centers[i - 1].distance(centers[i]);
+    }
+    let total = arc[n - 1];
+    if total <= 1e-6 {
+        return Vec::new();
+    }
+    let taper_span = (total * 0.15).clamp(1.0, 14.0);
+    let mut left = Vec::with_capacity(n);
+    let mut right = Vec::with_capacity(n);
+    for (i, (point, pressure, speed)) in samples.iter().enumerate() {
+        let pressure_factor = 0.35 + 2.0 * pressure;
+        // Long segments mean fast pointer travel; fast strokes thin out.
+        let speed_factor = (1.0 - speed / (brush * 9.0)).clamp(0.55, 1.0);
+        let edge = (arc[i] / taper_span)
+            .min((total - arc[i]) / taper_span)
+            .clamp(0.0, 1.0);
+        let taper = 0.15 + 0.85 * edge;
+        let half = brush * pressure_factor * speed_factor * taper * 0.5;
+        let half = half * (1.0 + rng.signed() * 0.06);
+        let normal = normal_at(&centers, i, false);
+        left.push(*point + normal.scale(half));
+        right.push(*point - normal.scale(half));
+    }
+    let mut band = left;
+    band.extend(right.into_iter().rev());
+    band
+}
+
+/// Resample the captured stroke through a Catmull-Rom spline, carrying
+/// pressure along and recording each segment's length as its speed.
+fn brush_samples(points: &[Point], pressures: &[f64]) -> Vec<(Point, f64, f64)> {
+    let pressure_at = |i: usize| pressures.get(i).copied().unwrap_or(0.5).clamp(0.0, 1.0);
+    let n = points.len();
+    if n < 2 {
+        return points
+            .iter()
+            .enumerate()
+            .map(|(i, point)| (*point, pressure_at(i), 0.0))
+            .collect();
+    }
+    let mut out = Vec::with_capacity(n * 3);
+    out.push((points[0], pressure_at(0), 0.0));
+    for i in 0..n - 1 {
+        let p0 = points[i.saturating_sub(1)];
+        let p1 = points[i];
+        let p2 = points[i + 1];
+        let p3 = points[(i + 2).min(n - 1)];
+        let speed = p1.distance(p2);
+        let steps = ((speed / 6.0).ceil() as usize).clamp(1, 5);
+        for step in 1..=steps {
+            let t = step as f64 / steps as f64;
+            let point = catmull_rom(p0, p1, p2, p3, t);
+            let pressure = pressure_at(i) * (1.0 - t) + pressure_at(i + 1) * t;
+            out.push((point, pressure, speed));
+        }
+    }
+    out
+}
+
+/// The Catmull-Rom spline segment from `p1` to `p2` (with `p0`/`p3` shaping
+/// the tangents), evaluated at `t` in `[0, 1]`.
+fn catmull_rom(p0: Point, p1: Point, p2: Point, p3: Point, t: f64) -> Point {
+    let t2 = t * t;
+    let t3 = t2 * t;
+    let x = 0.5
+        * (2.0 * p1.x
+            + (-p0.x + p2.x) * t
+            + (2.0 * p0.x - 5.0 * p1.x + 4.0 * p2.x - p3.x) * t2
+            + (-p0.x + 3.0 * p1.x - 3.0 * p2.x + p3.x) * t3);
+    let y = 0.5
+        * (2.0 * p1.y
+            + (-p0.y + p2.y) * t
+            + (2.0 * p0.y - 5.0 * p1.y + 4.0 * p2.y - p3.y) * t2
+            + (-p0.y + 3.0 * p1.y - 3.0 * p2.y + p3.y) * t3);
+    Point::new(x, y)
+}
+
 fn ink_path(points: Vec<Point>, style: &Style) -> Option<DrawOp> {
     if points.len() < 3 {
         return None;
@@ -461,13 +591,7 @@ pub fn build_element_ops(
             }
             let mut rng = RoughRng::seeded(seed ^ 0x55);
             let base = style.stroke_width.max(0.5);
-            let widths: Vec<f64> = (0..points.len())
-                .map(|i| {
-                    let pressure = pressures.get(i).copied().unwrap_or(0.5).clamp(0.0, 1.0);
-                    base * (0.45 + 0.95 * pressure)
-                })
-                .collect();
-            let band = pen_band(points, false, &widths, 0, &mut rng);
+            let band = brush_band(points, pressures, base, &mut rng);
             ink_path(band, style).into_iter().collect()
         }
         ElementKind::Arrow {
@@ -514,6 +638,59 @@ pub fn build_element_ops(
                     }));
                 }
             }
+            ops
+        }
+        ElementKind::StickyStack { rect, style } => {
+            let radius = (rect.w.min(rect.h) * 0.08).min(10.0);
+            let mut ops = Vec::new();
+            // Notes peeking from behind the pile.
+            for (depth, offset) in [12.0_f64, 6.0].iter().enumerate() {
+                let back = Rect::new(rect.x + offset, rect.y - offset, rect.w, rect.h);
+                let polygon = rounded_rect_polygon(back, radius);
+                if style.fill_color != "transparent" {
+                    ops.push(DrawOp::Path(PathOp {
+                        points: polygon.clone(),
+                        closed: true,
+                        stroke: None,
+                        fill: Some(FillStyle::Solid {
+                            color: style.fill_color.clone(),
+                            opacity: style.opacity * (0.45 + 0.2 * depth as f64),
+                        }),
+                    }));
+                }
+                ops.extend(outline_ops(
+                    &polygon,
+                    style,
+                    seed ^ (depth as u64) << 4,
+                    true,
+                ));
+            }
+            let front = rounded_rect_polygon(*rect, radius);
+            ops.extend(fill_ops(&front, style, seed));
+            ops.extend(outline_ops(&front, style, seed, true));
+            // The infinite badge.
+            let center = Point::new(rect.max_x() - 12.0, rect.max_y() - 12.0);
+            ops.push(DrawOp::Path(PathOp {
+                points: shape_polygon(
+                    ShapeKind::Ellipse,
+                    Rect::new(center.x - 10.0, center.y - 10.0, 20.0, 20.0),
+                ),
+                closed: true,
+                stroke: None,
+                fill: Some(FillStyle::Solid {
+                    color: "#1a1815".into(),
+                    opacity: 1.0,
+                }),
+            }));
+            ops.push(DrawOp::Text(TextOp {
+                x: center.x,
+                y: center.y + 5.0,
+                text: "∞".into(),
+                font_size: 14.0,
+                color: "#ece4d6".into(),
+                opacity: 1.0,
+                align: TextAlign::Center,
+            }));
             ops
         }
         ElementKind::Frame { rect, name } => {
@@ -618,6 +795,43 @@ mod tests {
         for _ in 0..10 {
             assert_eq!(a.next_u64(), b.next_u64());
         }
+    }
+
+    #[test]
+    fn brush_resamples_the_capture_through_a_spline() {
+        let points = vec![
+            Point::new(0.0, 0.0),
+            Point::new(50.0, 40.0),
+            Point::new(100.0, 0.0),
+        ];
+        let samples = brush_samples(&points, &[0.5, 0.5, 0.5]);
+        assert!(samples.len() > points.len(), "resampled for smoothness");
+        assert_eq!(samples[0].0, points[0], "start is preserved");
+        assert_eq!(samples.last().unwrap().0, points[2], "end is preserved");
+    }
+
+    #[test]
+    fn brush_width_follows_pressure_and_tapers_at_the_ends() {
+        let points: Vec<Point> = (0..=20).map(|i| Point::new(i as f64 * 5.0, 0.0)).collect();
+        let low = vec![0.1; points.len()];
+        let high = vec![1.0; points.len()];
+        let mut rng = RoughRng::seeded(1);
+        let narrow = brush_band(&points, &low, 2.0, &mut rng);
+        let mut rng = RoughRng::seeded(1);
+        let wide = brush_band(&points, &high, 2.0, &mut rng);
+
+        let widest = |band: &[Point]| band.iter().map(|p| p.y.abs()).fold(0.0, f64::max);
+        assert!(
+            widest(&wide) > widest(&narrow) * 1.5,
+            "pressure widens the stroke: {} vs {}",
+            widest(&wide),
+            widest(&narrow)
+        );
+        let middle = wide.len() / 4;
+        assert!(
+            widest(&wide[middle..middle + 1]) > wide[0].y.abs() * 2.0,
+            "the ends taper"
+        );
     }
 
     #[test]

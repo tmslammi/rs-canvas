@@ -84,7 +84,7 @@ test("placed text can be selected and moved", async ({ page }) => {
   await page.mouse.up();
   const moved = await selectionBounds(page);
   expect(moved![0]).toBeCloseTo(400, -1);
-  expect(moved![1]).toBeCloseTo(350, -1);
+  expect(moved![1]).toBeCloseTo(selected![1] + 50, -1);
 });
 
 test("clicking placed text with the text tool edits it instead of stacking a new one", async ({
@@ -333,7 +333,7 @@ test("redo is cleared by a new edit after undo", async ({ page }) => {  await pa
   expect(await count(page)).toBe(0);
 });
 
-test("after a freehand stroke, the tool hands back and the stroke is selectable", async ({
+test("after a freehand stroke, the brush stays armed and the stroke is selectable", async ({
   page,
 }) => {
   await page.goto("/");
@@ -348,14 +348,22 @@ test("after a freehand stroke, the tool hands back and the stroke is selectable"
   expect(await count(page)).toBe(1);
   expect(
     await page.evaluate(() => window.__rsEditor!.active_tool()),
-    "the pencil is single-shot",
-  ).toBe("select");
+    "the pencil stays armed for the next stroke",
+  ).toBe("freehand");
 
+  // The next drag is another stroke, not a selection.
+  await page.mouse.move(300, 500);
+  await page.mouse.down();
+  await page.mouse.move(500, 500, { steps: 6 });
+  await page.mouse.up();
+  expect(await count(page)).toBe(2);
+
+  await page.keyboard.press("v");
   await page.mouse.click(800, 600);
   expect(await selectionBounds(page)).toBeUndefined();
   await page.mouse.click(400, 400);
   const selected = await selectionBounds(page);
-  expect(selected, "the stroke is selectable right after drawing").toBeDefined();
+  expect(selected, "the stroke is selectable once Select is armed").toBeDefined();
 });
 
 test("dragging a bound connector keeps it attached to its shapes", async ({ page }) => {

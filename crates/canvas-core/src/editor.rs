@@ -99,6 +99,16 @@ const SELECT_TOLERANCE_PX: f64 = 4.0;
 const MIN_DRAW_SIZE_PX: f64 = 3.0;
 const HANDLE_HIT_PX: f64 = 7.0;
 const MIN_RESIZE_PX: f64 = 4.0;
+/// Default edge length of a sticky note (and of a sticky stack's pile).
+const STICKY_SIZE: f64 = 140.0;
+const STICKY_DEFAULT_COLOR: &str = "#ffec99";
+/// Sticky text is inked in the note's own outline colour.
+const STICKY_INK: &str = "#3b2f1c";
+/// How far outside an element's edge its connection nodes float, in screen px.
+const CONNECTION_NODE_PX: f64 = 16.0;
+/// The border ring of a sticky stack that drags the pile rather than pulling
+/// a note, in screen px.
+const STACK_EDGE_PX: f64 = 16.0;
 
 /// A resize handle on the selection bounds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -192,6 +202,10 @@ enum Interaction {
     Moving {
         start: Point,
         originals: Vec<Element>,
+        /// True when the drag began on empty space inside the selection's
+        /// bounding box: a click with no movement then clears the selection
+        /// instead of moving anything.
+        started_in_selection: bool,
     },
     Resizing {
         handle: Handle,
@@ -214,6 +228,12 @@ enum Interaction {
     ArrowEndpoint {
         id: ElementId,
         end: EndpointEnd,
+    },
+    /// Dragging a fresh note off a sticky stack; released away from the pile
+    /// it becomes a real note, released on the pile it is discarded.
+    PullingSticky {
+        id: ElementId,
+        origin: Point,
     },
     Erasing {
         erased: BTreeSet<ElementId>,
@@ -248,6 +268,8 @@ pub struct Editor {
     last_pressure: f64,
     measurer: Box<dyn TextMeasurer>,
     hover_anchors: Option<(ElementId, Vec<Point>)>,
+    /// The sticky stack under the pointer, if its pull zone is hovered.
+    hover_stack: Option<ElementId>,
     viewport_size: (f64, f64),
 }
 
@@ -271,6 +293,7 @@ impl Editor {
             last_pressure: 0.5,
             measurer: Box::new(ApproxMeasurer),
             hover_anchors: None,
+            hover_stack: None,
             viewport_size: (800.0, 600.0),
         };
         editor.refresh_scene();
@@ -287,10 +310,12 @@ impl Editor {
         self.viewport_size
     }
 
-    /// Select a tool (single-shot: reverts to Select after one use).
+    /// Select a tool (single-shot: reverts to Select after one use). The
+    /// freehand brush is the exception: it stays armed for repeated strokes,
+    /// like Excalidraw's freedraw and Miro's pen.
     pub fn set_tool(&mut self, tool: Tool) {
         self.tool = tool;
-        self.tool_locked = false;
+        self.tool_locked = tool == Tool::Freehand;
     }
 
     /// Select a tool and keep it armed for repeated use.
@@ -320,6 +345,7 @@ impl Editor {
         self.tx = None;
         self.marquee_current = None;
         self.hover_anchors = None;
+        self.hover_stack = None;
         self.refresh_scene();
         Effects {
             repaint_all: true,
@@ -446,8 +472,10 @@ impl Editor {
         }
         let world = self.camera.screen_to_world(screen);
         match self.tool {
-            Tool::Select => self.begin_select(screen, world, mods),
+            Tool::Select => self.begin_select(screen, world, mods, now),
             Tool::Rectangle | Tool::Diamond | Tool::Ellipse => self.begin_drawing(world, now),
+            Tool::Sticky => self.begin_sticky(world, now),
+            Tool::StickyStack => self.begin_sticky_stack(world, now),
             Tool::Frame => self.begin_frame(world, now),
             Tool::Freehand => self.begin_freehand(world, now),
             Tool::Line => self.begin_line(world, now),
@@ -478,11 +506,29 @@ impl Editor {
             self.interaction = Interaction::Erasing { erased };
             return effects;
         }
+        // Hover dots belong to the Select tool alone; while any other
+        // interaction is in flight the overlay is owned by that interaction.
+        if !matches!(
+            self.interaction,
+            Interaction::Idle | Interaction::Connecting { .. } | Interaction::ArrowEndpoint { .. }
+        ) {
+            self.hover_anchors = None;
+        }
         match &self.interaction {
-            Interaction::Idle => Effects::default(),
+            Interaction::Idle => {
+                let world = self.camera.screen_to_world(screen);
+                self.update_hover(world)
+            }
             Interaction::FrameNameEditing { .. } => Effects::default(),
             Interaction::Drawing { id, start } => {
                 let current = self.camera.screen_to_world(screen);
+                // A sticky note starts at its default size: a click keeps it,
+                // and only a real drag resizes it.
+                if self.doc.element(id).is_some_and(|e| e.is_sticky())
+                    && current.distance(*start) < self.min_draw_size()
+                {
+                    return Effects::default();
+                }
                 let rect = self.drawn_rect(*start, current, mods);
                 if let Some(tx) = self.tx.as_mut() {
                     if let Err(err) =
@@ -505,9 +551,16 @@ impl Editor {
                     ..Effects::default()
                 }
             }
-            Interaction::Moving { start, originals } => {
+            Interaction::Moving {
+                start,
+                originals,
+                started_in_selection: _,
+            } => {
                 let current = self.camera.screen_to_world(screen);
                 let (dx, dy) = (current.x - start.x, current.y - start.y);
+                if dx.abs() < 1e-9 && dy.abs() < 1e-9 {
+                    return Effects::default();
+                }
                 let moved_ids: BTreeSet<ElementId> =
                     originals.iter().map(|o| o.id.clone()).collect();
                 let mut effects = Effects::default();
@@ -620,24 +673,21 @@ impl Editor {
                         ElementKind::Arrow { start, .. } => Some(start.point()),
                         _ => None,
                     });
-                let candidate = connector::binding_candidate(
-                    &self.doc,
-                    current,
-                    tolerance,
-                    approach,
-                    Some(id.as_str()),
-                );
+                let candidate = self.node_hit(current, Some(id.as_str())).or_else(|| {
+                    connector::binding_candidate(
+                        &self.doc,
+                        current,
+                        tolerance,
+                        approach,
+                        Some(id.as_str()),
+                    )
+                });
                 let (end, binding, hover) = match candidate {
                     Some((target_id, side, point)) => {
                         let anchors = self
                             .doc
                             .element(&target_id)
-                            .map(|element| {
-                                connector::anchor_points(element.bounds())
-                                    .into_iter()
-                                    .map(|(_, p)| p)
-                                    .collect::<Vec<_>>()
-                            })
+                            .map(|element| self.node_points_for(element))
                             .unwrap_or_default();
                         (
                             point,
@@ -684,24 +734,15 @@ impl Editor {
                         }),
                         _ => None,
                     });
-                let candidate = connector::binding_candidate(
-                    &self.doc,
-                    current,
-                    tolerance,
-                    approach,
-                    Some(&id),
-                );
+                let candidate = self.node_hit(current, Some(&id)).or_else(|| {
+                    connector::binding_candidate(&self.doc, current, tolerance, approach, Some(&id))
+                });
                 let (point, binding, hover) = match candidate {
                     Some((target_id, side, point)) => {
                         let anchors = self
                             .doc
                             .element(&target_id)
-                            .map(|element| {
-                                connector::anchor_points(element.bounds())
-                                    .into_iter()
-                                    .map(|(_, p)| p)
-                                    .collect::<Vec<_>>()
-                            })
+                            .map(|element| self.node_points_for(element))
                             .unwrap_or_default();
                         (
                             point,
@@ -737,6 +778,28 @@ impl Editor {
                     ..Effects::default()
                 }
             }
+            Interaction::PullingSticky { id, .. } => {
+                let current = self.camera.screen_to_world(screen);
+                let size = self
+                    .doc
+                    .element(id)
+                    .map(|element| element.bounds())
+                    .map(|bounds| (bounds.w, bounds.h))
+                    .unwrap_or((STICKY_SIZE, STICKY_SIZE));
+                if let Some(tx) = self.tx.as_mut() {
+                    let _ = tx.update(&mut self.doc, id, now, |element| {
+                        if let ElementKind::Shape { rect, .. } = &mut element.kind {
+                            *rect = Rect::new(
+                                current.x - size.0 / 2.0,
+                                current.y - size.1 / 2.0,
+                                size.0,
+                                size.1,
+                            );
+                        }
+                    });
+                }
+                Effects::changed(id.clone())
+            }
         }
     }
 
@@ -753,6 +816,7 @@ impl Editor {
             | Interaction::Resizing { .. }
             | Interaction::Connecting { .. }
             | Interaction::ArrowEndpoint { .. }
+            | Interaction::PullingSticky { .. }
             | Interaction::Line { .. } => {
                 self.interaction = interaction;
                 self.pointer_move(screen, mods, now)
@@ -808,6 +872,14 @@ impl Editor {
                 let hits: Vec<ElementId> = elements_in_rect(&self.doc, rect)
                     .into_iter()
                     .map(|id| crate::hit::resolve_container(&self.doc, &id))
+                    // Frames are picked by their border or name, never by a
+                    // marquee: dragging inside a frame selects its contents.
+                    .filter(|id| {
+                        !self
+                            .doc
+                            .element(id)
+                            .is_some_and(|element| element.is_frame())
+                    })
                     .collect();
                 let mut hits = hits;
                 hits.sort();
@@ -826,7 +898,13 @@ impl Editor {
                     effects.merge(self.select(hits));
                 }
             }
-            Interaction::Moving { .. } => {
+            Interaction::Moving {
+                start,
+                started_in_selection,
+                ..
+            } => {
+                let end = self.camera.screen_to_world(screen);
+                let moved = end.distance(start) > 0.5 / self.camera.zoom;
                 self.sync_frame_membership(now);
                 if let Some(tx) = self.tx.take() {
                     let changed: BTreeSet<ElementId> =
@@ -837,6 +915,11 @@ impl Editor {
                         overlay_changed: true,
                         ..Effects::default()
                     });
+                }
+                // Clicking empty space inside the selection's bounding box
+                // deselects; only an actual drag moves the selection.
+                if started_in_selection && !moved {
+                    effects.merge(self.clear_selection());
                 }
             }
             Interaction::Resizing { .. } => {
@@ -966,6 +1049,33 @@ impl Editor {
                     let selection_effects = self.select([id.clone()]);
                     effects.changed.insert(id);
                     effects.merge(selection_effects);
+                }
+            }
+            Interaction::PullingSticky { id, origin } => {
+                let end = self.camera.screen_to_world(screen);
+                let pulled = end.distance(origin) > 3.0 / self.camera.zoom;
+                if pulled {
+                    self.sync_frame_membership(now);
+                    if let Some(tx) = self.tx.take() {
+                        tx.commit(&mut self.history);
+                    }
+                    self.finish_tool_use();
+                    let selection_effects = self.select([id.clone()]);
+                    effects.changed.insert(id);
+                    effects.merge(selection_effects);
+                } else {
+                    // A click on the pile leaves it as it was.
+                    self.tx = None;
+                    let purged = self.doc.element(&id).cloned();
+                    if let Some(element) = purged {
+                        let _ = self.doc.apply(&Delta::Purge { element });
+                    }
+                    self.finish_tool_use();
+                    effects.merge(Effects {
+                        changed: [id].into_iter().collect(),
+                        overlay_changed: true,
+                        ..Effects::default()
+                    });
                 }
             }
             Interaction::Connecting { id, .. } => {
@@ -1130,15 +1240,45 @@ impl Editor {
     fn begin_text_tool(&mut self, world: Point, now: u64) -> Effects {
         let tolerance = self.tolerance();
         if let Some(id) = hit_test_raw(&self.doc, world, tolerance) {
-            let is_text = matches!(
-                self.doc.element(&id).map(|e| &e.kind),
-                Some(ElementKind::Text { .. })
-            );
-            if is_text {
-                return self.begin_text_edit(self.doc.element(&id).cloned(), now);
+            match self.doc.element(&id).map(|e| &e.kind) {
+                Some(ElementKind::Text { .. }) => {
+                    return self.begin_text_edit(self.doc.element(&id).cloned(), now);
+                }
+                // Clicking a container with the text tool labels it: the text
+                // is bound and centred, so it lands in the middle of the
+                // element instead of wherever the click was.
+                Some(ElementKind::Shape { .. })
+                | Some(ElementKind::Glyph { .. })
+                | Some(ElementKind::Arrow { .. }) => {
+                    return self.begin_bound_text(id, now);
+                }
+                _ => {}
             }
         }
         self.start_text(world, now)
+    }
+
+    /// Edit (or create) the text bound to a container, centred in it.
+    fn begin_bound_text(&mut self, container_id: ElementId, now: u64) -> Effects {
+        let Some(element) = self.doc.element(&container_id).cloned() else {
+            return Effects::default();
+        };
+        let (rect, existing) = match &element.kind {
+            ElementKind::Shape {
+                rect,
+                bound_text_id,
+                ..
+            } => (*rect, bound_text_id.clone()),
+            ElementKind::Glyph {
+                rect, caption_id, ..
+            } => (*rect, caption_id.clone()),
+            ElementKind::Arrow { label_id, .. } => (element.bounds(), label_id.clone()),
+            _ => return Effects::default(),
+        };
+        match existing {
+            Some(text_id) => self.begin_text_edit(self.doc.element(&text_id).cloned(), now),
+            None => self.create_bound_text(container_id, rect, now),
+        }
     }
 
     /// Create a point-text element and open the editor.
@@ -1147,13 +1287,16 @@ impl Editor {
             return Effects::default();
         }
         let mut tx = Transaction::begin();
+        let line_height = self.measurer.line_height(self.style.font_size);
         let element = Element::new(
             ElementKind::Text {
                 rect: Rect::new(
                     world.x,
-                    world.y,
+                    // Centre the first line on the click so the text appears
+                    // where the pointer is, not below it.
+                    world.y - line_height / 2.0,
                     0.0,
-                    self.measurer.line_height(self.style.font_size),
+                    line_height,
                 ),
                 text: String::new(),
                 align: TextAlign::Left,
@@ -1216,25 +1359,46 @@ impl Editor {
             self.doc.element(&container_id).map(|e| &e.kind),
             Some(ElementKind::Glyph { .. })
         );
+        let is_sticky = matches!(
+            self.doc.element(&container_id).map(|e| &e.kind),
+            Some(ElementKind::Shape {
+                shape: ShapeKind::Sticky,
+                ..
+            })
+        );
         let mut tx = Transaction::begin();
         let font_size = self.style.font_size;
+        let line_height = self.measurer.line_height(font_size);
+        // Sticky text sits inside the note, inked in the note's own (dark)
+        // outline colour so it reads on the pastel fill.
+        let padding = if is_sticky { 14.0 } else { 10.0 };
+        let mut text_style = self.style.clone();
+        if is_sticky {
+            if let Some(ElementKind::Shape { style, .. }) =
+                self.doc.element(&container_id).map(|e| &e.kind)
+            {
+                text_style.stroke_color = style.stroke_color.clone();
+            }
+        }
         let element = Element::new(
             ElementKind::Text {
                 rect: Rect::new(
-                    container_rect.x + 10.0,
+                    container_rect.x + padding,
                     if is_glyph {
                         container_rect.max_y() + 4.0
+                    } else if is_sticky {
+                        container_rect.y + (container_rect.h - line_height) / 2.0
                     } else {
                         container_rect.center().y
                     },
-                    (container_rect.w - 20.0).max(20.0),
-                    self.measurer.line_height(font_size),
+                    (container_rect.w - padding * 2.0).max(20.0),
+                    line_height,
                 ),
                 text: String::new(),
                 align: TextAlign::Center,
                 fixed_width: true,
                 container_id: Some(container_id.clone()),
-                style: self.style.clone(),
+                style: text_style,
             },
             self.next_index(),
             now,
@@ -1390,7 +1554,13 @@ impl Editor {
                     *rect = new_rect;
                 }
             });
-            tx.commit(&mut self.history);
+            // Text committed inside a frame becomes its child, like any other
+            // element, so the frame carries it when it moves.
+            self.tx = Some(tx);
+            self.sync_frame_membership(now);
+            if let Some(tx) = self.tx.take() {
+                tx.commit(&mut self.history);
+            }
             self.selection = [id.to_string()].into_iter().collect();
             effects.changed.insert(id.to_string());
             if was_new_text {
@@ -1561,7 +1731,7 @@ impl Editor {
         let _ = current;
         match interaction {
             Interaction::Idle => self.clear_selection(),
-            Interaction::Drawing { id, .. } => {
+            Interaction::Drawing { id, .. } | Interaction::PullingSticky { id, .. } => {
                 self.tx = None;
                 let purged = self.doc.element(&id).cloned();
                 if let Some(element) = purged {
@@ -1734,7 +1904,7 @@ impl Editor {
 
     // -- tool helpers ------------------------------------------------------
 
-    fn begin_select(&mut self, screen: Point, world: Point, mods: Modifiers) -> Effects {
+    fn begin_select(&mut self, screen: Point, world: Point, mods: Modifiers, now: u64) -> Effects {
         if mods.command() {
             return Effects::default();
         }
@@ -1758,6 +1928,7 @@ impl Editor {
                 self.interaction = Interaction::Moving {
                     start: world,
                     originals,
+                    started_in_selection: false,
                 };
                 return Effects {
                     overlay_changed: true,
@@ -1765,6 +1936,8 @@ impl Editor {
                 };
             }
         }
+        // Resize handles win over connection nodes: the nodes float outside
+        // the element, so a sloppy grab at the edge must still resize.
         if let Some(bounds) = self.selection_bounds() {
             if let Some(handle) = self.handle_at(screen, bounds) {
                 let originals: Vec<Element> = self
@@ -1783,6 +1956,18 @@ impl Editor {
                     overlay_changed: true,
                     ..Effects::default()
                 };
+            }
+        }
+        if !mods.shift {
+            // A connection node floating outside a hovered element starts a
+            // bound arrow, Miro-style.
+            if let Some((id, side)) = self.connection_node_at(world) {
+                return self.begin_connector_from(id, side, now);
+            }
+            // Dragging the middle of a sticky stack pulls a note off it; its
+            // border ring falls through and moves the pile.
+            if let Some(stack_id) = self.stack_pull_at(world) {
+                return self.begin_pull_from_stack(&stack_id, world, now);
             }
         }
         let tolerance = self.tolerance();
@@ -1807,6 +1992,7 @@ impl Editor {
                 self.interaction = Interaction::Moving {
                     start: world,
                     originals,
+                    started_in_selection: false,
                 };
                 Effects {
                     overlay_changed: true,
@@ -1814,6 +2000,25 @@ impl Editor {
                 }
             }
             None => {
+                // Dragging from empty space inside the selection's bounding
+                // box moves the whole selection (Figma, Excalidraw and Miro
+                // all work this way); only a click clears it.
+                if !mods.shift && !self.selection.is_empty() {
+                    if let Some(bounds) = self.selection_bounds() {
+                        if bounds.contains(world) {
+                            self.tx = Some(Transaction::begin());
+                            self.interaction = Interaction::Moving {
+                                start: world,
+                                originals: self.selection_with_followers(),
+                                started_in_selection: true,
+                            };
+                            return Effects {
+                                overlay_changed: true,
+                                ..Effects::default()
+                            };
+                        }
+                    }
+                }
                 self.marquee_current = Some(world);
                 self.interaction = Interaction::Marquee { start: world };
                 Effects {
@@ -1877,6 +2082,153 @@ impl Editor {
                 .find(|(_, p)| p.distance(screen) <= HANDLE_HIT_PX)
                 .map(|(h, _)| h)
         })
+    }
+
+    // -- connection nodes --------------------------------------------------
+
+    fn node_grab(&self) -> f64 {
+        HANDLE_HIT_PX / self.camera.zoom
+    }
+
+    /// Where a side's connection node floats: just outside the edge, in
+    /// screen-constant distance, so it never fights the resize handles.
+    fn node_position(&self, side: connector::AnchorSide, anchor: Point) -> Point {
+        anchor + side.focus().scale(CONNECTION_NODE_PX / self.camera.zoom)
+    }
+
+    fn node_points_for(&self, element: &Element) -> Vec<Point> {
+        connector::anchor_points(element.bounds())
+            .into_iter()
+            .map(|(side, anchor)| self.node_position(side, anchor))
+            .collect()
+    }
+
+    /// Elements that accept connection nodes: everything an arrow can bind to
+    /// except connectors themselves and the stacks (which are sources, not
+    /// targets).
+    fn is_connectable(element: &Element) -> bool {
+        matches!(
+            element.kind,
+            ElementKind::Shape { .. }
+                | ElementKind::Glyph { .. }
+                | ElementKind::Text { .. }
+                | ElementKind::Frame { .. }
+        )
+    }
+
+    /// The connection node of a bindable element under `world`, if any.
+    /// Returns the element, its side and the edge anchor the node belongs to.
+    fn node_hit(
+        &self,
+        world: Point,
+        exclude: Option<&str>,
+    ) -> Option<(ElementId, connector::AnchorSide, Point)> {
+        let reach = (CONNECTION_NODE_PX + HANDLE_HIT_PX) / self.camera.zoom;
+        let grab = self.node_grab();
+        let mut best: Option<&Element> = None;
+        for element in self.doc.elements.values() {
+            if element.is_deleted
+                || !Self::is_connectable(element)
+                || exclude == Some(element.id.as_str())
+            {
+                continue;
+            }
+            if !element.bounds().expand(reach).contains(world) {
+                continue;
+            }
+            let topmost = best.is_none_or(|b| {
+                (element.index.as_str(), element.id.as_str()) > (b.index.as_str(), b.id.as_str())
+            });
+            if topmost {
+                best = Some(element);
+            }
+        }
+        let element = best?;
+        let (side, anchor) = connector::anchor_points(element.bounds())
+            .into_iter()
+            .find(|(side, anchor)| self.node_position(*side, *anchor).distance(world) <= grab)?;
+        Some((element.id.clone(), side, anchor))
+    }
+
+    /// The connection node under `world`, if the hovered element has one.
+    fn connection_node_at(&self, world: Point) -> Option<(ElementId, connector::AnchorSide)> {
+        self.node_hit(world, None).map(|(id, side, _)| (id, side))
+    }
+
+    /// Refresh the hovered element's connection nodes for the Select tool.
+    fn update_hover(&mut self, world: Point) -> Effects {
+        if self.tool != Tool::Select {
+            return self.clear_hover();
+        }
+        let mut effects = Effects::default();
+        // Hovering a sticky stack's pull zone offers to drag a note off it.
+        let next_stack = self.stack_pull_at(world);
+        if self.hover_stack != next_stack {
+            self.hover_stack = next_stack;
+            effects.overlay_changed = true;
+        }
+        // Keep the current nodes while the pointer is out on one of them:
+        // they float outside the element, so a fresh hit test would miss.
+        if let Some((_, nodes)) = &self.hover_anchors {
+            if nodes.iter().any(|p| p.distance(world) <= self.node_grab()) {
+                return effects;
+            }
+        }
+        let next = hit_test(&self.doc, world, self.tolerance())
+            .and_then(|id| self.doc.element(&id).cloned())
+            .filter(Self::is_connectable)
+            .map(|element| {
+                let nodes = self.node_points_for(&element);
+                (element.id.clone(), nodes)
+            })
+            .or_else(|| {
+                self.node_hit(world, None).and_then(|(id, _, _)| {
+                    let element = self.doc.element(&id)?;
+                    Some((id, self.node_points_for(element)))
+                })
+            });
+        if self.hover_anchors != next {
+            self.hover_anchors = next;
+            effects.overlay_changed = true;
+        }
+        effects
+    }
+
+    /// Drop the hover state (pointer left the canvas, tool changed, …).
+    pub fn clear_hover(&mut self) -> Effects {
+        let changed = self.hover_anchors.take().is_some() | self.hover_stack.take().is_some();
+        if changed {
+            Effects {
+                overlay_changed: true,
+                ..Effects::default()
+            }
+        } else {
+            Effects::default()
+        }
+    }
+
+    /// The sticky stack whose pull zone (everything but the border ring) is
+    /// under `world`, if any.
+    fn stack_pull_at(&self, world: Point) -> Option<ElementId> {
+        let id = hit_test(&self.doc, world, self.tolerance())?;
+        let element = self.doc.element(&id)?;
+        if !element.is_sticky_stack() {
+            return None;
+        }
+        let rect = element.bounds();
+        let inset = STACK_EDGE_PX / self.camera.zoom;
+        let inner = Rect::new(
+            rect.x + inset,
+            rect.y + inset,
+            (rect.w - inset * 2.0).max(1.0),
+            (rect.h - inset * 2.0).max(1.0),
+        );
+        inner.contains(world).then_some(id)
+    }
+
+    /// Whether the pointer is offering to pull a note off a stack.
+    pub fn stack_pull_hover(&self) -> bool {
+        self.hover_stack.is_some()
     }
 
     /// When the selection is a lone connector, which endpoint `world` grabs.
@@ -2054,6 +2406,141 @@ impl Editor {
         }
     }
 
+    /// The style new sticky notes and stacks inherit: a solid pastel fill and
+    /// dark ink, so text reads on the note.
+    fn sticky_style(&self) -> Style {
+        let mut style = self.style.clone();
+        style.fill_style = crate::model::FillPattern::Solid;
+        if style.fill_color == "transparent" {
+            style.fill_color = STICKY_DEFAULT_COLOR.into();
+        }
+        style.stroke_color = STICKY_INK.into();
+        style
+    }
+
+    /// The sticky tool: pull a note off a stack under the pointer, otherwise
+    /// start a new note (click for the default size, drag to size it).
+    fn begin_sticky(&mut self, world: Point, now: u64) -> Effects {
+        let tolerance = self.tolerance();
+        if let Some(id) = hit_test(&self.doc, world, tolerance) {
+            if self.doc.element(&id).is_some_and(|e| e.is_sticky_stack()) {
+                return self.begin_pull_from_stack(&id, world, now);
+            }
+        }
+        let mut tx = Transaction::begin();
+        let size = STICKY_SIZE;
+        let element = Element::new(
+            ElementKind::Shape {
+                shape: ShapeKind::Sticky,
+                rect: Rect::new(world.x - size / 2.0, world.y - size / 2.0, size, size),
+                style: self.sticky_style(),
+                bound_text_id: None,
+            },
+            self.next_index(),
+            now,
+        );
+        let id = element.id.clone();
+        if let Err(err) = tx.add(&mut self.doc, element) {
+            debug_assert!(false, "sticky add failed: {err}");
+        }
+        self.tx = Some(tx);
+        self.interaction = Interaction::Drawing {
+            id: id.clone(),
+            start: world,
+        };
+        Effects {
+            changed: [id].into_iter().collect(),
+            overlay_changed: true,
+            ..Effects::default()
+        }
+    }
+
+    /// Place a new infinite sticky stack.
+    fn begin_sticky_stack(&mut self, world: Point, now: u64) -> Effects {
+        if self.interaction != Interaction::Idle {
+            return Effects::default();
+        }
+        let size = STICKY_SIZE;
+        let mut tx = Transaction::begin();
+        let element = Element::new(
+            ElementKind::StickyStack {
+                rect: Rect::new(world.x - size / 2.0, world.y - size / 2.0, size, size),
+                style: self.sticky_style(),
+            },
+            self.next_index(),
+            now,
+        );
+        let id = element.id.clone();
+        if let Err(err) = tx.add(&mut self.doc, element) {
+            debug_assert!(false, "sticky stack add failed: {err}");
+        }
+        tx.commit(&mut self.history);
+        self.selection = [id.clone()].into_iter().collect();
+        self.finish_tool_use();
+        Effects {
+            changed: [id].into_iter().collect(),
+            overlay_changed: true,
+            ..Effects::default()
+        }
+    }
+
+    /// Pull a note from the stack with the given id.
+    fn begin_pull_from_stack(&mut self, stack_id: &str, world: Point, now: u64) -> Effects {
+        let Some(ElementKind::StickyStack { rect, style }) = self
+            .doc
+            .element(stack_id)
+            .map(|element| element.kind.clone())
+        else {
+            return Effects::default();
+        };
+        self.begin_pull_sticky(rect, style, world, now)
+    }
+
+    /// Create the note that will follow the pointer until release. It only
+    /// becomes a real note if it is dragged clear of the pile.
+    fn begin_pull_sticky(
+        &mut self,
+        stack_rect: Rect,
+        mut style: Style,
+        world: Point,
+        now: u64,
+    ) -> Effects {
+        style.fill_style = crate::model::FillPattern::Solid;
+        if style.fill_color == "transparent" {
+            style.fill_color = STICKY_DEFAULT_COLOR.into();
+        }
+        let mut tx = Transaction::begin();
+        let element = Element::new(
+            ElementKind::Shape {
+                shape: ShapeKind::Sticky,
+                rect: Rect::new(
+                    world.x - stack_rect.w / 2.0,
+                    world.y - stack_rect.h / 2.0,
+                    stack_rect.w,
+                    stack_rect.h,
+                ),
+                style,
+                bound_text_id: None,
+            },
+            self.next_index(),
+            now,
+        );
+        let id = element.id.clone();
+        if let Err(err) = tx.add(&mut self.doc, element) {
+            debug_assert!(false, "pulled sticky add failed: {err}");
+        }
+        self.tx = Some(tx);
+        self.interaction = Interaction::PullingSticky {
+            id: id.clone(),
+            origin: world,
+        };
+        Effects {
+            changed: [id].into_iter().collect(),
+            overlay_changed: true,
+            ..Effects::default()
+        }
+    }
+
     fn begin_erase(&mut self, world: Point, now: u64) -> Effects {
         self.tx = Some(Transaction::begin());
         let mut erased = BTreeSet::new();
@@ -2130,9 +2617,10 @@ impl Editor {
     }
 
     fn begin_connector(&mut self, world: Point, now: u64) -> Effects {
-        let mut tx = Transaction::begin();
         let tolerance = self.tolerance().max(4.0);
-        let candidate = connector::binding_candidate(&self.doc, world, tolerance, None, None);
+        let candidate = self
+            .node_hit(world, None)
+            .or_else(|| connector::binding_candidate(&self.doc, world, tolerance, None, None));
         let (start_point, start_binding) = match candidate {
             Some((target_id, side, point)) => (
                 point,
@@ -2143,6 +2631,35 @@ impl Editor {
             ),
             None => (world, None),
         };
+        self.begin_connector_bound(start_point, start_binding, world, now)
+    }
+
+    /// Start a connector from a specific element side (the connection nodes).
+    fn begin_connector_from(
+        &mut self,
+        id: ElementId,
+        side: connector::AnchorSide,
+        now: u64,
+    ) -> Effects {
+        let Some(element) = self.doc.element(&id) else {
+            return Effects::default();
+        };
+        let anchor = side.point(element.bounds());
+        let binding = Binding {
+            element_id: id,
+            focus: Some(side.focus()),
+        };
+        self.begin_connector_bound(anchor, Some(binding), anchor, now)
+    }
+
+    fn begin_connector_bound(
+        &mut self,
+        start_point: Point,
+        start_binding: Option<Binding>,
+        world: Point,
+        now: u64,
+    ) -> Effects {
+        let mut tx = Transaction::begin();
         let element = Element::new(
             ElementKind::Arrow {
                 start: Endpoint {
@@ -2662,6 +3179,7 @@ pub fn element_style_mut(element: &mut Element) -> Option<&mut Style> {
         | ElementKind::Freehand { style, .. }
         | ElementKind::Glyph { style, .. }
         | ElementKind::Arrow { style, .. }
+        | ElementKind::StickyStack { style, .. }
         | ElementKind::Text { style, .. } => Some(style),
         ElementKind::Frame { .. } => None,
     }
@@ -2674,6 +3192,7 @@ pub fn element_style(element: &Element) -> Option<&Style> {
         | ElementKind::Freehand { style, .. }
         | ElementKind::Glyph { style, .. }
         | ElementKind::Arrow { style, .. }
+        | ElementKind::StickyStack { style, .. }
         | ElementKind::Text { style, .. } => Some(style),
         ElementKind::Frame { .. } => None,
     }
@@ -2720,6 +3239,7 @@ pub fn translate_element(element: &mut Element, dx: f64, dy: f64) {
         ElementKind::Shape { rect, .. }
         | ElementKind::Glyph { rect, .. }
         | ElementKind::Text { rect, .. }
+        | ElementKind::StickyStack { rect, .. }
         | ElementKind::Frame { rect, .. } => {
             rect.x += dx;
             rect.y += dy;
@@ -2751,6 +3271,7 @@ pub fn scale_element(element: &mut Element, from: Rect, to: Rect) {
         ElementKind::Shape { rect, .. }
         | ElementKind::Glyph { rect, .. }
         | ElementKind::Text { rect, .. }
+        | ElementKind::StickyStack { rect, .. }
         | ElementKind::Frame { rect, .. } => {
             *rect = Rect::new(
                 to.x + (rect.x - from.x) * sx,
@@ -3024,6 +3545,102 @@ mod tests {
         e.pointer_move(Point::new(300.0, 100.0), mods, 5);
         e.pointer_up(Point::new(300.0, 100.0), mods, 6);
         assert_eq!(e.selection.len(), 2);
+    }
+
+    #[test]
+    fn dragging_empty_space_inside_the_selection_moves_everything() {
+        let mut e = editor();
+        drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(100.0, 50.0), 1);
+        drag_shape(&mut e, Point::new(200.0, 0.0), Point::new(300.0, 50.0), 4);
+        let ids: Vec<ElementId> = e
+            .doc
+            .ordered_live()
+            .iter()
+            .map(|element| element.id.clone())
+            .collect();
+        press(&mut e, "v", Modifiers::default(), 7);
+        e.select(ids);
+
+        let mods = Modifiers::default();
+        // Empty space between the two shapes, inside their common bounds.
+        e.pointer_down(Point::new(150.0, 25.0), 0, mods, 8);
+        e.pointer_move(Point::new(160.0, 45.0), mods, 9);
+        e.pointer_up(Point::new(160.0, 45.0), mods, 10);
+
+        assert_eq!(
+            e.doc.ordered_live()[0].bounds(),
+            Rect::new(10.0, 20.0, 100.0, 50.0)
+        );
+        assert_eq!(
+            e.doc.ordered_live()[1].bounds(),
+            Rect::new(210.0, 20.0, 100.0, 50.0)
+        );
+        assert_eq!(e.selection.len(), 2, "the whole group stays selected");
+
+        let mods_cmd = Modifiers {
+            meta: true,
+            ..Modifiers::default()
+        };
+        press(&mut e, "z", mods_cmd, 11);
+        assert_eq!(
+            e.doc.ordered_live()[0].bounds(),
+            Rect::new(0.0, 0.0, 100.0, 50.0),
+            "the group move is one undo step"
+        );
+    }
+
+    #[test]
+    fn clicking_empty_space_inside_the_selection_clears_it() {
+        let mut e = editor();
+        drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(100.0, 50.0), 1);
+        drag_shape(&mut e, Point::new(200.0, 0.0), Point::new(300.0, 50.0), 4);
+        let ids: Vec<ElementId> = e
+            .doc
+            .ordered_live()
+            .iter()
+            .map(|element| element.id.clone())
+            .collect();
+        press(&mut e, "v", Modifiers::default(), 7);
+        e.select(ids);
+
+        let mods = Modifiers::default();
+        e.pointer_down(Point::new(150.0, 25.0), 0, mods, 8);
+        e.pointer_up(Point::new(150.0, 25.0), mods, 9);
+        assert!(e.selection.is_empty(), "a click inside the box deselects");
+        assert_eq!(
+            e.doc.ordered_live()[0].bounds(),
+            Rect::new(0.0, 0.0, 100.0, 50.0),
+            "nothing moved"
+        );
+    }
+
+    #[test]
+    fn dragging_an_element_in_the_selection_still_moves_the_group() {
+        let mut e = editor();
+        drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(100.0, 50.0), 1);
+        drag_shape(&mut e, Point::new(200.0, 0.0), Point::new(300.0, 50.0), 4);
+        let ids: Vec<ElementId> = e
+            .doc
+            .ordered_live()
+            .iter()
+            .map(|element| element.id.clone())
+            .collect();
+        press(&mut e, "v", Modifiers::default(), 7);
+        e.select(ids);
+
+        let mods = Modifiers::default();
+        e.pointer_down(Point::new(50.0, 25.0), 0, mods, 8);
+        e.pointer_move(Point::new(70.0, 35.0), mods, 9);
+        e.pointer_up(Point::new(70.0, 35.0), mods, 10);
+
+        assert_eq!(
+            e.doc.ordered_live()[0].bounds(),
+            Rect::new(20.0, 10.0, 100.0, 50.0)
+        );
+        assert_eq!(
+            e.doc.ordered_live()[1].bounds(),
+            Rect::new(220.0, 10.0, 100.0, 50.0)
+        );
     }
 
     #[test]
@@ -3358,10 +3975,11 @@ mod tests {
     }
 
     #[test]
-    fn freehand_is_single_shot_and_the_stroke_stays_selectable() {
+    fn freehand_stays_armed_and_the_stroke_stays_selectable() {
         let mut e = editor();
         let mods = Modifiers::default();
         press(&mut e, "p", mods, 1);
+        assert!(e.tool_locked, "the brush arms locked");
         e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
         for i in 1..=20 {
             e.pointer_move(
@@ -3372,17 +3990,43 @@ mod tests {
         }
         e.pointer_up(Point::new(57.0, 2.6), mods, 30);
 
-        assert_eq!(e.tool, Tool::Select, "the pencil is single-shot too");
+        assert_eq!(e.tool, Tool::Freehand, "the pencil stays armed");
         assert_eq!(e.doc.ordered_live().len(), 1);
-        let id = e.doc.ordered_live()[0].id.clone();
 
+        // A second stroke needs no re-arming.
+        e.pointer_down(Point::new(100.0, 100.0), 0, mods, 31);
+        e.pointer_move(Point::new(140.0, 120.0), mods, 32);
+        e.pointer_up(Point::new(140.0, 120.0), mods, 33);
+        assert_eq!(e.doc.ordered_live().len(), 2, "the brush keeps drawing");
+
+        let id = e.doc.ordered_live()[0].id.clone();
         e.clear_selection();
-        e.pointer_down(Point::new(0.0, 0.0), 0, mods, 31);
-        e.pointer_up(Point::new(0.0, 0.0), mods, 32);
+        press(&mut e, "v", mods, 34);
+        e.pointer_down(Point::new(0.0, 0.0), 0, mods, 35);
+        e.pointer_up(Point::new(0.0, 0.0), mods, 36);
         assert_eq!(
             e.selection.iter().next(),
             Some(&id),
-            "clicking the stroke selects it once the tool handed back"
+            "the stroke is selectable once Select is armed"
+        );
+    }
+
+    #[test]
+    fn pressing_the_armed_brush_shortcut_unlocks_it() {
+        let mut e = editor();
+        let mods = Modifiers::default();
+        press(&mut e, "p", mods, 1);
+        assert!(e.tool_locked);
+        press(&mut e, "p", mods, 2);
+        assert!(!e.tool_locked, "second press makes the brush single-shot");
+
+        e.pointer_down(Point::new(0.0, 0.0), 0, mods, 3);
+        e.pointer_move(Point::new(60.0, 20.0), mods, 4);
+        e.pointer_up(Point::new(60.0, 20.0), mods, 5);
+        assert_eq!(
+            e.tool,
+            Tool::Select,
+            "unlocked, it hands back after one use"
         );
     }
 
@@ -3882,6 +4526,66 @@ mod tests {
     }
 
     #[test]
+    fn arrows_bind_to_frames_on_their_border() {
+        let mut e = editor();
+        let mods = Modifiers::default();
+        press(&mut e, "f", mods, 1);
+        e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
+        e.pointer_move(Point::new(200.0, 150.0), mods, 3);
+        e.pointer_up(Point::new(200.0, 150.0), mods, 4);
+        let frame_a = e.doc.ordered_live()[0].id.clone();
+
+        press(&mut e, "f", mods, 5);
+        e.pointer_down(Point::new(400.0, 0.0), 0, mods, 6);
+        e.pointer_move(Point::new(600.0, 150.0), mods, 7);
+        e.pointer_up(Point::new(600.0, 150.0), mods, 8);
+        let frame_b = e.doc.ordered_live()[1].id.clone();
+
+        // Connect frame A's east border to frame B's west border.
+        press(&mut e, "a", mods, 9);
+        e.pointer_down(Point::new(200.0, 75.0), 0, mods, 10);
+        e.pointer_move(Point::new(400.0, 75.0), mods, 11);
+        e.pointer_up(Point::new(400.0, 75.0), mods, 12);
+
+        let arrow_id = e
+            .doc
+            .ordered_live()
+            .iter()
+            .find(|element| matches!(element.kind, ElementKind::Arrow { .. }))
+            .unwrap()
+            .id
+            .clone();
+        let bindings = |element: &Element| match &element.kind {
+            ElementKind::Arrow { start, end, .. } => (
+                start.binding.as_ref().map(|b| b.element_id.clone()),
+                end.binding.as_ref().map(|b| b.element_id.clone()),
+            ),
+            other => panic!("expected an arrow, got {other:?}"),
+        };
+        assert_eq!(
+            bindings(e.doc.element(&arrow_id).unwrap()),
+            (Some(frame_a.clone()), Some(frame_b.clone())),
+            "both endpoints bind to the frames"
+        );
+
+        // Moving a frame drags the bound endpoint along.
+        press(&mut e, "v", mods, 13);
+        e.select([frame_a.clone()]);
+        e.pointer_down(Point::new(50.0, 150.0), 0, mods, 14);
+        e.pointer_move(Point::new(50.0, 200.0), mods, 15);
+        e.pointer_up(Point::new(50.0, 200.0), mods, 16);
+        let (start_y, end_y) = match &e.doc.element(&arrow_id).unwrap().kind {
+            ElementKind::Arrow { start, end, .. } => (start.y, end.y),
+            _ => unreachable!(),
+        };
+        assert!(
+            (start_y - 125.0).abs() < 0.01,
+            "start followed the frame down: {start_y}"
+        );
+        assert!((end_y - 75.0).abs() < 0.01, "end stayed put: {end_y}");
+    }
+
+    #[test]
     fn deleting_a_frame_deletes_children_in_one_undoable_step() {
         let mut e = editor();
         let mods = Modifiers::default();
@@ -3904,6 +4608,288 @@ mod tests {
         };
         press(&mut e, "z", cmd, 8);
         assert_eq!(e.doc.ordered_live().len(), 2, "one undo restores all");
+    }
+
+    #[test]
+    fn sticky_tool_creates_a_note_and_double_click_adds_text() {
+        let mut e = editor();
+        let mods = Modifiers::default();
+        press(&mut e, "n", mods, 1);
+        e.pointer_down(Point::new(200.0, 200.0), 0, mods, 2);
+        e.pointer_up(Point::new(200.0, 200.0), mods, 3);
+
+        assert_eq!(e.doc.ordered_live().len(), 1);
+        let note = e.doc.ordered_live()[0].clone();
+        assert!(note.is_sticky(), "the sticky tool draws a sticky note");
+        assert_eq!(note.bounds(), Rect::new(130.0, 130.0, 140.0, 140.0));
+        match &note.kind {
+            ElementKind::Shape { style, .. } => {
+                assert_eq!(style.fill_style, crate::model::FillPattern::Solid);
+                assert_ne!(style.fill_color, "transparent");
+                assert_eq!(style.stroke_color, STICKY_INK);
+            }
+            other => panic!("expected a sticky, got {other:?}"),
+        }
+        assert_eq!(e.tool, Tool::Select, "the sticky tool is single-shot");
+
+        // Double-click creates the note's bound text, inked in the note colour.
+        e.double_click(Point::new(200.0, 200.0), 4);
+        let text_id = match &e.interaction {
+            Interaction::TextEditing { id, .. } => id.clone(),
+            other => panic!("expected the text editor, got {other:?}"),
+        };
+        e.commit_text(&text_id, "hello", 5);
+        assert_eq!(e.doc.ordered_live().len(), 2);
+        let text = e.doc.element(&text_id).unwrap();
+        match &text.kind {
+            ElementKind::Text {
+                text,
+                container_id,
+                style,
+                ..
+            } => {
+                assert_eq!(text, "hello");
+                assert_eq!(container_id.as_ref(), Some(&note.id));
+                assert_eq!(style.stroke_color, STICKY_INK);
+            }
+            other => panic!("expected bound text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sticky_tool_pulls_notes_from_a_stack_and_select_moves_the_stack() {
+        let mut e = editor();
+        let mods = Modifiers::default();
+        press(&mut e, "k", mods, 1);
+        e.pointer_down(Point::new(300.0, 300.0), 0, mods, 2);
+        e.pointer_up(Point::new(300.0, 300.0), mods, 3);
+        let stack = e.doc.ordered_live()[0].clone();
+        assert!(stack.is_sticky_stack());
+        assert_eq!(e.tool, Tool::Select, "placing a stack is single-shot");
+        assert_eq!(stack.bounds(), Rect::new(230.0, 230.0, 140.0, 140.0));
+
+        // N-drag from the pile pulls a note out; the pile stays.
+        press(&mut e, "n", mods, 4);
+        e.pointer_down(Point::new(300.0, 300.0), 0, mods, 5);
+        e.pointer_move(Point::new(500.0, 320.0), mods, 6);
+        e.pointer_up(Point::new(500.0, 320.0), mods, 7);
+        assert_eq!(e.doc.ordered_live().len(), 2);
+        let note = e
+            .doc
+            .ordered_live()
+            .into_iter()
+            .find(|element| element.is_sticky())
+            .cloned()
+            .expect("a note was pulled");
+        assert_eq!(note.bounds().center(), Point::new(500.0, 320.0));
+        assert_eq!(
+            e.doc.element(&stack.id).unwrap().bounds(),
+            stack.bounds(),
+            "the pile did not move"
+        );
+        assert_eq!(e.tool, Tool::Select);
+
+        // A click on the pile pulls nothing.
+        press(&mut e, "n", mods, 8);
+        e.pointer_down(Point::new(300.0, 300.0), 0, mods, 9);
+        e.pointer_up(Point::new(300.0, 300.0), mods, 10);
+        assert_eq!(
+            e.doc.ordered_live().len(),
+            2,
+            "clicking the pile is a no-op"
+        );
+
+        // Select-drag from the middle pulls a note too (Miro-style), the
+        // pile staying put.
+        press(&mut e, "v", mods, 11);
+        e.pointer_down(Point::new(300.0, 300.0), 0, mods, 12);
+        e.pointer_move(Point::new(560.0, 300.0), mods, 13);
+        e.pointer_up(Point::new(560.0, 300.0), mods, 14);
+        assert_eq!(e.doc.ordered_live().len(), 3, "select pulled a note");
+        assert_eq!(
+            e.doc.element(&stack.id).unwrap().bounds(),
+            stack.bounds(),
+            "the pile did not move"
+        );
+        let second = e
+            .doc
+            .ordered_live()
+            .into_iter()
+            .filter(|element| element.is_sticky())
+            .nth(1)
+            .cloned()
+            .expect("second note");
+        assert_eq!(second.bounds().center(), Point::new(560.0, 300.0));
+
+        // Dragging the border ring moves the pile, not a note.
+        e.pointer_down(Point::new(235.0, 300.0), 0, mods, 15);
+        e.pointer_move(Point::new(265.0, 360.0), mods, 16);
+        e.pointer_up(Point::new(265.0, 360.0), mods, 17);
+        assert_eq!(
+            e.doc.element(&stack.id).unwrap().bounds(),
+            Rect::new(260.0, 290.0, 140.0, 140.0)
+        );
+        assert_eq!(
+            e.doc.element(&note.id).unwrap().bounds().center(),
+            Point::new(500.0, 320.0),
+            "the pulled note stayed put"
+        );
+        assert_eq!(e.doc.ordered_live().len(), 3, "moving made no new note");
+    }
+
+    #[test]
+    fn text_tool_on_a_shape_creates_a_centred_label() {
+        let mut e = editor();
+        drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(200.0, 100.0), 1);
+        let shape = e.doc.ordered_live()[0].id.clone();
+        let mods = Modifiers::default();
+
+        // Click well off-centre: the label still lands in the middle.
+        press(&mut e, "t", mods, 2);
+        e.pointer_down(Point::new(60.0, 40.0), 0, mods, 3);
+        let text_id = match &e.interaction {
+            Interaction::TextEditing { id, .. } => id.clone(),
+            other => panic!("expected the text editor, got {other:?}"),
+        };
+        e.commit_text(&text_id, "label", 4);
+
+        let text = e.doc.element(&text_id).unwrap();
+        match &text.kind {
+            ElementKind::Text {
+                container_id,
+                align,
+                ..
+            } => {
+                assert_eq!(container_id.as_ref(), Some(&shape));
+                assert_eq!(*align, TextAlign::Center);
+            }
+            other => panic!("expected bound text, got {other:?}"),
+        }
+        let bounds = text.bounds();
+        let shape_bounds = e.doc.element(&shape).unwrap().bounds();
+        assert!(
+            (bounds.center().x - shape_bounds.center().x).abs() < 1.0,
+            "the label is centred in the shape"
+        );
+    }
+
+    #[test]
+    fn marquee_inside_a_frame_selects_contents_not_the_frame() {
+        let mut e = editor();
+        let mods = Modifiers::default();
+        press(&mut e, "f", mods, 1);
+        e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
+        e.pointer_move(Point::new(400.0, 300.0), mods, 3);
+        e.pointer_up(Point::new(400.0, 300.0), mods, 4);
+        let frame_id = e.doc.ordered_live()[0].id.clone();
+        drag_shape(&mut e, Point::new(50.0, 50.0), Point::new(150.0, 150.0), 5);
+        let shape_id = e.doc.ordered_live()[1].id.clone();
+
+        press(&mut e, "v", mods, 6);
+        e.clear_selection();
+        e.pointer_down(Point::new(20.0, 20.0), 0, mods, 7);
+        e.pointer_move(Point::new(300.0, 200.0), mods, 8);
+        e.pointer_up(Point::new(300.0, 200.0), mods, 9);
+
+        assert_eq!(e.selection.len(), 1);
+        assert!(e.selection.contains(&shape_id));
+        assert!(
+            !e.selection.contains(&frame_id),
+            "a marquee inside the frame does not grab the frame"
+        );
+    }
+
+    #[test]
+    fn text_committed_inside_a_frame_becomes_its_child() {
+        let mut e = editor();
+        let mods = Modifiers::default();
+        press(&mut e, "f", mods, 1);
+        e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
+        e.pointer_move(Point::new(400.0, 300.0), mods, 3);
+        e.pointer_up(Point::new(400.0, 300.0), mods, 4);
+        let frame_id = e.doc.ordered_live()[0].id.clone();
+
+        press(&mut e, "t", mods, 5);
+        e.pointer_down(Point::new(200.0, 150.0), 0, mods, 6);
+        let text_id = match &e.interaction {
+            Interaction::TextEditing { id, .. } => id.clone(),
+            other => panic!("expected the text editor, got {other:?}"),
+        };
+        e.commit_text(&text_id, "inside", 7);
+        assert_eq!(
+            e.doc.element(&text_id).unwrap().frame_id.as_ref(),
+            Some(&frame_id),
+            "text dropped inside a frame is owned by it"
+        );
+
+        let before = e.doc.element(&text_id).unwrap().bounds();
+        press(&mut e, "v", mods, 8);
+        e.select([frame_id.clone()]);
+        e.pointer_down(Point::new(100.0, 300.0), 0, mods, 9);
+        e.pointer_move(Point::new(140.0, 340.0), mods, 10);
+        e.pointer_up(Point::new(140.0, 340.0), mods, 11);
+        let after = e.doc.element(&text_id).unwrap().bounds();
+        assert!(
+            (after.x - before.x - 40.0).abs() < 0.01,
+            "the frame carried the text"
+        );
+    }
+
+    #[test]
+    fn dragging_from_a_connection_node_draws_a_bound_arrow() {
+        let mut e = editor();
+        drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(100.0, 50.0), 1);
+        drag_shape(&mut e, Point::new(300.0, 0.0), Point::new(400.0, 50.0), 2);
+        let a = e.doc.ordered_live()[0].id.clone();
+        let b = e.doc.ordered_live()[1].id.clone();
+        let mods = Modifiers::default();
+        press(&mut e, "v", mods, 3);
+        e.clear_selection();
+
+        // Approaching the east node of A reveals the nodes.
+        e.pointer_move(Point::new(112.0, 25.0), mods, 4);
+        assert!(
+            !e.hover_anchor_points().is_empty(),
+            "connection nodes appear on approach"
+        );
+
+        // Dragging from the node starts an arrow bound to that side.
+        e.pointer_down(Point::new(112.0, 25.0), 0, mods, 5);
+        e.pointer_move(Point::new(288.0, 25.0), mods, 6);
+        e.pointer_up(Point::new(288.0, 25.0), mods, 7);
+
+        let arrow = e
+            .doc
+            .ordered_live()
+            .into_iter()
+            .find(|element| matches!(element.kind, ElementKind::Arrow { .. }))
+            .cloned()
+            .expect("an arrow was drawn");
+        let bindings = match &arrow.kind {
+            ElementKind::Arrow { start, end, .. } => (
+                start.binding.as_ref().map(|b| b.element_id.clone()),
+                end.binding.as_ref().map(|b| b.element_id.clone()),
+            ),
+            other => panic!("expected an arrow, got {other:?}"),
+        };
+        assert_eq!(bindings, (Some(a.clone()), Some(b.clone())));
+        assert_eq!(
+            e.selection.iter().next(),
+            Some(&arrow.id),
+            "the new arrow is selected"
+        );
+        assert_eq!(e.tool, Tool::Select);
+
+        // The start followed the source shape when it moved.
+        e.select([a.clone()]);
+        e.pointer_down(Point::new(50.0, 25.0), 0, mods, 8);
+        e.pointer_move(Point::new(50.0, 75.0), mods, 9);
+        e.pointer_up(Point::new(50.0, 75.0), mods, 10);
+        let start_y = match &e.doc.element(&arrow.id).unwrap().kind {
+            ElementKind::Arrow { start, .. } => start.y,
+            _ => unreachable!(),
+        };
+        assert!((start_y - 75.0).abs() < 0.01, "start followed: {start_y}");
     }
 
     #[test]

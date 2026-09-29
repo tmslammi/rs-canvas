@@ -35,6 +35,51 @@ test("type point text and commit with Escape", async ({ page }) => {
   expect(await count(page)).toBe(0);
 });
 
+test("large text keeps its size after the stroke is repainted", async ({ page }) => {
+  await page.goto("/");
+  await page.waitForFunction(() => window.__rsReady === true);
+  await page.evaluate(() => window.__rsEditor!.new_document());
+
+  await page.getByTitle("Font size 28").click();
+  await page.keyboard.press("t");
+  await page.mouse.click(300, 300);
+  await page.keyboard.type("asd");
+  await page.keyboard.press("Escape");
+
+  // Moving the text repaints its layer in a later frame. The renderer used
+  // to skip re-applying the font after the context state was restored, so
+  // the glyphs came back at the canvas default size.
+  const before = await page.evaluate(() => {
+    const bounds = window.__rsEditor!.selection_bounds();
+    return bounds ? Array.from(bounds) : [300, 300, 46, 36];
+  });
+  await page.mouse.move(before[0] + before[2] / 2, before[1] + before[3] / 2);
+  await page.mouse.down();
+  await page.mouse.move(before[0] + before[2] / 2 + 10, before[1] + before[3] / 2 + 10, {
+    steps: 3,
+  });
+  await page.mouse.up();
+
+  const inkHeight = await page.evaluate(() => {
+    const canvas = document.getElementById("scene") as HTMLCanvasElement;
+    const ctx = canvas.getContext("2d")!;
+    const data = ctx.getImageData(290, 285, 120, 80).data;
+    let minY = Infinity;
+    let maxY = -Infinity;
+    for (let y = 0; y < 80; y++) {
+      for (let x = 0; x < 120; x++) {
+        const i = (y * 120 + x) * 4;
+        if (data[i] > 100 && data[i + 1] > 100) {
+          minY = Math.min(minY, y);
+          maxY = Math.max(maxY, y);
+        }
+      }
+    }
+    return maxY - minY;
+  });
+  expect(inkHeight, "28px text stays 28px after a repaint").toBeGreaterThan(15);
+});
+
 test("double-click a shape to add bound text that moves with it", async ({ page }) => {
   await page.goto("/");
   await page.waitForFunction(() => window.__rsReady === true);

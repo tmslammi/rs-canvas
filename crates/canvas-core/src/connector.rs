@@ -238,6 +238,9 @@ pub fn arrowhead(tip: Point, from: Point, stroke_width: f64) -> Vec<Point> {
 /// `exclude` skips the element being edited — an arrow's bounds grow as it is
 /// drawn, so without the exclusion an endpoint dropped inside its own bounds
 /// would bind the connector to itself.
+///
+/// Frames only bind when the point is near their border, so a drop inside a
+/// frame still reaches the elements it contains.
 pub fn binding_candidate(
     doc: &Document,
     point: Point,
@@ -247,10 +250,15 @@ pub fn binding_candidate(
 ) -> Option<(String, AnchorSide, Point)> {
     let mut best: Option<&crate::model::Element> = None;
     for element in doc.elements.values() {
-        if element.is_deleted || element.is_frame() || exclude == Some(element.id.as_str()) {
+        if element.is_deleted || element.is_sticky_stack() || exclude == Some(element.id.as_str()) {
             continue;
         }
-        if !element.bounds().expand(tolerance).contains(point) {
+        let in_reach = if element.is_frame() {
+            crate::hit::hits(doc, element, point, tolerance)
+        } else {
+            element.bounds().expand(tolerance).contains(point)
+        };
+        if !in_reach {
             continue;
         }
         let topmost = best.is_none_or(|b| {
@@ -449,6 +457,28 @@ mod tests {
         assert!(
             binding_candidate(&doc, Point::new(95.0, 45.0), 6.0, None, Some(&id)).is_none(),
             "the excluded element is never a binding candidate"
+        );
+    }
+
+    #[test]
+    fn binding_candidate_binds_to_frames_only_near_their_border() {
+        let mut doc = Document::new();
+        let frame = doc.add(
+            ElementKind::Frame {
+                rect: Rect::new(0.0, 0.0, 200.0, 150.0),
+                name: "VPC".into(),
+            },
+            0,
+        );
+        let (found, side, point) =
+            binding_candidate(&doc, Point::new(202.0, 75.0), 6.0, None, None)
+                .expect("a drop on the frame border binds to the frame");
+        assert_eq!(found, frame);
+        assert_eq!(side, AnchorSide::E);
+        assert_eq!(point, Point::new(200.0, 75.0));
+        assert!(
+            binding_candidate(&doc, Point::new(100.0, 75.0), 6.0, None, None).is_none(),
+            "empty space inside a frame is not a binding target"
         );
     }
 

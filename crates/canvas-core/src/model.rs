@@ -24,6 +24,8 @@ pub enum ShapeKind {
     Rectangle,
     Ellipse,
     Diamond,
+    /// A sticky note: a filled, slightly rounded square with bound text.
+    Sticky,
 }
 
 /// Fill treatment for shapes.
@@ -217,6 +219,12 @@ pub enum ElementKind {
         container_id: Option<ElementId>,
         style: Style,
     },
+    /// An infinite source of blank sticky notes: drag notes out of it with
+    /// the sticky tool; the pile itself never empties.
+    StickyStack {
+        rect: Rect,
+        style: Style,
+    },
     Frame {
         rect: Rect,
         name: String,
@@ -283,6 +291,7 @@ impl Element {
             ElementKind::Shape { rect, .. }
             | ElementKind::Glyph { rect, .. }
             | ElementKind::Text { rect, .. }
+            | ElementKind::StickyStack { rect, .. }
             | ElementKind::Frame { rect, .. } => *rect,
             ElementKind::Freehand { points, .. } => {
                 let mut iter = points.iter();
@@ -307,6 +316,20 @@ impl Element {
 
     pub fn is_frame(&self) -> bool {
         matches!(self.kind, ElementKind::Frame { .. })
+    }
+
+    pub fn is_sticky_stack(&self) -> bool {
+        matches!(self.kind, ElementKind::StickyStack { .. })
+    }
+
+    pub fn is_sticky(&self) -> bool {
+        matches!(
+            self.kind,
+            ElementKind::Shape {
+                shape: ShapeKind::Sticky,
+                ..
+            }
+        )
     }
 
     pub fn is_text(&self) -> bool {
