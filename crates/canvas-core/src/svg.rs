@@ -4,17 +4,20 @@ use crate::display::{DrawOp, FillStyle, TextOp};
 use crate::geometry::Rect;
 use crate::model::Document;
 use crate::rough::build_element_ops;
+use crate::spatial::ObstacleIndex;
 use crate::text::TextMeasurer;
 
 const MARGIN: f64 = 16.0;
 
 /// Serialize the document as a standalone SVG.
 pub fn to_svg(doc: &Document, measurer: &dyn TextMeasurer) -> String {
+    let mut obstacles = ObstacleIndex::new();
+    obstacles.rebuild(doc);
     let layers: Vec<(Rect, Vec<DrawOp>)> = doc
         .ordered_live()
         .into_iter()
         .map(|element| {
-            let ops = build_element_ops(element, doc, measurer);
+            let ops = build_element_ops(element, doc, measurer, &obstacles);
             // Painted bounds, not model bounds, so frame labels and stroke
             // jitter are inside the viewBox instead of clipped by it.
             (crate::scene::layer_bounds(element, &ops, measurer), ops)
@@ -272,6 +275,7 @@ mod tests {
                 start_arrowhead: false,
                 end_arrowhead: true,
                 style: Style::default(),
+                waypoints: Vec::new(),
                 label_id: None,
             },
             "a1".into(),

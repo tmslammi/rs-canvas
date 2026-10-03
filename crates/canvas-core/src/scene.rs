@@ -11,6 +11,7 @@ use crate::display::DrawOp;
 use crate::geometry::Rect;
 use crate::model::{Document, Element, ElementId};
 use crate::rough::build_element_ops;
+use crate::spatial::ObstacleIndex;
 use crate::text::TextMeasurer;
 
 /// Extra margin around an element's bounds to cover stroke width and jitter.
@@ -105,14 +106,19 @@ impl Scene {
     }
 
     /// Rebuild every layer. Returns the world rects that changed.
-    pub fn rebuild_all(&mut self, doc: &Document, measurer: &dyn TextMeasurer) -> Vec<Rect> {
+    pub fn rebuild_all(
+        &mut self,
+        doc: &Document,
+        measurer: &dyn TextMeasurer,
+        obstacles: &ObstacleIndex,
+    ) -> Vec<Rect> {
         let mut dirty: Vec<Rect> = self.layers.iter().map(|l| l.bounds).collect();
         self.layers.clear();
         for element in doc.elements.values() {
             if element.is_deleted {
                 continue;
             }
-            let ops = build_element_ops(element, doc, measurer);
+            let ops = build_element_ops(element, doc, measurer, obstacles);
             let bounds = layer_bounds(element, &ops, measurer);
             self.layers.push(SceneLayer {
                 element_id: element.id.clone(),
@@ -160,6 +166,7 @@ impl Scene {
         doc: &Document,
         changed: &BTreeSet<ElementId>,
         measurer: &dyn TextMeasurer,
+        obstacles: &ObstacleIndex,
     ) -> Vec<Rect> {
         let mut dirty: Vec<Rect> = Vec::new();
         for id in changed {
@@ -167,7 +174,7 @@ impl Scene {
                 self.remove_layer(id, &mut dirty);
                 continue;
             };
-            let ops = build_element_ops(element, doc, measurer);
+            let ops = build_element_ops(element, doc, measurer, obstacles);
             let bounds = layer_bounds(element, &ops, measurer);
             let insert_at = match self.layer_position(&element.index, id) {
                 Ok(pos) => {
@@ -249,7 +256,7 @@ mod tests {
         doc.element_mut(&b).unwrap().is_deleted = true;
 
         let mut scene = Scene::new();
-        scene.rebuild_all(&doc, &crate::text::ApproxMeasurer);
+        scene.rebuild_all(&doc, &crate::text::ApproxMeasurer, &ObstacleIndex::new());
         assert_eq!(scene.layers.len(), 1);
         assert_eq!(scene.layers[0].element_id, a);
     }
@@ -259,14 +266,19 @@ mod tests {
         let mut doc = Document::new();
         let id = doc.add(shape(0.0), 1);
         let mut scene = Scene::new();
-        scene.rebuild_all(&doc, &crate::text::ApproxMeasurer);
+        scene.rebuild_all(&doc, &crate::text::ApproxMeasurer, &ObstacleIndex::new());
 
         doc.element_mut(&id).unwrap().touch(2);
         if let ElementKind::Shape { rect, .. } = &mut doc.element_mut(&id).unwrap().kind {
             rect.x = 500.0;
         }
         let changed: BTreeSet<_> = [id.clone()].into_iter().collect();
-        let dirty = scene.update(&doc, &changed, &crate::text::ApproxMeasurer);
+        let dirty = scene.update(
+            &doc,
+            &changed,
+            &crate::text::ApproxMeasurer,
+            &ObstacleIndex::new(),
+        );
         assert_eq!(dirty.len(), 2, "old and new bounds are both dirty");
         let covers_old = dirty.iter().any(|r| r.contains(Point::new(25.0, 20.0)));
         let covers_new = dirty.iter().any(|r| r.contains(Point::new(525.0, 20.0)));
@@ -278,12 +290,17 @@ mod tests {
         let mut doc = Document::new();
         let id = doc.add(shape(0.0), 1);
         let mut scene = Scene::new();
-        scene.rebuild_all(&doc, &crate::text::ApproxMeasurer);
+        scene.rebuild_all(&doc, &crate::text::ApproxMeasurer, &ObstacleIndex::new());
         assert_eq!(scene.layers.len(), 1);
 
         doc.element_mut(&id).unwrap().is_deleted = true;
         let changed: BTreeSet<_> = [id].into_iter().collect();
-        let dirty = scene.update(&doc, &changed, &crate::text::ApproxMeasurer);
+        let dirty = scene.update(
+            &doc,
+            &changed,
+            &crate::text::ApproxMeasurer,
+            &ObstacleIndex::new(),
+        );
         assert!(scene.layers.is_empty());
         assert_eq!(dirty.len(), 1);
     }
@@ -294,7 +311,7 @@ mod tests {
         doc.add(shape(0.0), 1);
         doc.add(shape(1000.0), 1);
         let mut scene = Scene::new();
-        scene.rebuild_all(&doc, &crate::text::ApproxMeasurer);
+        scene.rebuild_all(&doc, &crate::text::ApproxMeasurer, &ObstacleIndex::new());
         let visible: Vec<_> = scene.visible(Rect::new(0.0, 0.0, 200.0, 200.0)).collect();
         assert_eq!(visible.len(), 1);
     }
@@ -305,7 +322,7 @@ mod tests {
         let a = doc.add(shape(0.0), 1);
         let b = doc.add(shape(10.0), 1);
         let mut scene = Scene::new();
-        scene.rebuild_all(&doc, &crate::text::ApproxMeasurer);
+        scene.rebuild_all(&doc, &crate::text::ApproxMeasurer, &ObstacleIndex::new());
         assert_eq!(
             scene
                 .layers

@@ -52,11 +52,19 @@ impl Camera {
 
     /// Pan the view by a screen-space delta.
     pub fn pan_by_screen(&mut self, dx: f64, dy: f64) {
+        self.heal();
+        if !dx.is_finite() || !dy.is_finite() {
+            return;
+        }
         self.scroll = self.scroll - Point::new(dx, dy).scale(1.0 / self.zoom);
     }
 
     /// Multiply the zoom, keeping the world point under `screen` fixed.
     pub fn zoom_at(&mut self, screen: Point, factor: f64) {
+        self.heal();
+        if !factor.is_finite() || factor <= 0.0 || !screen.x.is_finite() || !screen.y.is_finite() {
+            return;
+        }
         let anchor = self.screen_to_world(screen);
         self.zoom = Self::clamp_zoom(self.zoom * factor);
         self.scroll = anchor - screen.scale(1.0 / self.zoom);
@@ -67,9 +75,28 @@ impl Camera {
         self.zoom_at(screen, zoom / self.zoom);
     }
 
+    /// Repair non-finite view state in place. Bad inputs are rejected at the
+    /// call sites, but a camera that was already poisoned must still be able
+    /// to recover (e.g. via reset-zoom) instead of staying blank forever.
+    fn heal(&mut self) {
+        if !self.scroll.x.is_finite() || !self.scroll.y.is_finite() {
+            self.scroll = Point::ZERO;
+        }
+        if !self.zoom.is_finite() || self.zoom <= 0.0 {
+            self.zoom = 1.0;
+        }
+    }
+
     /// Fit a world rectangle into the given viewport size.
     pub fn zoom_to_fit(&mut self, bounds: Rect, viewport: (f64, f64), padding: f64) {
-        if bounds.w <= 0.0 || bounds.h <= 0.0 || viewport.0 <= 0.0 || viewport.1 <= 0.0 {
+        self.heal();
+        if !bounds.w.is_finite()
+            || !bounds.h.is_finite()
+            || bounds.w <= 0.0
+            || bounds.h <= 0.0
+            || viewport.0 <= 0.0
+            || viewport.1 <= 0.0
+        {
             return;
         }
         let fit_x = (viewport.0 - 2.0 * padding) / bounds.w;
@@ -135,6 +162,32 @@ mod tests {
         assert_eq!(camera.zoom, Camera::MAX_ZOOM);
         camera.zoom_at(Point::ZERO, 0.000001);
         assert_eq!(camera.zoom, Camera::MIN_ZOOM);
+    }
+
+    #[test]
+    fn non_finite_input_is_ignored() {
+        let mut camera = Camera::default();
+        camera.pan_by_screen(f64::NAN, 10.0);
+        camera.pan_by_screen(f64::INFINITY, f64::NEG_INFINITY);
+        assert_eq!(camera.scroll, Point::ZERO);
+        camera.zoom_at(Point::new(10.0, f64::NAN), 2.0);
+        camera.zoom_at(Point::ZERO, 0.0);
+        camera.zoom_at(Point::ZERO, -3.0);
+        camera.zoom_at(Point::ZERO, f64::NAN);
+        camera.zoom_at(Point::ZERO, f64::INFINITY);
+        assert_eq!(camera.zoom, 1.0);
+        assert_eq!(camera.scroll, Point::ZERO);
+    }
+
+    #[test]
+    fn a_poisoned_camera_heals_itself() {
+        let mut camera = Camera {
+            scroll: Point::new(f64::NAN, f64::NAN),
+            zoom: f64::INFINITY,
+        };
+        camera.set_zoom_at(Point::new(400.0, 300.0), 1.0);
+        assert!(camera.scroll.x.is_finite() && camera.scroll.y.is_finite());
+        assert_eq!(camera.zoom, 1.0);
     }
 
     #[test]

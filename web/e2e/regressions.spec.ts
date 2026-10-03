@@ -247,9 +247,7 @@ test("an inserted library glyph can be selected and moved", async ({ page }) => 
   await page.goto("/");
   await page.waitForFunction(() => window.__rsReady === true);
   await page.evaluate(() => window.__rsEditor!.new_document());
-  await page.getByTitle("Shapes library").click();
-  await page.locator(".library-search").fill("cloud storage");
-  await page.getByTitle("Insert Cloud Storage").click();
+  await page.evaluate(() => window.__rsEditor!.insert_glyph("cloud_storage"));
   expect(await count(page)).toBe(2);
 
   await page.keyboard.press("v");

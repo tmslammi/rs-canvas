@@ -17,15 +17,38 @@ enum Navigation {
 }
 
 /// Tracks modifier state and the active navigation gesture.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct NavigationState {
     space_held: bool,
     navigation: Navigation,
+    /// Multiplier on wheel-zoom strength; 1.0 is the tuned default.
+    zoom_sensitivity: f64,
+}
+
+impl Default for NavigationState {
+    fn default() -> Self {
+        Self {
+            space_held: false,
+            navigation: Navigation::default(),
+            zoom_sensitivity: 1.0,
+        }
+    }
 }
 
 impl NavigationState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn zoom_sensitivity(&self) -> f64 {
+        self.zoom_sensitivity
+    }
+
+    /// Set the wheel-zoom multiplier, clamped to a sane range.
+    pub fn set_zoom_sensitivity(&mut self, sensitivity: f64) {
+        if sensitivity.is_finite() {
+            self.zoom_sensitivity = sensitivity.clamp(0.1, 16.0);
+        }
     }
 
     pub fn space_held(&self) -> bool {
@@ -82,8 +105,11 @@ impl NavigationState {
 
     /// Trackpad two-finger scroll pans; ctrl+wheel (pinch) zooms at cursor.
     pub fn wheel(&mut self, camera: &mut Camera, screen: Point, dx: f64, dy: f64, ctrl: bool) {
+        if !dx.is_finite() || !dy.is_finite() || !screen.x.is_finite() || !screen.y.is_finite() {
+            return;
+        }
         if ctrl {
-            camera.zoom_at(screen, (-dy * 0.0022).exp());
+            camera.zoom_at(screen, (-dy * 0.0022 * self.zoom_sensitivity).exp());
         } else {
             camera.pan_by_screen(-dx, -dy);
         }
@@ -119,6 +145,18 @@ mod tests {
     fn plain_left_click_is_not_navigation() {
         let mut nav = NavigationState::new();
         assert!(!nav.pointer_down(Point::new(0.0, 0.0), 0));
+    }
+
+    #[test]
+    fn zoom_sensitivity_scales_wheel_zoom() {
+        let mut nav = NavigationState::new();
+        let mut normal = Camera::default();
+        nav.wheel(&mut normal, Point::new(0.0, 0.0), 0.0, -100.0, true);
+        let mut fast = Camera::default();
+        nav.set_zoom_sensitivity(4.0);
+        nav.wheel(&mut fast, Point::new(0.0, 0.0), 0.0, -100.0, true);
+        assert!(fast.zoom > normal.zoom);
+        assert!(fast.zoom > 1.0);
     }
 
     #[test]

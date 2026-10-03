@@ -23,7 +23,18 @@ declare global {
       export_svg(): string;
       export_png(scale: number): string;
       load_benchmark_fixture(count: number): void;
+      load_connected_fixture(nodes: number, arrowsPerNode: number): void;
+      insert_glyph(glyphId: string): void;
       is_tool_locked(): boolean;
+      set_grid_visible(visible: boolean): void;
+      grid_visible(): boolean;
+      set_grid_size(size: number): void;
+      grid_size(): number;
+      set_zoom_sensitivity(sensitivity: number): void;
+      zoom_sensitivity(): number;
+      set_snap_enabled(enabled: boolean): void;
+      snap_enabled(): boolean;
+      route_for(id: string): Float64Array;
     };
   }
 }

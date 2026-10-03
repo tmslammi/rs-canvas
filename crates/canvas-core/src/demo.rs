@@ -128,6 +128,7 @@ fn connect(doc: &mut Document, from: &str, to: &str, label: Option<&str>) -> Str
             start_arrowhead: false,
             end_arrowhead: true,
             style: Style::default(),
+            waypoints: Vec::new(),
             label_id: None,
         },
         0,
@@ -140,8 +141,9 @@ fn connect(doc: &mut Document, from: &str, to: &str, label: Option<&str>) -> Str
                     start,
                     end,
                     routing,
+                    waypoints,
                     ..
-                } => Some(connector::route(start, end, *routing, doc)),
+                } => Some(connector::route(start, end, *routing, waypoints, doc)),
                 _ => None,
             })
             .map(|route| connector::point_at(&route, 0.5))
@@ -190,7 +192,9 @@ mod tests {
 
         // Every element renders and the scene builds without gaps.
         let mut scene = crate::scene::Scene::new();
-        scene.rebuild_all(&doc, &ApproxMeasurer);
+        let mut obstacles = crate::spatial::ObstacleIndex::new();
+        obstacles.rebuild(&doc);
+        scene.rebuild_all(&doc, &ApproxMeasurer, &obstacles);
         assert_eq!(scene.layers.len(), live.len());
         for layer in &scene.layers {
             assert!(

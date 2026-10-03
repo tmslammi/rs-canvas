@@ -3,11 +3,13 @@
 //! Files and autosaves share one schema. The migration function is the single
 //! place older documents are upgraded; unknown future versions are rejected.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use serde_json::Value;
 
-use crate::model::{Document, SCHEMA_VERSION};
+use crate::geometry::Rect;
+use crate::model::{Document, Element, ElementId, ElementKind, SCHEMA_VERSION};
 
 #[derive(Debug)]
 pub enum SchemaError {
@@ -57,7 +59,125 @@ pub fn from_json(input: &str) -> Result<Document, SchemaError> {
         .ok_or_else(|| SchemaError::Invalid("missing schemaVersion".into()))?
         as u32;
     let value = migrate(value, version)?;
-    Ok(serde_json::from_value(value)?)
+    let mut doc: Document = serde_json::from_value(value)?;
+    sanitize(&mut doc);
+    Ok(doc)
+}
+
+/// Repair references and geometry a hostile or hand-edited file may carry,
+/// so the editor never holds a dangling id or an inverted rect. Tombstones
+/// stay tombstones; links pointing at missing or deleted targets are
+/// cleared rather than rejected so the rest of the document survives.
+fn sanitize(doc: &mut Document) {
+    let live: BTreeSet<ElementId> = doc
+        .elements
+        .values()
+        .filter(|e| !e.is_deleted)
+        .map(|e| e.id.clone())
+        .collect();
+    let live_text: BTreeSet<ElementId> = doc
+        .elements
+        .values()
+        .filter(|e| !e.is_deleted && e.is_text())
+        .map(|e| e.id.clone())
+        .collect();
+    let live_containers: BTreeSet<ElementId> = doc
+        .elements
+        .values()
+        .filter(|e| {
+            !e.is_deleted
+                && matches!(
+                    e.kind,
+                    ElementKind::Shape { .. }
+                        | ElementKind::Glyph { .. }
+                        | ElementKind::Arrow { .. }
+                )
+        })
+        .map(|e| e.id.clone())
+        .collect();
+    let live_frames: BTreeSet<ElementId> = doc
+        .elements
+        .values()
+        .filter(|e| !e.is_deleted && e.is_frame())
+        .map(|e| e.id.clone())
+        .collect();
+    // Bound text belongs to its container: a binding that points at a label
+    // really means the container. Retarget before the dead-binding sweep so
+    // documents written before bound text stopped being a target stay wired.
+    let bound_text_containers: BTreeMap<ElementId, ElementId> = doc
+        .elements
+        .values()
+        .filter(|e| !e.is_deleted && e.is_text())
+        .filter_map(|e| match &e.kind {
+            ElementKind::Text {
+                container_id: Some(container_id),
+                ..
+            } if live.contains(container_id) => Some((e.id.clone(), container_id.clone())),
+            _ => None,
+        })
+        .collect();
+    for element in doc.elements.values_mut() {
+        // Negative extents are normalized rather than rejected: they draw
+        // the same shape with flipped axes.
+        if let Some(rect) = rect_mut(element) {
+            if rect.w < 0.0 {
+                rect.x += rect.w;
+                rect.w = -rect.w;
+            }
+            if rect.h < 0.0 {
+                rect.y += rect.h;
+                rect.h = -rect.h;
+            }
+        }
+        match &mut element.kind {
+            ElementKind::Shape { bound_text_id, .. } => clear_dead(bound_text_id, &live_text),
+            ElementKind::Glyph { caption_id, .. } => clear_dead(caption_id, &live_text),
+            ElementKind::Arrow {
+                start,
+                end,
+                label_id,
+                waypoints,
+                ..
+            } => {
+                clear_dead(label_id, &live_text);
+                waypoints.retain(|point| point.x.is_finite() && point.y.is_finite());
+                for endpoint in [start, end] {
+                    if let Some(binding) = &mut endpoint.binding {
+                        if let Some(container_id) = bound_text_containers.get(&binding.element_id) {
+                            binding.element_id = container_id.clone();
+                        }
+                        if !live.contains(&binding.element_id) {
+                            endpoint.binding = None;
+                        }
+                    }
+                }
+            }
+            ElementKind::Text { container_id, .. } => clear_dead(container_id, &live_containers),
+            _ => {}
+        }
+        if let Some(frame_id) = &element.frame_id {
+            if *frame_id == element.id || !live_frames.contains(frame_id) {
+                element.frame_id = None;
+            }
+        }
+    }
+}
+
+fn clear_dead(reference: &mut Option<ElementId>, valid: &BTreeSet<ElementId>) {
+    if reference.as_ref().is_some_and(|id| !valid.contains(id)) {
+        *reference = None;
+    }
+}
+
+fn rect_mut(element: &mut Element) -> Option<&mut Rect> {
+    match &mut element.kind {
+        ElementKind::Shape { rect, .. }
+        | ElementKind::Glyph { rect, .. }
+        | ElementKind::Text { rect, .. }
+        | ElementKind::StickyStack { rect, .. }
+        | ElementKind::Frame { rect, .. } => Some(rect),
+        _ => None,
+    }
 }
 
 /// Upgrade a document from an older schema version.
@@ -125,6 +245,7 @@ mod tests {
                     fill_style: FillPattern::CrossHatch,
                     ..Style::default()
                 },
+                waypoints: Vec::new(),
                 label_id: None,
             },
             4,
@@ -209,5 +330,186 @@ mod tests {
             assert!(element["updated"].is_u64());
             assert!(element["type"].is_string());
         }
+    }
+
+    #[test]
+    fn load_repairs_dangling_references() {
+        let mut doc = Document::new();
+        let shape_id = doc.add(
+            ElementKind::Shape {
+                shape: ShapeKind::Rectangle,
+                rect: Rect::new(0.0, 0.0, 100.0, 50.0),
+                style: Style::default(),
+                bound_text_id: Some("ghost-text".into()),
+            },
+            1,
+        );
+        let arrow_id = doc.add(
+            ElementKind::Arrow {
+                start: Endpoint {
+                    x: 0.0,
+                    y: 0.0,
+                    binding: Some(crate::model::Binding {
+                        element_id: "ghost".into(),
+                        focus: None,
+                    }),
+                },
+                end: Endpoint::free(50.0, 50.0),
+                routing: Routing::Straight,
+                start_arrowhead: false,
+                end_arrowhead: true,
+                style: Style::default(),
+                waypoints: Vec::new(),
+                label_id: None,
+            },
+            2,
+        );
+        let text_id = doc.add(
+            ElementKind::Text {
+                rect: Rect::new(0.0, 0.0, 10.0, 10.0),
+                text: "orphan".into(),
+                align: TextAlign::Left,
+                fixed_width: false,
+                container_id: Some("ghost".into()),
+                style: Style::default(),
+            },
+            3,
+        );
+        doc.element_mut(&shape_id).unwrap().frame_id = Some("ghost-frame".into());
+        let flipped_id = doc.add(
+            ElementKind::Shape {
+                shape: ShapeKind::Rectangle,
+                rect: Rect::new(200.0, 200.0, -40.0, -30.0),
+                style: Style::default(),
+                bound_text_id: None,
+            },
+            4,
+        );
+
+        let back = from_json(&to_json(&doc).unwrap()).unwrap();
+        let shape = back.element(&shape_id).unwrap();
+        assert!(
+            matches!(
+                &shape.kind,
+                ElementKind::Shape {
+                    bound_text_id: None,
+                    ..
+                }
+            ),
+            "dangling bound_text_id survived load"
+        );
+        assert!(shape.frame_id.is_none(), "dangling frame_id survived load");
+        let ElementKind::Arrow { start, .. } = &back.element(&arrow_id).unwrap().kind else {
+            panic!("arrow kind changed")
+        };
+        assert!(start.binding.is_none(), "dangling binding survived load");
+        let ElementKind::Text { container_id, .. } = &back.element(&text_id).unwrap().kind else {
+            panic!("text kind changed")
+        };
+        assert!(
+            container_id.is_none(),
+            "dangling container_id survived load"
+        );
+        let ElementKind::Shape { rect, .. } = &back.element(&flipped_id).unwrap().kind else {
+            panic!("shape kind changed")
+        };
+        assert_eq!(*rect, Rect::new(160.0, 170.0, 40.0, 30.0));
+    }
+
+    #[test]
+    fn load_preserves_live_bound_references() {
+        let mut doc = Document::new();
+        let shape_id = doc.add(
+            ElementKind::Shape {
+                shape: ShapeKind::Rectangle,
+                rect: Rect::new(0.0, 0.0, 100.0, 50.0),
+                style: Style::default(),
+                bound_text_id: None,
+            },
+            1,
+        );
+        let text_id = doc.add(
+            ElementKind::Text {
+                rect: Rect::new(0.0, 0.0, 10.0, 10.0),
+                text: "label".into(),
+                align: TextAlign::Center,
+                fixed_width: false,
+                container_id: Some(shape_id.clone()),
+                style: Style::default(),
+            },
+            2,
+        );
+        if let ElementKind::Shape { bound_text_id, .. } =
+            &mut doc.element_mut(&shape_id).unwrap().kind
+        {
+            *bound_text_id = Some(text_id.clone());
+        }
+
+        let back = from_json(&to_json(&doc).unwrap()).unwrap();
+        let ElementKind::Shape { bound_text_id, .. } = &back.element(&shape_id).unwrap().kind
+        else {
+            panic!("shape kind changed")
+        };
+        assert_eq!(bound_text_id.as_deref(), Some(text_id.as_str()));
+        let ElementKind::Text { container_id, .. } = &back.element(&text_id).unwrap().kind else {
+            panic!("text kind changed")
+        };
+        assert_eq!(container_id.as_deref(), Some(shape_id.as_str()));
+    }
+
+    #[test]
+    fn load_retargets_bindings_away_from_bound_text() {
+        let mut doc = Document::new();
+        let shape_id = doc.add(
+            ElementKind::Shape {
+                shape: ShapeKind::Rectangle,
+                rect: Rect::new(0.0, 0.0, 100.0, 50.0),
+                style: Style::default(),
+                bound_text_id: None,
+            },
+            1,
+        );
+        let text_id = doc.add(
+            ElementKind::Text {
+                rect: Rect::new(10.0, 10.0, 40.0, 10.0),
+                text: "hub".into(),
+                align: TextAlign::Center,
+                fixed_width: false,
+                container_id: Some(shape_id.clone()),
+                style: Style::default(),
+            },
+            2,
+        );
+        // A document written while bound text was still a legal target.
+        let arrow_id = doc.add(
+            ElementKind::Arrow {
+                start: Endpoint {
+                    x: 60.0,
+                    y: 25.0,
+                    binding: Some(crate::model::Binding {
+                        element_id: text_id.clone(),
+                        focus: None,
+                    }),
+                },
+                end: Endpoint::free(200.0, 200.0),
+                routing: Routing::Straight,
+                start_arrowhead: false,
+                end_arrowhead: true,
+                style: Style::default(),
+                waypoints: Vec::new(),
+                label_id: None,
+            },
+            3,
+        );
+
+        let back = from_json(&to_json(&doc).unwrap()).unwrap();
+        let ElementKind::Arrow { start, .. } = &back.element(&arrow_id).unwrap().kind else {
+            panic!("arrow kind changed")
+        };
+        assert_eq!(
+            start.binding.as_ref().map(|b| b.element_id.as_str()),
+            Some(shape_id.as_str()),
+            "binding still points at the label instead of its container"
+        );
     }
 }

@@ -50,6 +50,33 @@ test("trackpad scroll pans, ctrl+wheel zooms around the cursor", async ({ page }
   expect(Math.abs(worldBefore[1] - worldAfter[1])).toBeLessThan(1.5);
 });
 
+test("zoom speed setting scales ctrl+wheel zoom and persists", async ({ page }) => {
+  await page.goto("/");
+  await page.waitForFunction(() => window.__rsReady === true);
+  await page.evaluate(() => window.__rsEditor!.new_document());
+  expect(await page.evaluate(() => window.__rsEditor!.zoom_sensitivity())).toBe(1);
+
+  const wheelZoom = async () => {
+    await page.evaluate(() => window.__rsEditor!.reset_zoom());
+    await page.mouse.move(640, 400);
+    await page.keyboard.down("Control");
+    await page.mouse.wheel(0, -240);
+    await page.keyboard.up("Control");
+    return zoom(page);
+  };
+  const normal = await wheelZoom();
+  expect(normal).toBeGreaterThan(1);
+
+  await page.getByTitle(/Zoom speed/).click();
+  expect(await page.evaluate(() => window.__rsEditor!.zoom_sensitivity())).toBe(2);
+  const fast = await wheelZoom();
+  expect(fast, "2× zoom speed zooms further per wheel tick").toBeGreaterThan(normal);
+
+  await page.reload();
+  await page.waitForFunction(() => window.__rsReady === true);
+  expect(await page.evaluate(() => window.__rsEditor!.zoom_sensitivity())).toBe(2);
+});
+
 test("shift+1 fits the drawing, shift+0 resets to 100%", async ({ page }) => {
   await page.goto("/");
   await page.waitForFunction(() => window.__rsReady === true);

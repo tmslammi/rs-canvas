@@ -40,7 +40,7 @@ pub fn hit_test(doc: &Document, point: Point, tolerance: f64) -> Option<ElementI
 pub fn hit_test_raw(doc: &Document, point: Point, tolerance: f64) -> Option<ElementId> {
     let mut best: Option<&Element> = None;
     for element in doc.elements.values() {
-        if element.is_deleted {
+        if element.is_deleted || invisible(element) {
             continue;
         }
         if !hits(doc, element, point, tolerance) {
@@ -56,10 +56,19 @@ pub fn hit_test_raw(doc: &Document, point: Point, tolerance: f64) -> Option<Elem
     best.map(|element| element.id.clone())
 }
 
+/// Fully transparent elements never intercept input — there is no paint
+/// under the cursor for the user to aim at.
+fn invisible(element: &Element) -> bool {
+    crate::editor::element_style(element)
+        .map(|style| style.opacity <= 0.0)
+        .unwrap_or(false)
+}
+
 /// Live elements whose bounds intersect the rectangle, in z-order.
 pub fn elements_in_rect(doc: &Document, rect: Rect) -> Vec<ElementId> {
     doc.ordered_live()
         .into_iter()
+        .filter(|e| !invisible(e))
         .filter(|e| {
             let bounds = e.bounds();
             bounds.intersects(&rect) || bounds.expand(4.0).intersects(&rect)
@@ -69,6 +78,9 @@ pub fn elements_in_rect(doc: &Document, rect: Rect) -> Vec<ElementId> {
 }
 
 pub fn hits(doc: &Document, element: &Element, p: Point, tolerance: f64) -> bool {
+    if element.is_deleted || invisible(element) {
+        return false;
+    }
     match &element.kind {
         ElementKind::Shape {
             shape, rect, style, ..
@@ -95,10 +107,16 @@ pub fn hits(doc: &Document, element: &Element, p: Point, tolerance: f64) -> bool
             end,
             routing,
             style,
+            waypoints,
             ..
         } => {
-            let route = crate::connector::route(start, end, *routing, doc);
             let slack = tolerance + style.stroke_width / 2.0;
+            // Cheap reject: plain and waypoint routes stay inside the
+            // element bounds, so a point outside them can never hit.
+            if !element.bounds().expand(slack).contains(p) {
+                return false;
+            }
+            let route = crate::connector::route(start, end, *routing, waypoints, doc);
             if !polyline_bounds(&route).expand(slack).contains(p) {
                 return false;
             }
@@ -335,5 +353,18 @@ mod tests {
         let hits = elements_in_rect(&doc, Rect::new(-10.0, -10.0, 100.0, 100.0));
         assert_eq!(hits, vec![a]);
         assert!(!hits.contains(&b));
+    }
+
+    #[test]
+    fn invisible_elements_do_not_intercept_hits() {
+        let mut doc = Document::new();
+        let id = rect_element(&mut doc, Rect::new(0.0, 0.0, 50.0, 50.0));
+        let point = Point::new(25.0, 25.0);
+        assert_eq!(hit_test(&doc, point, 2.0), Some(id.clone()));
+        if let ElementKind::Shape { style, .. } = &mut doc.element_mut(&id).unwrap().kind {
+            style.opacity = 0.0;
+        }
+        assert_eq!(hit_test(&doc, point, 2.0), None);
+        assert_eq!(hit_test_raw(&doc, point, 2.0), None);
     }
 }

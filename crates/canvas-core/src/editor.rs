@@ -19,6 +19,7 @@ use crate::model::{
 };
 use crate::nav::NavigationState;
 use crate::scene::Scene;
+use crate::spatial::ObstacleIndex;
 use crate::text::{layout_text, ApproxMeasurer, TextMeasurer};
 use crate::tool::Tool;
 
@@ -109,6 +110,8 @@ const CONNECTION_NODE_PX: f64 = 16.0;
 /// The border ring of a sticky stack that drags the pile rather than pulling
 /// a note, in screen px.
 const STACK_EDGE_PX: f64 = 16.0;
+/// Default world-space spacing of the optional grid, and the snap step.
+pub const GRID_SIZE: f64 = 20.0;
 
 /// A resize handle on the selection bounds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -188,6 +191,50 @@ enum EndpointEnd {
     End,
 }
 
+/// A draggable bend on a selected connector's route.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ArrowHandle {
+    /// An existing waypoint, by list index.
+    Waypoint { index: usize, point: Point },
+    /// The midpoint of a route segment; dragging it bows the segment out by
+    /// inserting two waypoints.
+    Insert {
+        point: Point,
+        start: Point,
+        end: Point,
+        insert_at: usize,
+    },
+}
+
+impl ArrowHandle {
+    pub fn point(self) -> Point {
+        match self {
+            ArrowHandle::Waypoint { point, .. } | ArrowHandle::Insert { point, .. } => point,
+        }
+    }
+}
+
+/// What an `ArrowWaypoint` drag is moving.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum WaypointDrag {
+    Existing {
+        index: usize,
+    },
+    /// A segment midpoint: the first real move inserts two waypoints (a bow)
+    /// and then slides them perpendicular to the segment.
+    Bow {
+        start: Point,
+        end: Point,
+        /// Where the pointer grabbed the handle; a click with no movement
+        /// must not change the route.
+        grab: Point,
+        insert_at: usize,
+        /// Filled in after insertion: first waypoint index, and whether the
+        /// segment is horizontal.
+        inserted: Option<(usize, bool)>,
+    },
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 enum Interaction {
     #[default]
@@ -202,6 +249,10 @@ enum Interaction {
     Moving {
         start: Point,
         originals: Vec<Element>,
+        /// Arrows whose endpoints must re-resolve as the drag proceeds,
+        /// found once when the gesture starts so each move stays O(1) in the
+        /// document size.
+        arrow_ids: Vec<ElementId>,
         /// True when the drag began on empty space inside the selection's
         /// bounding box: a click with no movement then clears the selection
         /// instead of moving anything.
@@ -229,6 +280,11 @@ enum Interaction {
         id: ElementId,
         end: EndpointEnd,
     },
+    /// Dragging a bend on a selected connector's route.
+    ArrowWaypoint {
+        id: ElementId,
+        drag: WaypointDrag,
+    },
     /// Dragging a fresh note off a sticky stack; released away from the pile
     /// it becomes a real note, released on the pile it is discarded.
     PullingSticky {
@@ -252,11 +308,19 @@ pub struct Editor {
     pub doc: Document,
     pub camera: Camera,
     pub scene: Scene,
+    /// Spatial index of routing obstacles, kept in sync with `doc`.
+    pub obstacles: ObstacleIndex,
     pub history: History,
     pub nav: NavigationState,
     pub tool: Tool,
     pub tool_locked: bool,
     pub style: Style,
+    /// Whether the optional grid is drawn (view state; the shell persists it).
+    pub grid_visible: bool,
+    /// Whether pointer-driven edits snap to the grid.
+    pub snap_to_grid: bool,
+    /// World-space grid spacing (the snap step when snapping is enabled).
+    pub grid_size: f64,
     pub selection: BTreeSet<ElementId>,
     interaction: Interaction,
     tx: Option<Transaction>,
@@ -279,11 +343,15 @@ impl Editor {
             doc,
             camera: Camera::default(),
             scene: Scene::new(),
+            obstacles: ObstacleIndex::new(),
             history: History::new(),
             nav: NavigationState::new(),
             tool: Tool::default(),
             tool_locked: false,
             style: Style::default(),
+            grid_visible: false,
+            snap_to_grid: false,
+            grid_size: GRID_SIZE,
             selection: BTreeSet::new(),
             interaction: Interaction::Idle,
             tx: None,
@@ -313,15 +381,32 @@ impl Editor {
     /// Select a tool (single-shot: reverts to Select after one use). The
     /// freehand brush is the exception: it stays armed for repeated strokes,
     /// like Excalidraw's freedraw and Miro's pen.
-    pub fn set_tool(&mut self, tool: Tool) {
+    ///
+    /// Switching tools abandons an in-flight gesture: without this a mid-drag
+    /// tool switch would commit a half-drawn element on pointer-up.
+    pub fn set_tool(&mut self, tool: Tool) -> Effects {
+        let mut effects = if self.is_interacting() {
+            self.cancel()
+        } else {
+            Effects::default()
+        };
         self.tool = tool;
         self.tool_locked = tool == Tool::Freehand;
+        effects.overlay_changed = true;
+        effects
     }
 
     /// Select a tool and keep it armed for repeated use.
-    pub fn set_tool_locked(&mut self, tool: Tool) {
+    pub fn set_tool_locked(&mut self, tool: Tool) -> Effects {
+        let mut effects = if self.is_interacting() {
+            self.cancel()
+        } else {
+            Effects::default()
+        };
         self.tool = tool;
         self.tool_locked = true;
+        effects.overlay_changed = true;
+        effects
     }
 
     /// After a finished gesture, single-shot tools hand back to Select.
@@ -363,13 +448,16 @@ impl Editor {
 
     /// Rebuild the whole scene cache.
     pub fn refresh_scene(&mut self) -> Vec<Rect> {
-        self.scene.rebuild_all(&self.doc, self.measurer.as_ref())
+        self.obstacles.rebuild(&self.doc);
+        self.scene
+            .rebuild_all(&self.doc, self.measurer.as_ref(), &self.obstacles)
     }
 
     /// Rebuild the changed elements' layers, returning dirty world rects.
     pub fn rebuild_changed(&mut self, changed: &BTreeSet<ElementId>) -> Vec<Rect> {
+        self.obstacles.apply(&self.doc, changed);
         self.scene
-            .update(&self.doc, changed, self.measurer.as_ref())
+            .update(&self.doc, changed, self.measurer.as_ref(), &self.obstacles)
     }
 
     /// The text measurer in use (for SVG export).
@@ -388,6 +476,35 @@ impl Editor {
 
     fn min_draw_size(&self) -> f64 {
         MIN_DRAW_SIZE_PX / self.camera.zoom
+    }
+
+    /// The nearest grid point when snapping is enabled.
+    fn snap(&self, point: Point) -> Point {
+        if !self.snap_to_grid {
+            return point;
+        }
+        let size = self.grid_size;
+        Point::new(
+            (point.x / size).round() * size,
+            (point.y / size).round() * size,
+        )
+    }
+
+    /// A drag delta adjusted so the moving set's top-left corner lands on the
+    /// grid (relative positions inside the set stay intact).
+    fn snap_delta(&self, originals: &[Element], dx: f64, dy: f64) -> (f64, f64) {
+        if !self.snap_to_grid || originals.is_empty() {
+            return (dx, dy);
+        }
+        let Some(bounds) = originals
+            .iter()
+            .map(|element| element.bounds())
+            .reduce(|a, b| a.union(&b))
+        else {
+            return (dx, dy);
+        };
+        let target = self.snap(Point::new(bounds.x + dx, bounds.y + dy));
+        (target.x - bounds.x, target.y - bounds.y)
     }
 
     // -- selection ---------------------------------------------------------
@@ -471,17 +588,20 @@ impl Editor {
             return Effects::default();
         }
         let world = self.camera.screen_to_world(screen);
+        // Geometry-creating tools snap their anchor; hit-testing tools must
+        // aim at what the user actually pointed at.
+        let spot = self.snap(world);
         match self.tool {
             Tool::Select => self.begin_select(screen, world, mods, now),
-            Tool::Rectangle | Tool::Diamond | Tool::Ellipse => self.begin_drawing(world, now),
-            Tool::Sticky => self.begin_sticky(world, now),
-            Tool::StickyStack => self.begin_sticky_stack(world, now),
-            Tool::Frame => self.begin_frame(world, now),
+            Tool::Rectangle | Tool::Diamond | Tool::Ellipse => self.begin_drawing(spot, now),
+            Tool::Sticky => self.begin_sticky(spot, now),
+            Tool::StickyStack => self.begin_sticky_stack(spot, now),
+            Tool::Frame => self.begin_frame(spot, now),
             Tool::Freehand => self.begin_freehand(world, now),
-            Tool::Line => self.begin_line(world, now),
-            Tool::Arrow => self.begin_connector(world, now),
+            Tool::Line => self.begin_line(spot, now),
+            Tool::Arrow => self.begin_connector(spot, now),
             Tool::Eraser => self.begin_erase(world, now),
-            Tool::Text => self.begin_text_tool(world, now),
+            Tool::Text => self.begin_text_tool(spot, now),
             Tool::Hand => {
                 self.nav.start_pan(screen);
                 Effects::default()
@@ -506,6 +626,98 @@ impl Editor {
             self.interaction = Interaction::Erasing { erased };
             return effects;
         }
+        // Waypoint drags mutate through `&mut self` too: a segment bow is
+        // inserted on the first move, then dragged.
+        if let Interaction::ArrowWaypoint { id, drag } = &self.interaction {
+            let id = id.clone();
+            let mut drag = *drag;
+            let current = self.snap(self.camera.screen_to_world(screen));
+            let effects = Effects {
+                changed: [id.clone()].into_iter().collect(),
+                overlay_changed: true,
+                ..Effects::default()
+            };
+            if let Some(tx) = self.tx.as_mut() {
+                match &mut drag {
+                    WaypointDrag::Existing { index } => {
+                        let target = *index;
+                        let _ = tx.update(&mut self.doc, &id, now, |element| {
+                            if let ElementKind::Arrow { waypoints, .. } = &mut element.kind {
+                                if let Some(slot) = waypoints.get_mut(target) {
+                                    *slot = current;
+                                }
+                            }
+                        });
+                    }
+                    WaypointDrag::Bow {
+                        start,
+                        end,
+                        grab,
+                        insert_at,
+                        inserted,
+                    } => {
+                        // A click that never moved (pointer_up replays a
+                        // zero-distance move) must leave the route alone.
+                        if inserted.is_none() {
+                            if current.distance(*grab) <= 2.0 / self.camera.zoom {
+                                self.interaction = Interaction::ArrowWaypoint { id, drag };
+                                return effects;
+                            }
+                            let horizontal = (end.y - start.y).abs() <= (end.x - start.x).abs();
+                            // Inset inward from each end along the segment, so
+                            // the bow never lands outside the grabbed segment.
+                            let inset = (start.distance(*end) / 4.0).clamp(8.0, 32.0);
+                            let (first, second) = if horizontal {
+                                let dir = if end.x >= start.x { 1.0 } else { -1.0 };
+                                (
+                                    Point::new(start.x + dir * inset, start.y),
+                                    Point::new(end.x - dir * inset, end.y),
+                                )
+                            } else {
+                                let dir = if end.y >= start.y { 1.0 } else { -1.0 };
+                                (
+                                    Point::new(start.x, start.y + dir * inset),
+                                    Point::new(end.x, end.y - dir * inset),
+                                )
+                            };
+                            let existing = self
+                                .doc
+                                .element(&id)
+                                .and_then(|element| match &element.kind {
+                                    ElementKind::Arrow { waypoints, .. } => Some(waypoints.len()),
+                                    _ => None,
+                                })
+                                .unwrap_or(0);
+                            let at = (*insert_at).min(existing);
+                            let _ = tx.update(&mut self.doc, &id, now, |element| {
+                                if let ElementKind::Arrow { waypoints, .. } = &mut element.kind {
+                                    let at = at.min(waypoints.len());
+                                    waypoints.insert(at, first);
+                                    waypoints.insert(at + 1, second);
+                                }
+                            });
+                            *inserted = Some((at, horizontal));
+                        }
+                        let (first, horizontal) = inserted.unwrap_or((0, true));
+                        let _ = tx.update(&mut self.doc, &id, now, |element| {
+                            if let ElementKind::Arrow { waypoints, .. } = &mut element.kind {
+                                for offset in 0..2 {
+                                    if let Some(slot) = waypoints.get_mut(first + offset) {
+                                        if horizontal {
+                                            slot.y = current.y;
+                                        } else {
+                                            slot.x = current.x;
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+            self.interaction = Interaction::ArrowWaypoint { id, drag };
+            return effects;
+        }
         // Hover dots belong to the Select tool alone; while any other
         // interaction is in flight the overlay is owned by that interaction.
         if !matches!(
@@ -521,7 +733,7 @@ impl Editor {
             }
             Interaction::FrameNameEditing { .. } => Effects::default(),
             Interaction::Drawing { id, start } => {
-                let current = self.camera.screen_to_world(screen);
+                let current = self.snap(self.camera.screen_to_world(screen));
                 // A sticky note starts at its default size: a click keeps it,
                 // and only a real drag resizes it.
                 if self.doc.element(id).is_some_and(|e| e.is_sticky())
@@ -554,6 +766,7 @@ impl Editor {
             Interaction::Moving {
                 start,
                 originals,
+                arrow_ids,
                 started_in_selection: _,
             } => {
                 let current = self.camera.screen_to_world(screen);
@@ -561,6 +774,7 @@ impl Editor {
                 if dx.abs() < 1e-9 && dy.abs() < 1e-9 {
                     return Effects::default();
                 }
+                let (dx, dy) = self.snap_delta(originals, dx, dy);
                 let moved_ids: BTreeSet<ElementId> =
                     originals.iter().map(|o| o.id.clone()).collect();
                 let mut effects = Effects::default();
@@ -581,10 +795,11 @@ impl Editor {
                     }
                     effects.changed.insert(original.id.clone());
                 }
-                let updates = self.connected_arrow_updates(&moved_ids);
+                let updates = self.arrow_updates_for(arrow_ids);
+                let mut reflow_targets: BTreeSet<ElementId> = BTreeSet::new();
                 if let Some(tx) = self.tx.as_mut() {
-                    for (arrow_id, start_point, end_point) in updates {
-                        let _ = tx.update(&mut self.doc, &arrow_id, now, |element| {
+                    for (arrow_id, start_point, end_point) in &updates {
+                        let _ = tx.update(&mut self.doc, arrow_id, now, |element| {
                             if let ElementKind::Arrow { start, end, .. } = &mut element.kind {
                                 start.x = start_point.x;
                                 start.y = start_point.y;
@@ -592,7 +807,29 @@ impl Editor {
                                 end.y = end_point.y;
                             }
                         });
-                        effects.changed.insert(arrow_id);
+                        reflow_targets.insert(arrow_id.clone());
+                        effects.changed.insert(arrow_id.clone());
+                    }
+                }
+                // Arrows in the dragged set re-resolve their bound endpoints,
+                // so a rigid translate leaves their labels off the midpoint.
+                for id in &moved_ids {
+                    if self
+                        .doc
+                        .element(id)
+                        .is_some_and(|e| matches!(e.kind, ElementKind::Arrow { .. }))
+                    {
+                        reflow_targets.insert(id.clone());
+                    }
+                }
+                for (text_id, rect) in self.bound_text_reflows(&reflow_targets) {
+                    if let Some(tx) = self.tx.as_mut() {
+                        let _ = tx.update(&mut self.doc, &text_id, now, |element| {
+                            if let ElementKind::Text { rect: r, .. } = &mut element.kind {
+                                *r = rect;
+                            }
+                        });
+                        effects.changed.insert(text_id);
                     }
                 }
                 effects
@@ -603,7 +840,7 @@ impl Editor {
                 bounds,
                 originals,
             } => {
-                let current = self.camera.screen_to_world(screen);
+                let current = self.snap(self.camera.screen_to_world(screen));
                 let target = resized_bounds(*bounds, *handle, *start, current, mods.shift);
                 let mut effects = Effects::default();
                 for original in originals {
@@ -622,6 +859,7 @@ impl Editor {
                 effects
             }
             Interaction::Erasing { .. } => unreachable!("handled above"),
+            Interaction::ArrowWaypoint { .. } => unreachable!("handled above"),
             Interaction::TextEditing { .. } => Effects::default(),
             Interaction::Freehand { id } => {
                 let current = self.camera.screen_to_world(screen);
@@ -653,6 +891,9 @@ impl Editor {
             Interaction::Line { id, start } => {
                 let current = self.camera.screen_to_world(screen);
                 let end = constrain_angle(*start, current, mods.shift);
+                // An angle-constrained end is already intentional; snapping it
+                // would shear the angle.
+                let end = if mods.shift { end } else { self.snap(end) };
                 if let Some(tx) = self.tx.as_mut() {
                     let _ = tx.update(&mut self.doc, id, now, |element| {
                         if let ElementKind::Arrow { end: e, .. } = &mut element.kind {
@@ -673,7 +914,9 @@ impl Editor {
                         ElementKind::Arrow { start, .. } => Some(start.point()),
                         _ => None,
                     });
-                let candidate = self.node_hit(current, Some(id.as_str())).or_else(|| {
+                let node = self.node_hit(current, Some(id.as_str()));
+                let explicit = node.is_some();
+                let candidate = node.or_else(|| {
                     connector::binding_candidate(
                         &self.doc,
                         current,
@@ -693,21 +936,65 @@ impl Editor {
                             point,
                             Some(Binding {
                                 element_id: target_id.clone(),
-                                focus: Some(side.focus()),
+                                // A node grab picks the side explicitly; a
+                                // body drop keeps re-anchoring toward the
+                                // other endpoint so the route never cuts back
+                                // through the shape it binds to.
+                                focus: explicit.then(|| side.focus()),
                             }),
                             Some((target_id, anchors)),
                         )
                     }
-                    None => (current, None, None),
+                    None => (self.snap(current), None, None),
                 };
                 self.hover_anchors = hover;
                 let _ = start;
+                // Store the resolved anchor, not the heuristic one: endpoint
+                // coordinates must describe the drawn geometry so bounds(),
+                // endpoint handles and selection math stay honest.
+                let stored_end = {
+                    let other = self
+                        .doc
+                        .element(id)
+                        .and_then(|element| match &element.kind {
+                            ElementKind::Arrow { start, .. } => Some(start.point()),
+                            _ => None,
+                        });
+                    match (&binding, other) {
+                        (Some(binding), Some(other)) => {
+                            let ep = crate::model::Endpoint {
+                                x: end.x,
+                                y: end.y,
+                                binding: Some(binding.clone()),
+                            };
+                            connector::resolve_endpoint(&ep, other, &self.doc).0
+                        }
+                        _ => end,
+                    }
+                };
+                // Now that the end has a real position, the bound start's
+                // stored point re-resolves against it — the anchor it picked
+                // while the pointer still stood inside the source element is
+                // not the side that faces the destination.
+                let stored_start = self
+                    .doc
+                    .element(id)
+                    .and_then(|element| match &element.kind {
+                        ElementKind::Arrow { start, .. } if start.binding.is_some() => {
+                            Some(connector::resolve_endpoint(start, stored_end, &self.doc).0)
+                        }
+                        _ => None,
+                    });
                 if let Some(tx) = self.tx.as_mut() {
                     let _ = tx.update(&mut self.doc, id, now, |element| {
-                        if let ElementKind::Arrow { end: e, .. } = &mut element.kind {
-                            e.x = end.x;
-                            e.y = end.y;
+                        if let ElementKind::Arrow { start, end: e, .. } = &mut element.kind {
+                            e.x = stored_end.x;
+                            e.y = stored_end.y;
                             e.binding = binding.clone();
+                            if let Some(p) = stored_start {
+                                start.x = p.x;
+                                start.y = p.y;
+                            }
                         }
                     });
                 }
@@ -734,7 +1021,9 @@ impl Editor {
                         }),
                         _ => None,
                     });
-                let candidate = self.node_hit(current, Some(&id)).or_else(|| {
+                let node = self.node_hit(current, Some(&id));
+                let explicit = node.is_some();
+                let candidate = node.or_else(|| {
                     connector::binding_candidate(&self.doc, current, tolerance, approach, Some(&id))
                 });
                 let (point, binding, hover) = match candidate {
@@ -748,27 +1037,63 @@ impl Editor {
                             point,
                             Some(Binding {
                                 element_id: target_id.clone(),
-                                focus: Some(side.focus()),
+                                focus: explicit.then(|| side.focus()),
                             }),
                             Some((target_id, anchors)),
                         )
                     }
-                    None => (current, None, None),
+                    None => (self.snap(current), None, None),
                 };
                 self.hover_anchors = hover;
+                // Store the resolved anchor so endpoint coordinates describe
+                // the drawn geometry (see the Connecting arm).
+                let stored_point = match (&binding, approach) {
+                    (Some(binding), Some(other)) => {
+                        let ep = crate::model::Endpoint {
+                            x: point.x,
+                            y: point.y,
+                            binding: Some(binding.clone()),
+                        };
+                        connector::resolve_endpoint(&ep, other, &self.doc).0
+                    }
+                    _ => point,
+                };
+                // A rebind can re-anchor the untouched bound end too — its
+                // stored point must track the new opposite anchor.
+                let stored_other = self
+                    .doc
+                    .element(&id)
+                    .and_then(|element| match &element.kind {
+                        ElementKind::Arrow {
+                            start, end: tail, ..
+                        } => {
+                            let other_ep = match end {
+                                EndpointEnd::Start => tail,
+                                EndpointEnd::End => start,
+                            };
+                            other_ep.binding.as_ref().map(|_| {
+                                connector::resolve_endpoint(other_ep, stored_point, &self.doc).0
+                            })
+                        }
+                        _ => None,
+                    });
                 if let Some(tx) = self.tx.as_mut() {
                     let _ = tx.update(&mut self.doc, &id, now, |element| {
                         if let ElementKind::Arrow {
                             start, end: tail, ..
                         } = &mut element.kind
                         {
-                            let endpoint = match end {
-                                EndpointEnd::Start => start,
-                                EndpointEnd::End => tail,
+                            let (endpoint, other_ep) = match end {
+                                EndpointEnd::Start => (start, tail),
+                                EndpointEnd::End => (tail, start),
                             };
-                            endpoint.x = point.x;
-                            endpoint.y = point.y;
+                            endpoint.x = stored_point.x;
+                            endpoint.y = stored_point.y;
                             endpoint.binding = binding.clone();
+                            if let Some(p) = stored_other {
+                                other_ep.x = p.x;
+                                other_ep.y = p.y;
+                            }
                         }
                     });
                 }
@@ -779,7 +1104,7 @@ impl Editor {
                 }
             }
             Interaction::PullingSticky { id, .. } => {
-                let current = self.camera.screen_to_world(screen);
+                let current = self.snap(self.camera.screen_to_world(screen));
                 let size = self
                     .doc
                     .element(id)
@@ -816,6 +1141,7 @@ impl Editor {
             | Interaction::Resizing { .. }
             | Interaction::Connecting { .. }
             | Interaction::ArrowEndpoint { .. }
+            | Interaction::ArrowWaypoint { .. }
             | Interaction::PullingSticky { .. }
             | Interaction::Line { .. } => {
                 self.interaction = interaction;
@@ -928,24 +1254,30 @@ impl Editor {
                     .as_ref()
                     .map(|tx| tx.deltas().iter().map(|d| d.element_id().clone()).collect())
                     .unwrap_or_default();
-                let reflows = self.bound_text_reflows(&changed);
-                let arrow_updates = self.connected_arrow_updates(&changed);
                 self.sync_frame_membership(now);
+                // Bound arrows re-resolve against the resized elements first —
+                // their labels reflow only after the new geometry is in place.
+                let arrow_updates = self.connected_arrow_updates(&changed);
+                let mut reflow_targets = changed.clone();
                 if let Some(tx) = self.tx.as_mut() {
-                    for (text_id, rect) in &reflows {
-                        let _ = tx.update(&mut self.doc, text_id, now, |element| {
-                            if let ElementKind::Text { rect: r, .. } = &mut element.kind {
-                                *r = *rect;
-                            }
-                        });
-                    }
                     for (arrow_id, start_point, end_point) in arrow_updates {
+                        reflow_targets.insert(arrow_id.clone());
                         let _ = tx.update(&mut self.doc, &arrow_id, now, |element| {
                             if let ElementKind::Arrow { start, end, .. } = &mut element.kind {
                                 start.x = start_point.x;
                                 start.y = start_point.y;
                                 end.x = end_point.x;
                                 end.y = end_point.y;
+                            }
+                        });
+                    }
+                }
+                let reflows = self.bound_text_reflows(&reflow_targets);
+                if let Some(tx) = self.tx.as_mut() {
+                    for (text_id, rect) in &reflows {
+                        let _ = tx.update(&mut self.doc, text_id, now, |element| {
+                            if let ElementKind::Text { rect: r, .. } = &mut element.kind {
+                                *r = *rect;
                             }
                         });
                     }
@@ -1110,7 +1442,7 @@ impl Editor {
                     effects.merge(selection_effects);
                 }
             }
-            Interaction::ArrowEndpoint { id, .. } => {
+            Interaction::ArrowEndpoint { id, .. } | Interaction::ArrowWaypoint { id, .. } => {
                 self.hover_anchors = None;
                 // The connector's label rides along its new geometry.
                 let reflows = self.bound_text_reflows(&[id.clone()].into_iter().collect());
@@ -1148,6 +1480,34 @@ impl Editor {
             return Effects::default();
         }
         let world = self.camera.screen_to_world(screen);
+        // Double-clicking a bend removes it.
+        if let Some((id, ArrowHandle::Waypoint { index, .. })) = self.arrow_handle_at(world) {
+            let mut tx = Transaction::begin();
+            if let Err(err) = tx.update(&mut self.doc, &id, now, |element| {
+                if let ElementKind::Arrow { waypoints, .. } = &mut element.kind {
+                    if index < waypoints.len() {
+                        waypoints.remove(index);
+                    }
+                }
+            }) {
+                debug_assert!(false, "waypoint removal failed: {err}");
+            }
+            let mut changed: BTreeSet<ElementId> = [id.clone()].into_iter().collect();
+            for (text_id, rect) in self.bound_text_reflows(&changed) {
+                let _ = tx.update(&mut self.doc, &text_id, now, |element| {
+                    if let ElementKind::Text { rect: r, .. } = &mut element.kind {
+                        *r = rect;
+                    }
+                });
+                changed.insert(text_id);
+            }
+            tx.commit(&mut self.history);
+            return Effects {
+                changed,
+                overlay_changed: true,
+                ..Effects::default()
+            };
+        }
         let tolerance = self.tolerance();
         let Some(id) = hit_test_raw(&self.doc, world, tolerance) else {
             return Effects::default();
@@ -1201,15 +1561,21 @@ impl Editor {
             _ => return Effects::default(),
         };
         match target {
-            Target::Existing(id)
-            | Target::Bound {
-                existing: Some(id), ..
-            } => self.begin_text_edit(self.doc.element(&id).cloned(), now),
+            Target::Existing(id) => self.begin_text_edit(self.doc.element(&id).cloned(), now),
             Target::Bound {
                 container,
                 rect,
-                existing: None,
-            } => self.create_bound_text(container, rect, now),
+                existing,
+            } => {
+                // A dangling link (corrupted document, abandoned draft) heals
+                // by creating a fresh bound text instead of editing nothing.
+                match existing
+                    .and_then(|id| self.doc.element(&id).filter(|e| !e.is_deleted).map(|_| id))
+                {
+                    Some(id) => self.begin_text_edit(self.doc.element(&id).cloned(), now),
+                    None => self.create_bound_text(container, rect, now),
+                }
+            }
             Target::Frame { id, rect, name } => {
                 self.interaction = Interaction::FrameNameEditing { id: id.clone() };
                 let top_left = self
@@ -1276,7 +1642,19 @@ impl Editor {
             _ => return Effects::default(),
         };
         match existing {
-            Some(text_id) => self.begin_text_edit(self.doc.element(&text_id).cloned(), now),
+            Some(text_id) => {
+                // A dangling link (corrupted document, abandoned draft) heals
+                // here: treat it like no link and create a fresh bound text.
+                match self
+                    .doc
+                    .element(&text_id)
+                    .filter(|element| !element.is_deleted)
+                    .cloned()
+                {
+                    Some(element) => self.begin_text_edit(Some(element), now),
+                    None => self.create_bound_text(container_id, rect, now),
+                }
+            }
             None => self.create_bound_text(container_id, rect, now),
         }
     }
@@ -1534,9 +1912,18 @@ impl Editor {
                     }
                 }
                 None => {
-                    let purged = self.doc.element(id).cloned();
-                    if let Some(element) = purged {
-                        let _ = self.doc.apply(&Delta::Purge { element });
+                    // Abandon the whole draft transaction: reverting drops the
+                    // fresh text AND the container link it created (bound
+                    // text/caption/label), so no dangling bound_text_id is
+                    // left and nothing lands in history.
+                    match tx {
+                        Some(tx) => effects.changed.extend(self.revert_transaction(&tx)),
+                        None => {
+                            if let Some(element) = self.doc.element(id).cloned() {
+                                let _ = self.doc.apply(&Delta::Purge { element });
+                            }
+                            self.unlink_dead_reference(id);
+                        }
                     }
                     self.selection.remove(id);
                 }
@@ -1612,9 +1999,17 @@ impl Editor {
                 start,
                 end,
                 routing,
+                waypoints,
                 ..
             } => {
-                let points = connector::route(start, end, *routing, &self.doc);
+                let points = connector::route_avoiding(
+                    start,
+                    end,
+                    *routing,
+                    waypoints,
+                    &self.doc,
+                    &self.obstacles,
+                );
                 let mid = connector::point_at(&points, 0.5);
                 let width = if rect.w > 1.0 { rect.w } else { 100.0 };
                 Some(Rect::new(
@@ -1643,9 +2038,10 @@ impl Editor {
             unreachable!("checked above");
         };
         let original = *original;
-        self.tx = None;
+        let mut changed: BTreeSet<ElementId> = [id.clone()].into_iter().collect();
         match original {
             Some(orig) => {
+                self.tx = None;
                 if let Some(current) = self.doc.element(&id).cloned() {
                     let _ = self.doc.apply(&Delta::Update {
                         before: current,
@@ -1653,17 +2049,66 @@ impl Editor {
                     });
                 }
             }
-            None => {
-                let purged = self.doc.element(&id).cloned();
-                if let Some(element) = purged {
-                    let _ = self.doc.apply(&Delta::Purge { element });
+            None => match self.tx.take() {
+                Some(tx) => changed.extend(self.revert_transaction(&tx)),
+                None => {
+                    if let Some(element) = self.doc.element(&id).cloned() {
+                        let _ = self.doc.apply(&Delta::Purge { element });
+                    }
+                    self.unlink_dead_reference(&id);
                 }
-            }
+            },
         }
         Effects {
-            changed: [id].into_iter().collect(),
+            changed,
             overlay_changed: true,
             ..Effects::default()
+        }
+    }
+
+    /// Revert an abandoned transaction against the live document, returning
+    /// the ids it touched. Drafts are thrown away this way so every element
+    /// they created or modified is restored together.
+    fn revert_transaction(&mut self, tx: &Transaction) -> BTreeSet<ElementId> {
+        let changed: BTreeSet<ElementId> = tx
+            .deltas()
+            .iter()
+            .map(|delta| delta.element_id().clone())
+            .collect();
+        for delta in tx.deltas().iter().rev() {
+            let _ = self.doc.apply(&delta.invert());
+        }
+        changed
+    }
+
+    /// Clear any container's bound-text link that points at `id`. The
+    /// transactional paths can't leave these dangling; this is a defensive
+    /// fallback for edits that bypass history.
+    fn unlink_dead_reference(&mut self, id: &str) {
+        let owners: Vec<ElementId> = self
+            .doc
+            .elements
+            .values()
+            .filter(|element| match &element.kind {
+                ElementKind::Shape { bound_text_id, .. } => bound_text_id.as_deref() == Some(id),
+                ElementKind::Glyph { caption_id, .. } => caption_id.as_deref() == Some(id),
+                ElementKind::Arrow { label_id, .. } => label_id.as_deref() == Some(id),
+                _ => false,
+            })
+            .map(|element| element.id.clone())
+            .collect();
+        for owner_id in owners {
+            let Some(before) = self.doc.element(&owner_id).cloned() else {
+                continue;
+            };
+            let mut after = before.clone();
+            match &mut after.kind {
+                ElementKind::Shape { bound_text_id, .. } => *bound_text_id = None,
+                ElementKind::Glyph { caption_id, .. } => *caption_id = None,
+                ElementKind::Arrow { label_id, .. } => *label_id = None,
+                _ => {}
+            }
+            let _ = self.doc.apply(&Delta::Update { before, after });
         }
     }
 
@@ -1697,13 +2142,12 @@ impl Editor {
                 if let Some(tool) = Tool::from_shortcut(key) {
                     if tool == self.tool {
                         self.tool_locked = !self.tool_locked;
-                    } else {
-                        self.set_tool(tool);
+                        return Effects {
+                            overlay_changed: true,
+                            ..Effects::default()
+                        };
                     }
-                    return Effects {
-                        overlay_changed: true,
-                        ..Effects::default()
-                    };
+                    return self.set_tool(tool);
                 }
                 Effects::default()
             }
@@ -1711,6 +2155,9 @@ impl Editor {
     }
 
     fn nudge_step(&self, mods: Modifiers) -> f64 {
+        if self.snap_to_grid {
+            return self.grid_size;
+        }
         if mods.shift {
             10.0 / self.camera.zoom
         } else {
@@ -1749,7 +2196,8 @@ impl Editor {
             },
             Interaction::Moving { .. }
             | Interaction::Resizing { .. }
-            | Interaction::ArrowEndpoint { .. } => {
+            | Interaction::ArrowEndpoint { .. }
+            | Interaction::ArrowWaypoint { .. } => {
                 self.hover_anchors = None;
                 if let Some(tx) = self.tx.take() {
                     for delta in tx.deltas().iter().rev() {
@@ -1806,9 +2254,10 @@ impl Editor {
                 }
             }
             Interaction::TextEditing { id, original } => {
-                self.tx = None;
+                let mut changed: BTreeSet<ElementId> = [id.clone()].into_iter().collect();
                 match *original {
                     Some(orig) => {
+                        self.tx = None;
                         if let Some(current) = self.doc.element(&id).cloned() {
                             let _ = self.doc.apply(&Delta::Update {
                                 before: current,
@@ -1816,15 +2265,18 @@ impl Editor {
                             });
                         }
                     }
-                    None => {
-                        let purged = self.doc.element(&id).cloned();
-                        if let Some(element) = purged {
-                            let _ = self.doc.apply(&Delta::Purge { element });
+                    None => match self.tx.take() {
+                        Some(tx) => changed.extend(self.revert_transaction(&tx)),
+                        None => {
+                            if let Some(element) = self.doc.element(&id).cloned() {
+                                let _ = self.doc.apply(&Delta::Purge { element });
+                            }
+                            self.unlink_dead_reference(&id);
                         }
-                    }
+                    },
                 }
                 Effects {
-                    changed: [id].into_iter().collect(),
+                    changed,
                     overlay_changed: true,
                     ..Effects::default()
                 }
@@ -1919,15 +2371,42 @@ impl Editor {
                     ..Effects::default()
                 };
             }
+            // A bend on a selected connector: drag it to reshape the path.
+            if let Some((id, handle)) = self.arrow_handle_at(world) {
+                self.tx = Some(Transaction::begin());
+                let drag = match handle {
+                    ArrowHandle::Waypoint { index, .. } => WaypointDrag::Existing { index },
+                    ArrowHandle::Insert {
+                        start,
+                        end,
+                        insert_at,
+                        ..
+                    } => WaypointDrag::Bow {
+                        start,
+                        end,
+                        grab: world,
+                        insert_at,
+                        inserted: None,
+                    },
+                };
+                self.interaction = Interaction::ArrowWaypoint { id, drag };
+                return Effects {
+                    overlay_changed: true,
+                    ..Effects::default()
+                };
+            }
             // A lone connector's shaft: begin Moving directly. Otherwise the
             // click lands on the degenerate bounding box's edge handles —
             // and resizing a zero-height or zero-width box is a no-op, so the
             // arrow would seem glued in place.
             if let Some(originals) = self.lone_arrow_shaft_hit(world) {
+                let arrow_ids =
+                    self.arrows_touching(&originals.iter().map(|e| e.id.clone()).collect());
                 self.tx = Some(Transaction::begin());
                 self.interaction = Interaction::Moving {
                     start: world,
                     originals,
+                    arrow_ids,
                     started_in_selection: false,
                 };
                 return Effects {
@@ -1988,10 +2467,13 @@ impl Editor {
                     self.selection = [id].into_iter().collect();
                 }
                 let originals: Vec<Element> = self.selection_with_followers();
+                let arrow_ids =
+                    self.arrows_touching(&originals.iter().map(|e| e.id.clone()).collect());
                 self.tx = Some(Transaction::begin());
                 self.interaction = Interaction::Moving {
                     start: world,
                     originals,
+                    arrow_ids,
                     started_in_selection: false,
                 };
                 Effects {
@@ -2006,10 +2488,14 @@ impl Editor {
                 if !mods.shift && !self.selection.is_empty() {
                     if let Some(bounds) = self.selection_bounds() {
                         if bounds.contains(world) {
+                            let originals = self.selection_with_followers();
+                            let arrow_ids = self
+                                .arrows_touching(&originals.iter().map(|e| e.id.clone()).collect());
                             self.tx = Some(Transaction::begin());
                             self.interaction = Interaction::Moving {
                                 start: world,
-                                originals: self.selection_with_followers(),
+                                originals,
+                                arrow_ids,
                                 started_in_selection: true,
                             };
                             return Effects {
@@ -2107,13 +2593,7 @@ impl Editor {
     /// except connectors themselves and the stacks (which are sources, not
     /// targets).
     fn is_connectable(element: &Element) -> bool {
-        matches!(
-            element.kind,
-            ElementKind::Shape { .. }
-                | ElementKind::Glyph { .. }
-                | ElementKind::Text { .. }
-                | ElementKind::Frame { .. }
-        )
+        element.is_bind_target()
     }
 
     /// The connection node of a bindable element under `world`, if any.
@@ -2127,10 +2607,20 @@ impl Editor {
         let grab = self.node_grab();
         let mut best: Option<&Element> = None;
         for element in self.doc.elements.values() {
-            if element.is_deleted
-                || !Self::is_connectable(element)
-                || exclude == Some(element.id.as_str())
-            {
+            if element.is_deleted || exclude == Some(element.id.as_str()) {
+                continue;
+            }
+            // Bound text is not a node source, but it still occludes the
+            // nodes that float over its container — a click on a label
+            // selects the container instead of pulling a connector.
+            let is_bound_text = matches!(
+                element.kind,
+                ElementKind::Text {
+                    container_id: Some(_),
+                    ..
+                }
+            );
+            if !Self::is_connectable(element) && !is_bound_text {
                 continue;
             }
             if !element.bounds().expand(reach).contains(world) {
@@ -2144,6 +2634,9 @@ impl Editor {
             }
         }
         let element = best?;
+        if !Self::is_connectable(element) {
+            return None;
+        }
         let (side, anchor) = connector::anchor_points(element.bounds())
             .into_iter()
             .find(|(side, anchor)| self.node_position(*side, *anchor).distance(world) <= grab)?;
@@ -2229,6 +2722,74 @@ impl Editor {
     /// Whether the pointer is offering to pull a note off a stack.
     pub fn stack_pull_hover(&self) -> bool {
         self.hover_stack.is_some()
+    }
+
+    /// Draggable bends on the selected lone connector: one handle per
+    /// existing waypoint, plus an insert handle on every segment long enough
+    /// to aim at.
+    pub fn arrow_path_handles(&self) -> Vec<ArrowHandle> {
+        let Some(element) = self.lone_arrow() else {
+            return Vec::new();
+        };
+        let ElementKind::Arrow {
+            start,
+            end,
+            routing,
+            waypoints,
+            ..
+        } = &element.kind
+        else {
+            return Vec::new();
+        };
+        let route =
+            connector::route_avoiding(start, end, *routing, waypoints, &self.doc, &self.obstacles);
+        let mut handles: Vec<ArrowHandle> = waypoints
+            .iter()
+            .enumerate()
+            .map(|(index, point)| ArrowHandle::Waypoint {
+                index,
+                point: *point,
+            })
+            .collect();
+        let min_segment = 24.0 / self.camera.zoom;
+        // On a multi-segment elbow the first and last segments leave the
+        // anchors themselves; bowing them can only double the route back on
+        // itself. Only interior runs offer insert handles.
+        let interior_only = route.len() > 2;
+        for (index, segment) in route.windows(2).enumerate() {
+            if segment[0].distance(segment[1]) < min_segment {
+                continue;
+            }
+            if interior_only && (index == 0 || index + 2 == route.len()) {
+                continue;
+            }
+            let point = segment[0].lerp(segment[1], 0.5);
+            handles.push(ArrowHandle::Insert {
+                point,
+                start: segment[0],
+                end: segment[1],
+                insert_at: connector::waypoint_insertion_index(&route, waypoints, point),
+            });
+        }
+        handles
+    }
+
+    fn lone_arrow(&self) -> Option<&Element> {
+        if self.selection.len() != 1 {
+            return None;
+        }
+        let element = self.doc.element(self.selection.iter().next()?)?;
+        matches!(element.kind, ElementKind::Arrow { .. }).then_some(element)
+    }
+
+    fn arrow_handle_at(&self, world: Point) -> Option<(ElementId, ArrowHandle)> {
+        let element = self.lone_arrow()?;
+        let grab = HANDLE_HIT_PX / self.camera.zoom;
+        let handle = self
+            .arrow_path_handles()
+            .into_iter()
+            .find(|handle| handle.point().distance(world) <= grab)?;
+        Some((element.id.clone(), handle))
     }
 
     /// When the selection is a lone connector, which endpoint `world` grabs.
@@ -2474,7 +3035,12 @@ impl Editor {
         if let Err(err) = tx.add(&mut self.doc, element) {
             debug_assert!(false, "sticky stack add failed: {err}");
         }
-        tx.commit(&mut self.history);
+        self.tx = Some(tx);
+        // A stack placed inside a frame belongs to it like any note.
+        self.sync_frame_membership(now);
+        if let Some(tx) = self.tx.take() {
+            tx.commit(&mut self.history);
+        }
         self.selection = [id.clone()].into_iter().collect();
         self.finish_tool_use();
         Effects {
@@ -2618,17 +3184,26 @@ impl Editor {
 
     fn begin_connector(&mut self, world: Point, now: u64) -> Effects {
         let tolerance = self.tolerance().max(4.0);
-        let candidate = self
-            .node_hit(world, None)
-            .or_else(|| connector::binding_candidate(&self.doc, world, tolerance, None, None));
+        let node = self.node_hit(world, None);
+        let explicit = node.is_some();
+        let candidate =
+            node.or_else(|| connector::binding_candidate(&self.doc, world, tolerance, None, None));
         let (start_point, start_binding) = match candidate {
-            Some((target_id, side, point)) => (
-                point,
-                Some(Binding {
+            Some((target_id, side, point)) => {
+                let binding = Binding {
                     element_id: target_id,
-                    focus: Some(side.focus()),
-                }),
-            ),
+                    focus: explicit.then(|| side.focus()),
+                };
+                // Store the resolved anchor so endpoint coordinates describe
+                // the drawn geometry (see the Connecting arm).
+                let ep = crate::model::Endpoint {
+                    x: point.x,
+                    y: point.y,
+                    binding: Some(binding.clone()),
+                };
+                let (resolved, _) = connector::resolve_endpoint(&ep, world, &self.doc);
+                (resolved, Some(binding))
+            }
             None => (world, None),
         };
         self.begin_connector_bound(start_point, start_binding, world, now)
@@ -2672,6 +3247,7 @@ impl Editor {
                 start_arrowhead: false,
                 end_arrowhead: true,
                 style: self.style.clone(),
+                waypoints: Vec::new(),
                 label_id: None,
             },
             self.next_index(),
@@ -2718,19 +3294,18 @@ impl Editor {
             .collect()
     }
 
-    /// New endpoint positions for arrows connected to the given elements.
+    /// Arrows whose endpoints re-resolve when the given elements move: arrows
+    /// bound to them, and moved arrows that carry bindings of their own.
     ///
-    /// One pass over the document, not one pass per moved element.
-    fn connected_arrow_updates(
-        &self,
-        moved: &BTreeSet<ElementId>,
-    ) -> Vec<(ElementId, Point, Point)> {
-        let mut updates = Vec::new();
+    /// One pass over the document — call this once per gesture, never per
+    /// pointer move (on a large board the pass is the expensive part).
+    fn arrows_touching(&self, moved: &BTreeSet<ElementId>) -> Vec<ElementId> {
+        let mut arrows = Vec::new();
         for element in self.doc.elements.values() {
             let ElementKind::Arrow { start, end, .. } = &element.kind else {
                 continue;
             };
-            if element.is_deleted || moved.contains(&element.id) {
+            if element.is_deleted {
                 continue;
             }
             let binds_moved = |endpoint: &Endpoint| {
@@ -2739,14 +3314,41 @@ impl Editor {
                     .as_ref()
                     .is_some_and(|b| moved.contains(&b.element_id))
             };
-            if !binds_moved(start) && !binds_moved(end) {
-                continue;
+            // A moved arrow with bindings needs a post-translate resolve too:
+            // its bound endpoints were glued mid-transaction, possibly against
+            // elements that had not moved yet.
+            let moved_bound =
+                moved.contains(&element.id) && (start.binding.is_some() || end.binding.is_some());
+            if binds_moved(start) || binds_moved(end) || moved_bound {
+                arrows.push(element.id.clone());
             }
+        }
+        arrows
+    }
+
+    /// Fresh endpoint positions for the given arrows.
+    fn arrow_updates_for(&self, arrow_ids: &[ElementId]) -> Vec<(ElementId, Point, Point)> {
+        let mut updates = Vec::with_capacity(arrow_ids.len());
+        for id in arrow_ids {
+            let Some(element) = self.doc.element(id) else {
+                continue;
+            };
+            let ElementKind::Arrow { start, end, .. } = &element.kind else {
+                continue;
+            };
             let (s, _) = connector::resolve_endpoint(start, end.point(), &self.doc);
             let (e, _) = connector::resolve_endpoint(end, start.point(), &self.doc);
-            updates.push((element.id.clone(), s, e));
+            updates.push((id.clone(), s, e));
         }
         updates
+    }
+
+    /// New endpoint positions for arrows connected to the given elements.
+    fn connected_arrow_updates(
+        &self,
+        moved: &BTreeSet<ElementId>,
+    ) -> Vec<(ElementId, Point, Point)> {
+        self.arrow_updates_for(&self.arrows_touching(moved))
     }
 
     /// Frame membership updates needed after the given elements moved.
@@ -2769,7 +3371,7 @@ impl Editor {
             let Some(element) = self.doc.element(id) else {
                 continue;
             };
-            if element.is_deleted || element.is_frame() {
+            if element.is_deleted {
                 continue;
             }
             if let ElementKind::Text {
@@ -2779,7 +3381,13 @@ impl Editor {
             {
                 continue;
             }
-            let target = smallest_frame_containing(&frames, element.bounds().center());
+            let target = if element.is_frame() {
+                // A nested frame is owned by the smallest frame that strictly
+                // contains it; strict containment keeps the hierarchy acyclic.
+                smallest_frame_strictly_containing(&frames, element)
+            } else {
+                smallest_frame_containing(&frames, element.bounds().center())
+            };
             if element.frame_id != target {
                 out.push((id.clone(), target));
             }
@@ -2814,6 +3422,7 @@ impl Editor {
                 start_arrowhead: false,
                 end_arrowhead: arrowhead,
                 style: self.style.clone(),
+                waypoints: Vec::new(),
                 label_id: None,
             },
             self.next_index(),
@@ -2862,13 +3471,6 @@ impl Editor {
     }
 
     // -- commands ----------------------------------------------------------
-
-    fn selected_elements(&self) -> Vec<Element> {
-        self.selection
-            .iter()
-            .filter_map(|id| self.doc.element(id).cloned())
-            .collect()
-    }
 
     /// Elements that always travel with this element: bound text, frame
     /// children.
@@ -2943,7 +3545,7 @@ impl Editor {
         if self.selection.is_empty() || self.interaction != Interaction::Idle {
             return Effects::default();
         }
-        let originals = self.selected_elements();
+        let originals = self.selection_with_followers();
         let mut tx = Transaction::begin();
         let mut effects = Effects::default();
         for original in &originals {
@@ -2958,7 +3560,9 @@ impl Editor {
             effects.changed.insert(original.id.clone());
         }
         let moved_ids: BTreeSet<ElementId> = originals.iter().map(|o| o.id.clone()).collect();
+        let mut reflow_targets: BTreeSet<ElementId> = BTreeSet::new();
         for (arrow_id, start_point, end_point) in self.connected_arrow_updates(&moved_ids) {
+            reflow_targets.insert(arrow_id.clone());
             let _ = tx.update(&mut self.doc, &arrow_id, now, |element| {
                 if let ElementKind::Arrow { start, end, .. } = &mut element.kind {
                     start.x = start_point.x;
@@ -2968,6 +3572,25 @@ impl Editor {
                 }
             });
             effects.changed.insert(arrow_id);
+        }
+        // Arrows in the nudged set re-resolve bound endpoints, so their labels
+        // need a midpoint reflow rather than the rigid translate they got.
+        for id in &moved_ids {
+            if self
+                .doc
+                .element(id)
+                .is_some_and(|e| matches!(e.kind, ElementKind::Arrow { .. }))
+            {
+                reflow_targets.insert(id.clone());
+            }
+        }
+        for (text_id, rect) in self.bound_text_reflows(&reflow_targets) {
+            let _ = tx.update(&mut self.doc, &text_id, now, |element| {
+                if let ElementKind::Text { rect: r, .. } = &mut element.kind {
+                    *r = rect;
+                }
+            });
+            effects.changed.insert(text_id);
         }
         tx.commit(&mut self.history);
         effects
@@ -3208,7 +3831,13 @@ fn translate_element_keeping_bindings(doc: &Document, element: &mut Element, dx:
         translate_element(element, dx, dy);
         return;
     }
-    let ElementKind::Arrow { start, end, .. } = &mut element.kind else {
+    let ElementKind::Arrow {
+        start,
+        end,
+        waypoints,
+        ..
+    } = &mut element.kind
+    else {
         return;
     };
     if start.binding.is_none() {
@@ -3218,6 +3847,12 @@ fn translate_element_keeping_bindings(doc: &Document, element: &mut Element, dx:
     if end.binding.is_none() {
         end.x += dx;
         end.y += dy;
+    }
+    // Waypoints are authored bends: they ride the drag whichever ends are
+    // bound, so a bound connector's path can still be repositioned.
+    for waypoint in waypoints.iter_mut() {
+        waypoint.x += dx;
+        waypoint.y += dy;
     }
     if start.binding.is_some() {
         let other = Point::new(end.x, end.y);
@@ -3250,11 +3885,20 @@ pub fn translate_element(element: &mut Element, dx: f64, dy: f64) {
                 p.y += dy;
             }
         }
-        ElementKind::Arrow { start, end, .. } => {
+        ElementKind::Arrow {
+            start,
+            end,
+            waypoints,
+            ..
+        } => {
             start.x += dx;
             start.y += dy;
             end.x += dx;
             end.y += dy;
+            for waypoint in waypoints.iter_mut() {
+                waypoint.x += dx;
+                waypoint.y += dy;
+            }
         }
     }
 }
@@ -3285,7 +3929,12 @@ pub fn scale_element(element: &mut Element, from: Rect, to: Rect) {
                 *p = map(*p);
             }
         }
-        ElementKind::Arrow { start, end, .. } => {
+        ElementKind::Arrow {
+            start,
+            end,
+            waypoints,
+            ..
+        } => {
             let s = map(Point::new(start.x, start.y));
             let e = map(Point::new(end.x, end.y));
             *start = crate::model::Endpoint {
@@ -3298,6 +3947,9 @@ pub fn scale_element(element: &mut Element, from: Rect, to: Rect) {
                 y: e.y,
                 binding: end.binding.clone(),
             };
+            for waypoint in waypoints.iter_mut() {
+                *waypoint = map(*waypoint);
+            }
         }
     }
 }
@@ -3307,6 +3959,31 @@ fn smallest_frame_containing(frames: &[(&str, Rect)], point: Point) -> Option<El
     let mut best: Option<(f64, &str)> = None;
     for (id, rect) in frames {
         if rect.contains(point) {
+            let area = rect.w * rect.h;
+            if best.as_ref().map(|(a, _)| area < *a).unwrap_or(true) {
+                best = Some((area, id));
+            }
+        }
+    }
+    best.map(|(_, id)| id.to_string())
+}
+
+/// The smallest frame that strictly contains `element`'s bounds — the parent
+/// of a nested frame. Strict containment (equal rects don't count) keeps
+/// frame parentage acyclic: two frames can never own each other.
+fn smallest_frame_strictly_containing(
+    frames: &[(&str, Rect)],
+    element: &Element,
+) -> Option<ElementId> {
+    let bounds = element.bounds();
+    let min = Point::new(bounds.min_x(), bounds.min_y());
+    let max = Point::new(bounds.max_x(), bounds.max_y());
+    let mut best: Option<(f64, &str)> = None;
+    for (id, rect) in frames {
+        if *id == element.id || *rect == bounds {
+            continue;
+        }
+        if rect.contains(min) && rect.contains(max) {
             let area = rect.w * rect.h;
             if best.as_ref().map(|(a, _)| area < *a).unwrap_or(true) {
                 best = Some((area, id));
@@ -3482,6 +4159,59 @@ mod tests {
         let shape = e.doc.ordered_live()[0];
         assert_eq!(shape.bounds(), Rect::new(10.0, 10.0, 100.0, 50.0));
         assert_eq!(e.selection.len(), 1);
+    }
+
+    #[test]
+    fn snapping_rounds_creation_to_the_grid() {
+        let mut e = editor();
+        assert!(!e.snap_to_grid, "snapping is off by default");
+        assert!(!e.grid_visible, "the grid is off by default");
+        e.snap_to_grid = true;
+        drag_shape(&mut e, Point::new(13.0, 27.0), Point::new(103.0, 217.0), 1);
+        assert_eq!(
+            e.doc.ordered_live()[0].bounds(),
+            Rect::new(20.0, 20.0, 80.0, 200.0)
+        );
+    }
+
+    #[test]
+    fn snapping_respects_a_custom_grid_size() {
+        let mut e = editor();
+        e.snap_to_grid = true;
+        e.grid_size = 40.0;
+        drag_shape(&mut e, Point::new(13.0, 27.0), Point::new(103.0, 217.0), 1);
+        assert_eq!(
+            e.doc.ordered_live()[0].bounds(),
+            Rect::new(0.0, 40.0, 120.0, 160.0)
+        );
+    }
+
+    #[test]
+    fn snapping_moves_shapes_in_grid_steps() {
+        let mut e = editor();
+        drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(100.0, 50.0), 1);
+        press(&mut e, "v", Modifiers::default(), 2);
+        e.snap_to_grid = true;
+        let mods = Modifiers::default();
+        e.pointer_down(Point::new(50.0, 25.0), 0, mods, 3);
+        e.pointer_move(Point::new(63.0, 25.0), mods, 4);
+        e.pointer_up(Point::new(63.0, 25.0), mods, 5);
+        assert_eq!(e.doc.ordered_live()[0].bounds().x, 20.0);
+    }
+
+    #[test]
+    fn snapping_rounds_resize_edges() {
+        let mut e = editor();
+        drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(100.0, 100.0), 1);
+        press(&mut e, "v", Modifiers::default(), 2);
+        e.snap_to_grid = true;
+        let mods = Modifiers::default();
+        e.pointer_down(Point::new(100.0, 100.0), 0, mods, 3);
+        e.pointer_move(Point::new(153.0, 147.0), mods, 4);
+        e.pointer_up(Point::new(153.0, 147.0), mods, 5);
+        let bounds = e.doc.ordered_live()[0].bounds();
+        assert_eq!(bounds.w, 160.0);
+        assert_eq!(bounds.h, 140.0);
     }
 
     #[test]
@@ -4316,6 +5046,131 @@ mod tests {
             }
             other => panic!("expected arrow, got {other:?}"),
         }
+    }
+
+    /// Two shapes and a bound elbow connector between them, selected.
+    fn bound_arrow_board(e: &mut Editor) {
+        drag_shape(e, Point::new(0.0, 0.0), Point::new(100.0, 100.0), 1);
+        drag_shape(e, Point::new(300.0, 0.0), Point::new(400.0, 100.0), 2);
+        let mods = Modifiers::default();
+        press(e, "a", mods, 3);
+        e.pointer_down(Point::new(50.0, 50.0), 0, mods, 4);
+        e.pointer_move(Point::new(350.0, 50.0), mods, 5);
+        e.pointer_up(Point::new(350.0, 50.0), mods, 6);
+    }
+
+    fn arrow_waypoints(e: &Editor) -> Vec<Point> {
+        e.doc
+            .ordered_live()
+            .into_iter()
+            .find_map(|element| match &element.kind {
+                ElementKind::Arrow { waypoints, .. } => Some(waypoints.clone()),
+                _ => None,
+            })
+            .expect("arrow exists")
+    }
+
+    #[test]
+    fn dragging_a_segment_midpoint_inserts_a_waypoint() {
+        let mut e = editor();
+        bound_arrow_board(&mut e);
+        assert!(arrow_waypoints(&e).is_empty());
+        let handles = e.arrow_path_handles();
+        assert!(
+            handles.iter().any(|h| h.point() == Point::new(200.0, 50.0)),
+            "an insert handle sits on the plain route: {handles:?}"
+        );
+
+        let mods = Modifiers::default();
+        e.pointer_down(Point::new(200.0, 50.0), 0, mods, 7);
+        e.pointer_move(Point::new(200.0, 150.0), mods, 8);
+        e.pointer_up(Point::new(200.0, 150.0), mods, 9);
+
+        // The segment bows down: two waypoints, one at each end of the bow.
+        assert_eq!(
+            arrow_waypoints(&e),
+            vec![Point::new(132.0, 150.0), Point::new(268.0, 150.0)]
+        );
+        let element = e
+            .doc
+            .ordered_live()
+            .into_iter()
+            .find(|el| matches!(el.kind, ElementKind::Arrow { .. }))
+            .unwrap()
+            .clone();
+        let ElementKind::Arrow {
+            start,
+            end,
+            routing,
+            waypoints,
+            ..
+        } = &element.kind
+        else {
+            unreachable!()
+        };
+        let route = connector::route(start, end, *routing, waypoints, &e.doc);
+        for waypoint in waypoints {
+            assert!(
+                route.contains(waypoint),
+                "the drawn route passes through {waypoint:?}: {route:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn clicking_an_insert_handle_leaves_the_route_alone() {
+        let mut e = editor();
+        bound_arrow_board(&mut e);
+        let mods = Modifiers::default();
+        // Down and up on the insert handle: no movement, no waypoints.
+        e.pointer_down(Point::new(200.0, 50.0), 0, mods, 7);
+        e.pointer_up(Point::new(200.0, 50.0), mods, 8);
+        assert!(arrow_waypoints(&e).is_empty());
+    }
+
+    #[test]
+    fn double_clicking_the_midpoint_does_not_bend_the_route() {
+        let mut e = editor();
+        bound_arrow_board(&mut e);
+        let mods = Modifiers::default();
+        e.pointer_down(Point::new(200.0, 50.0), 0, mods, 7);
+        e.pointer_up(Point::new(200.0, 50.0), mods, 8);
+        e.pointer_down(Point::new(200.0, 50.0), 0, mods, 9);
+        e.pointer_up(Point::new(200.0, 50.0), mods, 10);
+        e.double_click(Point::new(200.0, 50.0), 11);
+        assert!(arrow_waypoints(&e).is_empty());
+    }
+
+    #[test]
+    fn dragging_a_waypoint_moves_it() {
+        let mut e = editor();
+        bound_arrow_board(&mut e);
+        let mods = Modifiers::default();
+        e.pointer_down(Point::new(200.0, 50.0), 0, mods, 7);
+        e.pointer_move(Point::new(200.0, 150.0), mods, 8);
+        e.pointer_up(Point::new(200.0, 150.0), mods, 9);
+
+        e.pointer_down(Point::new(132.0, 150.0), 0, mods, 10);
+        e.pointer_move(Point::new(190.0, 180.0), mods, 11);
+        e.pointer_up(Point::new(190.0, 180.0), mods, 12);
+        assert_eq!(
+            arrow_waypoints(&e),
+            vec![Point::new(190.0, 180.0), Point::new(268.0, 150.0)]
+        );
+    }
+
+    #[test]
+    fn double_clicking_a_waypoint_removes_it() {
+        let mut e = editor();
+        bound_arrow_board(&mut e);
+        let mods = Modifiers::default();
+        e.pointer_down(Point::new(200.0, 50.0), 0, mods, 7);
+        e.pointer_move(Point::new(200.0, 150.0), mods, 8);
+        e.pointer_up(Point::new(200.0, 150.0), mods, 9);
+        assert_eq!(arrow_waypoints(&e).len(), 2);
+
+        e.double_click(Point::new(132.0, 150.0), 10);
+        assert_eq!(arrow_waypoints(&e), vec![Point::new(268.0, 150.0)]);
     }
 
     #[test]
@@ -5188,12 +6043,330 @@ mod tests {
                 "a0".into(),
                 0,
             );
-            let ops = crate::rough::build_element_ops(&element, &doc, &ApproxMeasurer);
+            let ops = crate::rough::build_element_ops(
+                &element,
+                &doc,
+                &ApproxMeasurer,
+                &crate::spatial::ObstacleIndex::new(),
+            );
             assert!(!ops.is_empty(), "{} renders nothing", info.id);
             doc.insert(element);
         }
         let mut scene = Scene::new();
-        scene.rebuild_all(&doc, &ApproxMeasurer);
+        scene.rebuild_all(&doc, &ApproxMeasurer, &crate::spatial::ObstacleIndex::new());
         assert_eq!(scene.layers.len(), crate::glyphs::catalog().len());
+    }
+
+    #[test]
+    fn switching_tools_mid_drag_abandons_the_draft() {
+        let mut e = editor();
+        let mods = Modifiers::default();
+        press(&mut e, "r", mods, 1);
+        e.pointer_down(Point::new(10.0, 10.0), 0, mods, 2);
+        e.pointer_move(Point::new(80.0, 60.0), mods, 3);
+        press(&mut e, "v", mods, 4);
+        e.pointer_up(Point::new(80.0, 60.0), mods, 5);
+        assert!(e.doc.is_empty(), "tool switch committed a half-drawn shape");
+        assert_eq!(e.tool, Tool::Select);
+        // The gesture is really over: the next drag uses the new tool.
+        e.pointer_down(Point::new(300.0, 300.0), 0, mods, 6);
+        e.pointer_move(Point::new(320.0, 320.0), mods, 7);
+        e.pointer_up(Point::new(320.0, 320.0), mods, 8);
+        assert!(e.doc.is_empty());
+    }
+
+    #[test]
+    fn empty_bound_text_commit_leaves_no_dangling_link() {
+        let mut e = editor();
+        drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(100.0, 50.0), 1);
+        e.set_tool(Tool::Select);
+        e.double_click(Point::new(50.0, 25.0), 4);
+        let text_id = e
+            .doc
+            .ordered_live()
+            .iter()
+            .find(|element| element.is_text())
+            .map(|element| element.id.clone())
+            .expect("double-click did not open a bound text");
+        e.commit_text(&text_id, "   ", 5);
+        // The draft is gone entirely and the shape carries no link.
+        assert!(e.doc.element(&text_id).is_none());
+        assert_eq!(e.doc.ordered_live().len(), 1);
+        let ElementKind::Shape { bound_text_id, .. } = &e.doc.ordered_live()[0].kind else {
+            panic!("expected a shape")
+        };
+        assert!(
+            bound_text_id.is_none(),
+            "empty commit left a dangling bound_text_id"
+        );
+        // Re-labeling after the abandoned edit works.
+        e.double_click(Point::new(50.0, 25.0), 6);
+        let fresh = e
+            .doc
+            .ordered_live()
+            .iter()
+            .find(|element| element.is_text())
+            .map(|element| element.id.clone())
+            .expect("second edit did not open a bound text");
+        e.commit_text(&fresh, "real", 7);
+        let ElementKind::Shape { bound_text_id, .. } = &e.doc.ordered_live()[0].kind else {
+            panic!("expected a shape")
+        };
+        assert_eq!(bound_text_id.as_deref(), Some(fresh.as_str()));
+        // Undo removes the label, then the shape — history stayed linear.
+        let cmd = Modifiers {
+            meta: true,
+            ..Modifiers::default()
+        };
+        press(&mut e, "z", cmd, 8);
+        assert_eq!(e.doc.ordered_live().len(), 1, "undo ate the shape");
+        press(&mut e, "z", cmd, 9);
+        assert!(e.doc.is_empty());
+    }
+
+    #[test]
+    fn a_dangling_bound_text_id_heals_on_edit() {
+        let mut e = editor();
+        drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(100.0, 50.0), 1);
+        let shape_id = e.doc.ordered_live()[0].id.clone();
+        if let ElementKind::Shape { bound_text_id, .. } =
+            &mut e.doc.element_mut(&shape_id).unwrap().kind
+        {
+            *bound_text_id = Some("ghost".into());
+        }
+        e.double_click(Point::new(50.0, 25.0), 4);
+        let fresh = e
+            .doc
+            .ordered_live()
+            .iter()
+            .find(|element| element.is_text())
+            .map(|element| element.id.clone())
+            .expect("no fresh bound text opened");
+        e.commit_text(&fresh, "healed", 5);
+        let ElementKind::Shape { bound_text_id, .. } = &e.doc.element(&shape_id).unwrap().kind
+        else {
+            panic!("expected a shape")
+        };
+        assert_eq!(bound_text_id.as_deref(), Some(fresh.as_str()));
+    }
+
+    #[test]
+    fn nested_frames_cascade_through_parentage() {
+        let mut e = editor();
+        let mods = Modifiers::default();
+        e.set_tool(Tool::Frame);
+        e.pointer_down(Point::new(0.0, 0.0), 0, mods, 1);
+        e.pointer_move(Point::new(400.0, 300.0), mods, 2);
+        e.pointer_up(Point::new(400.0, 300.0), mods, 3);
+        e.set_tool(Tool::Frame);
+        e.pointer_down(Point::new(50.0, 50.0), 0, mods, 4);
+        e.pointer_move(Point::new(200.0, 150.0), mods, 5);
+        e.pointer_up(Point::new(200.0, 150.0), mods, 6);
+        e.set_tool(Tool::Rectangle);
+        e.pointer_down(Point::new(80.0, 80.0), 0, mods, 7);
+        e.pointer_move(Point::new(140.0, 120.0), mods, 8);
+        e.pointer_up(Point::new(140.0, 120.0), mods, 9);
+
+        let outer = e.doc.ordered_live()[0].id.clone();
+        let inner = e.doc.ordered_live()[1].id.clone();
+        assert_eq!(
+            e.doc.element(&inner).unwrap().frame_id.as_deref(),
+            Some(outer.as_str()),
+            "inner frame was not adopted by the outer frame"
+        );
+        e.select([outer.clone()]);
+        e.delete_selection(10);
+        assert_eq!(
+            e.doc.live_count(),
+            0,
+            "nested contents survived the parent delete"
+        );
+        let cmd = Modifiers {
+            meta: true,
+            ..Modifiers::default()
+        };
+        press(&mut e, "z", cmd, 11);
+        assert_eq!(e.doc.live_count(), 3);
+    }
+
+    #[test]
+    fn arrow_endpoints_bind_shapes_not_their_labels() {
+        let mut e = editor();
+        drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(160.0, 100.0), 1);
+        let shape_id = e.doc.ordered_live()[0].id.clone();
+        e.double_click(Point::new(80.0, 50.0), 2);
+        let text_id = e
+            .doc
+            .ordered_live()
+            .iter()
+            .find(|element| element.is_text())
+            .expect("bound text created")
+            .id
+            .clone();
+        e.commit_text(&text_id, "hub", 3);
+
+        drag_shape(&mut e, Point::new(300.0, 0.0), Point::new(400.0, 100.0), 4);
+        let mods = Modifiers::default();
+        press(&mut e, "a", mods, 5);
+        e.pointer_down(Point::new(350.0, 50.0), 0, mods, 6);
+        e.pointer_move(Point::new(80.0, 50.0), mods, 7);
+        e.pointer_up(Point::new(80.0, 50.0), mods, 8);
+
+        let arrow = e
+            .doc
+            .ordered_live()
+            .into_iter()
+            .find(|element| matches!(element.kind, ElementKind::Arrow { .. }))
+            .expect("arrow created");
+        match &arrow.kind {
+            ElementKind::Arrow { end, .. } => {
+                assert_eq!(
+                    end.binding.as_ref().map(|b| b.element_id.clone()),
+                    Some(shape_id),
+                    "dropping on the label bound the text, not its shape"
+                );
+            }
+            other => panic!("expected arrow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn body_dropped_arrows_reanchor_toward_the_target() {
+        let mut e = editor();
+        // Wide source, destination straight up: a frozen centre-drop anchor
+        // picks a vertical side and the route slices back through the shape.
+        drag_shape(&mut e, Point::new(0.0, 200.0), Point::new(160.0, 300.0), 1);
+        drag_shape(&mut e, Point::new(30.0, 0.0), Point::new(130.0, 80.0), 2);
+        let mods = Modifiers::default();
+        press(&mut e, "a", mods, 3);
+        e.pointer_down(Point::new(80.0, 250.0), 0, mods, 4);
+        e.pointer_move(Point::new(80.0, 40.0), mods, 5);
+        e.pointer_up(Point::new(80.0, 40.0), mods, 6);
+
+        let arrow = e
+            .doc
+            .ordered_live()
+            .into_iter()
+            .find(|element| matches!(element.kind, ElementKind::Arrow { .. }))
+            .expect("arrow created");
+        let ElementKind::Arrow {
+            start,
+            end,
+            routing,
+            waypoints,
+            ..
+        } = &arrow.kind
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            start.binding.as_ref().and_then(|b| b.focus),
+            None,
+            "body drops keep dynamic anchoring"
+        );
+        let route = connector::route(start, end, *routing, waypoints, &e.doc);
+        let source = Rect::new(0.0, 200.0, 160.0, 100.0);
+        let interior = route
+            .iter()
+            .filter(|p| {
+                p.x > source.x + 0.5
+                    && p.x < source.max_x() - 0.5
+                    && p.y > source.y + 0.5
+                    && p.y < source.max_y() - 0.5
+            })
+            .count();
+        assert_eq!(
+            interior, 0,
+            "route passes through the bound shape's body: {route:?}"
+        );
+    }
+
+    #[test]
+    fn arrow_labels_follow_when_bound_shapes_move() {
+        let mut e = editor();
+        drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(100.0, 100.0), 1);
+        drag_shape(&mut e, Point::new(300.0, 0.0), Point::new(400.0, 100.0), 2);
+        let b = e.doc.ordered_live()[1].id.clone();
+        let mods = Modifiers::default();
+        press(&mut e, "a", mods, 3);
+        e.pointer_down(Point::new(50.0, 50.0), 0, mods, 4);
+        e.pointer_move(Point::new(350.0, 50.0), mods, 5);
+        e.pointer_up(Point::new(350.0, 50.0), mods, 6);
+        e.double_click(Point::new(200.0, 50.0), 7);
+        let text_id = e
+            .doc
+            .ordered_live()
+            .iter()
+            .find(|element| element.is_text())
+            .expect("label created")
+            .id
+            .clone();
+        e.commit_text(&text_id, "sync", 8);
+        let before = e.doc.element(&text_id).unwrap().bounds();
+
+        press(&mut e, "v", mods, 9);
+        e.select([b.clone()]);
+        e.pointer_down(Point::new(350.0, 50.0), 0, mods, 10);
+        e.pointer_move(Point::new(350.0, 250.0), mods, 11);
+        e.pointer_up(Point::new(350.0, 250.0), mods, 12);
+
+        let after = e.doc.element(&text_id).unwrap().bounds();
+        assert!(
+            (after.center().y - before.center().y).abs() > 50.0,
+            "label did not follow the re-routed connector: {before:?} -> {after:?}"
+        );
+    }
+
+    #[test]
+    fn nudge_moves_bound_text_and_reflows_arrow_labels() {
+        let mut e = editor();
+        drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(100.0, 100.0), 1);
+        let shape_id = e.doc.ordered_live()[0].id.clone();
+        e.double_click(Point::new(50.0, 50.0), 2);
+        let text_id = e
+            .doc
+            .ordered_live()
+            .iter()
+            .find(|element| element.is_text())
+            .expect("bound text created")
+            .id
+            .clone();
+        e.commit_text(&text_id, "node", 3);
+        let label_before = e.doc.element(&text_id).unwrap().bounds();
+
+        let mods = Modifiers::default();
+        e.select([shape_id.clone()]);
+        press(&mut e, "ArrowRight", mods, 4);
+        let label_after = e.doc.element(&text_id).unwrap().bounds();
+        assert!(
+            label_after.x > label_before.x,
+            "bound text stayed behind on nudge: {label_before:?} -> {label_after:?}"
+        );
+    }
+
+    #[test]
+    fn sticky_stack_inside_a_frame_belongs_to_it() {
+        let mut e = editor();
+        let mods = Modifiers::default();
+        press(&mut e, "f", mods, 1);
+        e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
+        e.pointer_move(Point::new(400.0, 400.0), mods, 3);
+        e.pointer_up(Point::new(400.0, 400.0), mods, 4);
+        let frame_id = e.doc.ordered_live()[0].id.clone();
+
+        press(&mut e, "k", mods, 5);
+        e.pointer_down(Point::new(100.0, 100.0), 0, mods, 6);
+        e.pointer_up(Point::new(100.0, 100.0), mods, 7);
+        let stack = e
+            .doc
+            .ordered_live()
+            .into_iter()
+            .find(|element| element.is_sticky_stack())
+            .expect("stack created");
+        assert_eq!(
+            stack.frame_id.as_deref(),
+            Some(frame_id.as_str()),
+            "stack placed in a frame was not adopted"
+        );
     }
 }

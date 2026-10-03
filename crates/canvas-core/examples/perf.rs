@@ -49,19 +49,21 @@ fn pump(editor: &mut Editor, effects: &Effects) {
 fn main() {
     let doc = benchmark_fixture(10_000);
 
+    let mut obstacles = canvas_core::spatial::ObstacleIndex::new();
+    obstacles.rebuild(&doc);
     let mut scene = Scene::new();
-    scene.rebuild_all(&doc, &ApproxMeasurer);
+    scene.rebuild_all(&doc, &ApproxMeasurer, &obstacles);
     let changed: BTreeSet<String> = ["bench-05000".to_string()].into_iter().collect();
     {
         let start = Instant::now();
         for _ in 0..200 {
-            std::hint::black_box(scene.update(&doc, &changed, &ApproxMeasurer));
+            std::hint::black_box(scene.update(&doc, &changed, &ApproxMeasurer, &obstacles));
         }
         report("scene.update 1 changed", 200, start.elapsed());
     }
 
     bench("scene.rebuild_all (10k)", 5, Scene::new, |s| {
-        s.rebuild_all(&doc, &ApproxMeasurer);
+        s.rebuild_all(&doc, &ApproxMeasurer, &obstacles);
     });
 
     {
@@ -207,4 +209,50 @@ fn main() {
             std::hint::black_box(editor.undo());
         },
     );
+
+    // -- the heavy connected board -----------------------------------------
+
+    for nodes in [10_000usize, 100_000] {
+        let doc = canvas_core::benchmark::connected_fixture(nodes, 1);
+        let elements = doc.live_count();
+        println!("\nconnected fixture: {nodes} nodes + arrows = {elements} elements");
+
+        let mut obstacles = canvas_core::ObstacleIndex::new();
+        let start = Instant::now();
+        obstacles.rebuild(&doc);
+        report("  obstacles.rebuild", 1, start.elapsed());
+
+        let mut scene = Scene::new();
+        let start = Instant::now();
+        scene.rebuild_all(&doc, &ApproxMeasurer, &obstacles);
+        report("  scene.rebuild_all", 1, start.elapsed());
+
+        let start = Instant::now();
+        let mut editor = Editor::new(doc);
+        report("  Editor::new (fixture + scene)", 1, start.elapsed());
+
+        // Drag a node from the middle of the board, then measure per-move
+        // cost: hit-test, translation, connected-arrow updates and layer
+        // rebuilds all happen here.
+        let probe = format!("perf-{:06}", nodes / 2);
+        let start_point = editor.doc.element(&probe).unwrap().bounds().center();
+        let effects = editor.pointer_down(start_point, 0, Modifiers::default(), 1);
+        pump(&mut editor, &effects);
+        let start = Instant::now();
+        for i in 1..=100u64 {
+            let effects = editor.pointer_move(
+                Point::new(start_point.x + i as f64, start_point.y + i as f64),
+                Modifiers::default(),
+                1 + i,
+            );
+            pump(&mut editor, &effects);
+        }
+        report("  drag node, 100 moves", 1, start.elapsed());
+        let effects = editor.pointer_up(
+            Point::new(start_point.x + 100.0, start_point.y + 100.0),
+            Modifiers::default(),
+            300,
+        );
+        pump(&mut editor, &effects);
+    }
 }

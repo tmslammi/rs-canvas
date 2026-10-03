@@ -1,5 +1,4 @@
-import init, { Editor, glyph_catalog, load_saved_json } from "./wasm/canvas_wasm.js";
-import { createLibraryPanel } from "./libraryPanel.js";
+import init, { Editor, load_saved_json } from "./wasm/canvas_wasm.js";
 import { createStylePanel } from "./stylePanel.js";
 
 const TOOLS = [
@@ -27,22 +26,12 @@ async function boot() {
   await loadFonts();
 
   const scene = document.getElementById("scene");
+  const grid = document.getElementById("grid");
   const overlay = document.getElementById("overlay");
   const toolbar = document.getElementById("toolbar");
   const stylePanelHost = document.getElementById("style-panel");
-  const libraryPanelHost = document.getElementById("library-panel");
-  const editor = new Editor(scene, overlay);
+  const editor = new Editor(scene, overlay, grid);
   const stylePanel = createStylePanel(stylePanelHost, editor);
-  createLibraryPanel(libraryPanelHost, editor, glyph_catalog());
-
-  const libraryToggle = document.createElement("button");
-  libraryToggle.textContent = "▦";
-  libraryToggle.title = "Shapes library";
-  libraryToggle.addEventListener("click", () => {
-    libraryPanelHost.classList.toggle("visible");
-    libraryToggle.classList.toggle("active", libraryPanelHost.classList.contains("visible"));
-  });
-  toolbar.appendChild(libraryToggle);
 
   const toast = document.createElement("div");
   toast.id = "toast";
@@ -55,6 +44,122 @@ async function boot() {
     window.clearTimeout(toastTimer);
     toastTimer = window.setTimeout(() => toast.classList.remove("visible"), 3200);
   };
+
+  // -- grid and snapping (per-browser preferences) ------------------------
+
+  const GRID_KEY = "rs-canvas-grid";
+  const SNAP_KEY = "rs-canvas-snap";
+  const GRID_SIZE_KEY = "rs-canvas-grid-size";
+  const ZOOM_KEY = "rs-canvas-zoom-sensitivity";
+  const GRID_SIZES = [10, 20, 40, 80];
+  const ZOOM_SENSITIVITIES = [0.5, 1, 2, 4];
+
+  const gridDivider = document.createElement("div");
+  gridDivider.className = "divider";
+
+  const gridButton = document.createElement("button");
+  gridButton.textContent = "#";
+  gridButton.title = "Grid — G";
+  const gridSizeButton = document.createElement("button");
+  const snapButton = document.createElement("button");
+  snapButton.textContent = "🧲";
+  snapButton.title = "Snap to grid — ⇧G";
+  const zoomButton = document.createElement("button");
+
+  const updateGridSizeButton = () => {
+    const size = Math.round(editor.grid_size());
+    gridSizeButton.textContent = String(size);
+    gridSizeButton.title = `Grid size — ${size} world units (click to change)`;
+  };
+
+  const updateZoomButton = () => {
+    const value = editor.zoom_sensitivity();
+    zoomButton.textContent = `${value}×`;
+    zoomButton.title = `Zoom speed — ${value}× (⌘/Ctrl + wheel)`;
+  };
+
+  const persist = (key, value) => {
+    try {
+      localStorage.setItem(key, value ? "1" : "0");
+    } catch {
+      // Private mode: the preference just won't survive a reload.
+    }
+  };
+
+  const setGridVisible = (visible, remember = true) => {
+    editor.set_grid_visible(visible);
+    gridButton.classList.toggle("active", visible);
+    if (remember) persist(GRID_KEY, visible);
+  };
+
+  const setSnapEnabled = (enabled, remember = true) => {
+    editor.set_snap_enabled(enabled);
+    snapButton.classList.toggle("active", enabled);
+    if (remember) persist(SNAP_KEY, enabled);
+  };
+
+  const setGridSize = (size, remember = true) => {
+    editor.set_grid_size(size);
+    updateGridSizeButton();
+    if (remember) {
+      try {
+        localStorage.setItem(GRID_SIZE_KEY, String(Math.round(editor.grid_size())));
+      } catch {
+        // Preference is optional.
+      }
+    }
+  };
+
+  gridButton.addEventListener("click", () => {
+    const next = !editor.grid_visible();
+    setGridVisible(next);
+    showToast(next ? "Grid on" : "Grid off");
+  });
+  gridSizeButton.addEventListener("click", () => {
+    const current = Math.round(editor.grid_size());
+    const index = GRID_SIZES.indexOf(current);
+    const next = GRID_SIZES[(index + 1) % GRID_SIZES.length];
+    setGridSize(next);
+    showToast(`Grid size ${next}`);
+  });
+  snapButton.addEventListener("click", () => {
+    const next = !editor.snap_enabled();
+    setSnapEnabled(next);
+    showToast(next ? "Snap to grid on" : "Snap to grid off");
+  });
+  zoomButton.addEventListener("click", () => {
+    const current = editor.zoom_sensitivity();
+    const index = ZOOM_SENSITIVITIES.indexOf(current);
+    const next = ZOOM_SENSITIVITIES[(index + 1) % ZOOM_SENSITIVITIES.length];
+    editor.set_zoom_sensitivity(next);
+    updateZoomButton();
+    try {
+      localStorage.setItem(ZOOM_KEY, String(next));
+    } catch {
+      // Preference is optional.
+    }
+    showToast(`Zoom speed ${next}×`);
+  });
+
+  try {
+    setGridVisible(localStorage.getItem(GRID_KEY) === "1", false);
+    setSnapEnabled(localStorage.getItem(SNAP_KEY) === "1", false);
+    const storedSize = Number(localStorage.getItem(GRID_SIZE_KEY));
+    if (GRID_SIZES.includes(storedSize)) {
+      setGridSize(storedSize, false);
+    } else {
+      updateGridSizeButton();
+    }
+    const storedZoom = Number(localStorage.getItem(ZOOM_KEY));
+    if (ZOOM_SENSITIVITIES.includes(storedZoom)) {
+      editor.set_zoom_sensitivity(storedZoom);
+    }
+    updateZoomButton();
+  } catch {
+    // Preferences are optional.
+    updateGridSizeButton();
+    updateZoomButton();
+  }
 
   let updateCursor = () => {
     const cursor = editor.cursor();
@@ -142,110 +247,13 @@ async function boot() {
     showToast("Demo architecture loaded — a VPC with GKE, Cloud SQL, Cloud Storage and Pub/Sub");
   });
 
-  const openButton = document.createElement("button");
-  openButton.textContent = "📂";
-  openButton.title = "Open… (⌘O)";
-
-  const saveButton = document.createElement("button");
-  saveButton.textContent = "💾";
-  saveButton.title = "Save (⌘S)";
-
-  const pngButton = document.createElement("button");
-  pngButton.textContent = "🖼";
-  pngButton.title = "Export PNG";
-
-  const svgButton = document.createElement("button");
-  svgButton.textContent = "⇱";
-  svgButton.title = "Export SVG";
-
-  const copyButton = document.createElement("button");
-  copyButton.textContent = "📋";
-  copyButton.title = "Copy PNG";
-
   toolbar.appendChild(newButton);
   toolbar.appendChild(seedButton);
-  toolbar.appendChild(openButton);
-  toolbar.appendChild(saveButton);
-  toolbar.appendChild(pngButton);
-  toolbar.appendChild(svgButton);
-  toolbar.appendChild(copyButton);
-
-  const downloadDataUrl = (dataUrl, filename) => {
-    const anchor = document.createElement("a");
-    anchor.href = dataUrl;
-    anchor.download = filename;
-    anchor.click();
-  };
-
-  const exportStamp = () =>
-    new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-");
-
-  pngButton.addEventListener("click", () => {
-    try {
-      const dataUrl = editor.export_png(2);
-      downloadDataUrl(dataUrl, `rs-canvas-${exportStamp()}.png`);
-      showToast("Exported PNG");
-    } catch (error) {
-      showToast(`Export failed: ${String(error)}`, true);
-    }
-  });
-
-  svgButton.addEventListener("click", () => {
-    const svg = editor.export_svg();
-    const blob = new Blob([svg], { type: "image/svg+xml" });
-    const url = URL.createObjectURL(blob);
-    downloadDataUrl(url, `rs-canvas-${exportStamp()}.svg`);
-    URL.revokeObjectURL(url);
-    showToast("Exported SVG");
-  });
-
-  copyButton.addEventListener("click", async () => {
-    try {
-      const dataUrl = editor.export_png(2);
-      const blob = await (await fetch(dataUrl)).blob();
-      await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
-      showToast("Copied PNG to clipboard");
-    } catch (error) {
-      showToast(`Copy failed: ${String(error)}`, true);
-    }
-  });
-
-  const fileInput = document.createElement("input");
-  fileInput.type = "file";
-  fileInput.id = "file-input";
-  fileInput.accept = ".json,application/json";
-  fileInput.style.display = "none";
-  document.body.appendChild(fileInput);
-
-  const saveFile = () => {
-    const json = editor.save_json();
-    const blob = new Blob([json], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = `rs-canvas-${exportStamp()}.json`;
-    anchor.click();
-    URL.revokeObjectURL(url);
-    showToast("Saved");
-  };
-
-  openButton.addEventListener("click", () => fileInput.click());
-  saveButton.addEventListener("click", () => saveFile());
-
-  fileInput.addEventListener("change", async () => {
-    const file = fileInput.files?.[0];
-    if (!file) return;
-    const text = await file.text();
-    try {
-      editor.load_json(text);
-      refreshToolbar();
-      updateCursor();
-      showToast(`Opened ${file.name}`);
-    } catch (error) {
-      showToast(`Could not open: ${String(error)}`, true);
-    }
-    fileInput.value = "";
-  });
+  toolbar.appendChild(gridDivider);
+  toolbar.appendChild(gridButton);
+  toolbar.appendChild(gridSizeButton);
+  toolbar.appendChild(snapButton);
+  toolbar.appendChild(zoomButton);
 
   const refreshToolbar = () => {
     const active = editor.active_tool();
@@ -267,7 +275,7 @@ async function boot() {
   let editingSingleLine = false;
 
   const closeTextEditor = () => {
-    textEditor.classList.remove("visible");
+    textEditor.classList.remove("visible", "single-line");
     textEditor.blur();
     editingId = null;
     editingSingleLine = false;
@@ -300,6 +308,9 @@ async function boot() {
     textEditor.style.fontSize = `${action.font_size}px`;
     textEditor.style.lineHeight = "1.3";
     textEditor.style.textAlign = action.align;
+    // Frame names paint a band above the border; an opaque editor hides the
+    // canvas-drawn name instead of ghosting through it.
+    textEditor.classList.toggle("single-line", !!action.single_line);
     textEditor.classList.add("visible");
     textEditor.focus();
     textEditor.setSelectionRange(action.text.length, action.text.length);
@@ -308,10 +319,48 @@ async function boot() {
   // Autosave is debounced in the shell so serializing a large document never
   // happens inside a pointer or keyboard handler.
   let autosaveTimer = 0;
+  let autosavePaused = false;
   const scheduleAutosave = () => {
+    if (autosavePaused) return;
     window.clearTimeout(autosaveTimer);
-    autosaveTimer = window.setTimeout(() => editor.flush_save(), 700);
+    autosaveTimer = window.setTimeout(() => {
+      autosaveTimer = 0;
+      editor.flush_save();
+    }, 700);
   };
+  // Test hook: let frame-time measurements on huge documents skip the
+  // (deliberately) expensive serialization pass.
+  window.__rsPauseAutosave = (paused) => {
+    autosavePaused = !!paused;
+  };
+  // The debounce loses edits made in its last ~700ms if the page goes away
+  // before the timer fires.
+  const flushPendingAutosave = () => {
+    if (autosaveTimer) {
+      window.clearTimeout(autosaveTimer);
+      autosaveTimer = 0;
+      editor.flush_save();
+    }
+  };
+  // IndexedDB writes spawned during unload can be torn down before they
+  // commit, so the unload path also writes a synchronous checkpoint.
+  const UNLOAD_CHECKPOINT = "rs-canvas-unload-checkpoint";
+  const checkpointAutosave = () => {
+    if (!autosaveTimer) return; // nothing pending — IndexedDB is already current
+    window.clearTimeout(autosaveTimer);
+    autosaveTimer = 0;
+    try {
+      localStorage.setItem(UNLOAD_CHECKPOINT, editor.save_json());
+    } catch {
+      // Quota or privacy-mode refusal: the async flush below may still land.
+    }
+    editor.flush_save();
+  };
+  window.addEventListener("pagehide", checkpointAutosave);
+  window.addEventListener("beforeunload", checkpointAutosave);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") flushPendingAutosave();
+  });
 
   textEditor.addEventListener("input", () => {
     textEditor.style.height = "auto";
@@ -443,14 +492,18 @@ async function boot() {
     ) {
       return;
     }
-    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") {
+    if (
+      !event.metaKey &&
+      !event.ctrlKey &&
+      !event.altKey &&
+      event.key.toLowerCase() === "g"
+    ) {
       event.preventDefault();
-      saveFile();
-      return;
-    }
-    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "o") {
-      event.preventDefault();
-      fileInput.click();
+      if (event.shiftKey) {
+        setSnapEnabled(!editor.snap_enabled());
+      } else {
+        setGridVisible(!editor.grid_visible());
+      }
       return;
     }
     const handled = editor.key_down(
@@ -489,6 +542,19 @@ async function boot() {
     }
   } catch (error) {
     console.warn("could not restore autosave", error);
+  }
+
+  // An unload checkpoint always post-dates whatever IndexedDB holds: apply
+  // it over the top, then hand it back to async persistence.
+  try {
+    const checkpoint = localStorage.getItem(UNLOAD_CHECKPOINT);
+    if (checkpoint) {
+      localStorage.removeItem(UNLOAD_CHECKPOINT);
+      editor.load_json(checkpoint);
+      editor.flush_save();
+    }
+  } catch (error) {
+    console.warn("could not restore unload checkpoint", error);
   }
 
   refreshToolbar();

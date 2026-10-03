@@ -119,8 +119,8 @@ impl StylePatch {
         if let Some(value) = self.fill_style {
             style.fill_style = value;
         }
-        if let Some(value) = self.stroke_width {
-            style.stroke_width = value;
+        if let Some(value) = self.stroke_width.filter(|v| v.is_finite()) {
+            style.stroke_width = value.clamp(0.5, 64.0);
         }
         if let Some(value) = self.roughness {
             style.roughness = value.min(2);
@@ -128,10 +128,10 @@ impl StylePatch {
         if let Some(value) = self.dash {
             style.dash = value;
         }
-        if let Some(value) = self.opacity {
+        if let Some(value) = self.opacity.filter(|v| v.is_finite()) {
             style.opacity = value.clamp(0.05, 1.0);
         }
-        if let Some(value) = self.font_size {
+        if let Some(value) = self.font_size.filter(|v| v.is_finite()) {
             style.font_size = value.clamp(8.0, 96.0);
         }
     }
@@ -206,6 +206,10 @@ pub enum ElementKind {
         start_arrowhead: bool,
         end_arrowhead: bool,
         style: Style,
+        /// User-placed bends; the route passes through them in order. Empty
+        /// means fully automated routing.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        waypoints: Vec<Point>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         label_id: Option<ElementId>,
     },
@@ -310,7 +314,18 @@ impl Element {
                 }
                 Rect::new(min_x, min_y, max_x - min_x, max_y - min_y)
             }
-            ElementKind::Arrow { start, end, .. } => Rect::from_points(start.point(), end.point()),
+            ElementKind::Arrow {
+                start,
+                end,
+                waypoints,
+                ..
+            } => {
+                let mut bounds = Rect::from_points(start.point(), end.point());
+                for waypoint in waypoints {
+                    bounds = bounds.union(&Rect::from_points(*waypoint, *waypoint));
+                }
+                bounds
+            }
         }
     }
 
@@ -320,6 +335,19 @@ impl Element {
 
     pub fn is_sticky_stack(&self) -> bool {
         matches!(self.kind, ElementKind::StickyStack { .. })
+    }
+
+    /// Whether an arrow endpoint may bind to this element. Shapes, glyphs,
+    /// frames and standalone text are targets; bound text belongs to its
+    /// container and connectors/strokes/stacks can never be targets.
+    pub fn is_bind_target(&self) -> bool {
+        match &self.kind {
+            ElementKind::Shape { .. } | ElementKind::Glyph { .. } | ElementKind::Frame { .. } => {
+                true
+            }
+            ElementKind::Text { container_id, .. } => container_id.is_none(),
+            _ => false,
+        }
     }
 
     pub fn is_sticky(&self) -> bool {
@@ -526,6 +554,7 @@ mod tests {
                 start_arrowhead: false,
                 end_arrowhead: true,
                 style: Style::default(),
+                waypoints: Vec::new(),
                 label_id: None,
             },
             1,

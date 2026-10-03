@@ -10,6 +10,7 @@ use crate::display::{Dash, DrawOp, FillStyle, PathOp, StrokeStyle, TextOp};
 use crate::geometry::{Point, Rect};
 use crate::glyphs;
 use crate::model::{Document, Element, ElementKind, FillPattern, ShapeKind, Style, TextAlign};
+use crate::spatial::ObstacleIndex;
 use crate::text::{layout_text, TextMeasurer};
 
 /// A tiny deterministic RNG (splitmix64).
@@ -144,7 +145,9 @@ pub fn shape_polygon(shape: ShapeKind, rect: Rect) -> Vec<Point> {
             let c = rect.center();
             let rx = rect.w / 2.0;
             let ry = rect.h / 2.0;
-            let n = 48;
+            // Dense sampling: the outline is wobbled as a smooth curve, so
+            // facets never show even on large circles.
+            let n = 128;
             (0..n)
                 .map(|i| {
                     let t = i as f64 / n as f64 * std::f64::consts::TAU;
@@ -346,8 +349,24 @@ pub fn pen_band(
         left.push(points[i] + normal.scale(half));
         right.push(points[i] - normal.scale(half));
     }
-    let mut band = left;
-    band.extend(right.into_iter().rev());
+    if !closed {
+        let mut band = left;
+        band.extend(right.into_iter().rev());
+        return band;
+    }
+    // A closed ribbon must wrap with a single seam: run the outer edge all
+    // the way around, cross to the inner edge, and run it back to the same
+    // seam. The open-ribbon trace (outer, cap, inner, cap) leaves the arc
+    // between the two caps unpainted — the classic gap at the right of a
+    // circle.
+    let mut band = Vec::with_capacity(2 * n + 3);
+    band.extend(left.iter().copied());
+    band.push(left[0]);
+    band.push(right[0]);
+    for i in (1..n).rev() {
+        band.push(right[i]);
+    }
+    band.push(right[0]);
     band
 }
 
@@ -512,6 +531,44 @@ pub fn outline_ops(polygon: &[Point], style: &Style, seed: u64, closed: bool) ->
     ops
 }
 
+/// Wobble a closed polygon as one smooth curve: a low-frequency radial drift
+/// instead of per-vertex jitter, so circles read as drawn by hand rather
+/// than cut from a lumpy polygon.
+pub fn smooth_closed_polyline(points: &[Point], roughness: u8, rng: &mut RoughRng) -> Vec<Point> {
+    let n = points.len();
+    if n < 3 {
+        return points.to_vec();
+    }
+    let amplitude = jitter_magnitude(roughness) * 1.6;
+    let phase_a = rng.next_f64() * std::f64::consts::TAU;
+    let phase_b = rng.next_f64() * std::f64::consts::TAU;
+    (0..n)
+        .map(|i| {
+            let t = i as f64 / n as f64;
+            let drift = (t * std::f64::consts::TAU + phase_a).sin() * 0.7
+                + (t * 2.0 * std::f64::consts::TAU + phase_b).sin() * 0.3;
+            let normal = normal_at(points, i, true);
+            points[i] + normal.scale(drift * amplitude)
+        })
+        .collect()
+}
+
+/// Outline ops for a smoothly-wobbled closed shape (ellipses).
+pub fn smooth_outline_ops(polygon: &[Point], style: &Style, seed: u64) -> Vec<DrawOp> {
+    if style.stroke_color == "transparent" || polygon.len() < 3 {
+        return Vec::new();
+    }
+    if style.dash != crate::model::StrokeDash::Solid {
+        return stroked_paths(polygon, style, seed, true);
+    }
+    let mut rng = RoughRng::seeded(seed);
+    let curve = smooth_closed_polyline(polygon, style.roughness, &mut rng);
+    let width = style.stroke_width.max(0.5);
+    let widths = vec![width; curve.len()];
+    let band = pen_band(&curve, true, &widths, style.roughness, &mut rng);
+    ink_path(band, style).into_iter().collect()
+}
+
 /// Fill ops for a polygon per the style's fill pattern.
 pub fn fill_ops(polygon: &[Point], style: &Style, seed: u64) -> Vec<DrawOp> {
     if style.fill_color == "transparent" || polygon.len() < 3 {
@@ -561,6 +618,7 @@ pub fn build_element_ops(
     element: &Element,
     doc: &Document,
     measurer: &dyn TextMeasurer,
+    obstacles: &ObstacleIndex,
 ) -> Vec<DrawOp> {
     let seed = hash_str(&element.id);
     match &element.kind {
@@ -569,7 +627,11 @@ pub fn build_element_ops(
         } => {
             let polygon = shape_polygon(*shape, *rect);
             let mut ops = fill_ops(&polygon, style, seed);
-            ops.extend(outline_ops(&polygon, style, seed, true));
+            if *shape == ShapeKind::Ellipse {
+                ops.extend(smooth_outline_ops(&polygon, style, seed));
+            } else {
+                ops.extend(outline_ops(&polygon, style, seed, true));
+            }
             ops
         }
         ElementKind::Freehand {
@@ -601,9 +663,10 @@ pub fn build_element_ops(
             start_arrowhead,
             end_arrowhead,
             style,
+            waypoints,
             ..
         } => {
-            let points = connector::route(start, end, *routing, doc);
+            let points = connector::route_avoiding(start, end, *routing, waypoints, doc, obstacles);
             if style.stroke_color == "transparent" || points.len() < 2 {
                 return Vec::new();
             }
@@ -904,7 +967,7 @@ mod tests {
                 0,
             );
             element.id = "stable-id".into();
-            build_element_ops(&element, &doc, &ApproxMeasurer)
+            build_element_ops(&element, &doc, &ApproxMeasurer, &ObstacleIndex::new())
         };
         assert_eq!(make(), make());
     }
@@ -922,12 +985,13 @@ mod tests {
                 start_arrowhead: false,
                 end_arrowhead: true,
                 style: Style::default(),
+                waypoints: Vec::new(),
                 label_id: None,
             },
             "a0".into(),
             0,
         );
-        let ops = build_element_ops(&element, &doc, &ApproxMeasurer);
+        let ops = build_element_ops(&element, &doc, &ApproxMeasurer, &ObstacleIndex::new());
         let filled = ops
             .iter()
             .filter(|op| {

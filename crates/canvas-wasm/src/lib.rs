@@ -9,8 +9,9 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use canvas_core::{
-    Affine, Dash, Document, DrawOp, Editor as CoreEditor, Effects, FillStyle, Modifiers, Point,
-    Rect, Renderer, ShellAction, StrokeStyle, StylePatch, TextAlign, TextMeasurer, TextOp, Tool,
+    Affine, ArrowHandle, Dash, Document, DrawOp, Editor as CoreEditor, Effects, FillStyle,
+    Modifiers, Point, Rect, Renderer, ShellAction, StrokeStyle, StylePatch, TextAlign,
+    TextMeasurer, TextOp, Tool,
 };
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -18,6 +19,10 @@ use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement};
 
 const BACKGROUND: &str = "#1a1815";
 const ACCENT: &str = "#d98e32";
+const GRID_LINE: &str = "rgba(236, 228, 214, 0.07)";
+/// Line spacing at which the grid doubles rather than getting denser, in
+/// device px (at 6 device px a 1px line is still readable).
+const GRID_MIN_SPACING_PX: f64 = 6.0;
 
 fn now_ms() -> u64 {
     js_sys::Date::now() as u64
@@ -245,8 +250,12 @@ struct ViewSnapshot {
 pub struct Editor {
     scene_canvas: HtmlCanvasElement,
     overlay_canvas: HtmlCanvasElement,
+    grid_canvas: HtmlCanvasElement,
     renderer: Canvas2dRenderer,
     overlay: CanvasRenderingContext2d,
+    /// The grid sits between the scene and the overlay so elements paint on
+    /// top of it.
+    grid: CanvasRenderingContext2d,
     /// Offscreen context for text measurement (never painted).
     measure_ctx: CanvasRenderingContext2d,
     dpr: f64,
@@ -279,6 +288,7 @@ impl Editor {
     pub fn new(
         scene_canvas: HtmlCanvasElement,
         overlay_canvas: HtmlCanvasElement,
+        grid_canvas: HtmlCanvasElement,
     ) -> Result<Editor, JsValue> {
         console_error_panic_hook::set_once();
         let ctx = scene_canvas
@@ -289,6 +299,10 @@ impl Editor {
             .get_context("2d")?
             .ok_or_else(|| JsValue::from_str("overlay canvas has no 2d context"))?
             .dyn_into::<CanvasRenderingContext2d>()?;
+        let grid = grid_canvas
+            .get_context("2d")?
+            .ok_or_else(|| JsValue::from_str("grid canvas has no 2d context"))?
+            .dyn_into::<CanvasRenderingContext2d>()?;
         let dpr = web_sys::window()
             .map(|w| w.device_pixel_ratio())
             .unwrap_or(1.0);
@@ -297,8 +311,10 @@ impl Editor {
         let mut editor = Editor {
             scene_canvas,
             overlay_canvas,
+            grid_canvas,
             renderer: Canvas2dRenderer::new(ctx),
             overlay,
+            grid,
             measure_ctx: measure_ctx.clone(),
             dpr,
             core,
@@ -311,9 +327,9 @@ impl Editor {
         Ok(editor)
     }
 
-    /// Match both backing stores to their layout sizes.
+    /// Match every backing store to its layout size.
     pub fn resize(&mut self) {
-        for canvas in [&self.scene_canvas, &self.overlay_canvas] {
+        for canvas in [&self.scene_canvas, &self.overlay_canvas, &self.grid_canvas] {
             let w = canvas.client_width() as f64;
             let h = canvas.client_height() as f64;
             canvas.set_width((w * self.dpr).round().max(1.0) as u32);
@@ -331,7 +347,18 @@ impl Editor {
 
     /// Replace the drawing with an empty one.
     pub fn new_document(&mut self) {
+        // View preferences survive replacing the document.
+        let (grid_visible, snap_to_grid, grid_size) = (
+            self.core.grid_visible,
+            self.core.snap_to_grid,
+            self.core.grid_size,
+        );
+        let zoom_sensitivity = self.core.nav.zoom_sensitivity();
         self.core = CoreEditor::new(Document::new());
+        self.core.grid_visible = grid_visible;
+        self.core.snap_to_grid = snap_to_grid;
+        self.core.grid_size = grid_size;
+        self.core.nav.set_zoom_sensitivity(zoom_sensitivity);
         self.core
             .set_measurer(Box::new(FontMeasurer::new(self.measure_ctx.clone())));
         self.core.set_viewport(self.css_width(), self.css_height());
@@ -347,6 +374,14 @@ impl Editor {
     /// Load the deterministic large fixture (scale verification).
     pub fn load_benchmark_fixture(&mut self, count: usize) {
         let doc = canvas_core::benchmark_fixture(count);
+        let effects = self.core.replace_document(doc);
+        self.apply(effects);
+    }
+
+    /// Load the dense connected board: `nodes` shapes wired to their
+    /// neighbours by `arrows_per_node` (0..=2) bound connectors each.
+    pub fn load_connected_fixture(&mut self, nodes: usize, arrows_per_node: usize) {
+        let doc = canvas_core::benchmark::connected_fixture(nodes, arrows_per_node);
         let effects = self.core.replace_document(doc);
         self.apply(effects);
     }
@@ -373,6 +408,11 @@ impl Editor {
 
     /// Export the drawing as a PNG data URL at the requested scale.
     pub fn export_png(&self, scale: f64) -> Result<String, JsValue> {
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(JsValue::from_str(
+                "export scale must be a positive, finite number",
+            ));
+        }
         let bounds = self
             .core
             .scene
@@ -417,6 +457,9 @@ impl Editor {
     }
 
     pub fn double_click(&mut self, x: f64, y: f64) {
+        if !x.is_finite() || !y.is_finite() {
+            return;
+        }
         let effects = self.core.double_click(Point::new(x, y), now_ms());
         self.apply(effects);
     }
@@ -433,11 +476,12 @@ impl Editor {
     }
 
     /// Apply a style patch (JSON) to the selection and/or defaults.
-    pub fn update_style(&mut self, patch_json: &str) {
-        if let Ok(patch) = serde_json::from_str::<StylePatch>(patch_json) {
-            let effects = self.core.update_style(&patch, now_ms());
-            self.apply(effects);
-        }
+    pub fn update_style(&mut self, patch_json: &str) -> Result<(), JsValue> {
+        let patch: StylePatch = serde_json::from_str(patch_json)
+            .map_err(|error| JsValue::from_str(&format!("invalid style patch: {error}")))?;
+        let effects = self.core.update_style(&patch, now_ms());
+        self.apply(effects);
+        Ok(())
     }
 
     /// The style the panel should show (selection style, else defaults).
@@ -478,16 +522,16 @@ impl Editor {
 
     pub fn set_tool(&mut self, name: &str) {
         if let Some(tool) = Tool::from_name(name) {
-            self.core.set_tool(tool);
-            self.draw_overlay();
+            let effects = self.core.set_tool(tool);
+            self.apply(effects);
         }
     }
 
     /// Select a tool and keep it armed for repeated use.
     pub fn set_tool_locked(&mut self, name: &str) {
         if let Some(tool) = Tool::from_name(name) {
-            self.core.set_tool_locked(tool);
-            self.draw_overlay();
+            let effects = self.core.set_tool_locked(tool);
+            self.apply(effects);
         }
     }
 
@@ -497,6 +541,47 @@ impl Editor {
 
     pub fn is_tool_locked(&self) -> bool {
         self.core.tool_locked
+    }
+
+    /// Show or hide the optional grid.
+    pub fn set_grid_visible(&mut self, visible: bool) {
+        self.core.grid_visible = visible;
+        self.draw_grid();
+    }
+
+    pub fn grid_visible(&self) -> bool {
+        self.core.grid_visible
+    }
+
+    /// Set the grid spacing (world units). Out-of-range values are clamped;
+    /// non-finite values are ignored.
+    pub fn set_grid_size(&mut self, size: f64) {
+        if size.is_finite() {
+            self.core.grid_size = size.clamp(4.0, 400.0);
+            self.draw_grid();
+        }
+    }
+
+    pub fn grid_size(&self) -> f64 {
+        self.core.grid_size
+    }
+
+    /// Multiplier on wheel-zoom strength (1 is the tuned default).
+    pub fn set_zoom_sensitivity(&mut self, sensitivity: f64) {
+        self.core.nav.set_zoom_sensitivity(sensitivity);
+    }
+
+    pub fn zoom_sensitivity(&self) -> f64 {
+        self.core.nav.zoom_sensitivity()
+    }
+
+    /// Enable or disable snapping edits to the grid.
+    pub fn set_snap_enabled(&mut self, enabled: bool) {
+        self.core.snap_to_grid = enabled;
+    }
+
+    pub fn snap_enabled(&self) -> bool {
+        self.core.snap_to_grid
     }
 
     /// Load the seed demo: a small cloud architecture to explore.
@@ -535,6 +620,9 @@ impl Editor {
     // -- input -------------------------------------------------------------
 
     pub fn pointer_down(&mut self, x: f64, y: f64, button: u8, mods: JsValue) {
+        if !x.is_finite() || !y.is_finite() {
+            return;
+        }
         let mods = parse_modifiers(&mods);
         let effects = self
             .core
@@ -544,16 +632,25 @@ impl Editor {
 
     /// Forward pointer pressure for freehand capture.
     pub fn set_pressure(&mut self, pressure: f64) {
+        if !pressure.is_finite() {
+            return;
+        }
         self.core.set_pressure(pressure);
     }
 
     pub fn pointer_move(&mut self, x: f64, y: f64, mods: JsValue) {
+        if !x.is_finite() || !y.is_finite() {
+            return;
+        }
         let mods = parse_modifiers(&mods);
         let effects = self.core.pointer_move(Point::new(x, y), mods, now_ms());
         self.apply(effects);
     }
 
     pub fn pointer_up(&mut self, x: f64, y: f64, button: u8, mods: JsValue) {
+        if !x.is_finite() || !y.is_finite() {
+            return;
+        }
         let mods = parse_modifiers(&mods);
         let effects = self.core.pointer_up(Point::new(x, y), mods, now_ms());
         let _ = button;
@@ -564,6 +661,9 @@ impl Editor {
     }
 
     pub fn wheel(&mut self, x: f64, y: f64, dx: f64, dy: f64, ctrl: bool) {
+        if !x.is_finite() || !y.is_finite() || !dx.is_finite() || !dy.is_finite() {
+            return;
+        }
         self.core
             .nav
             .wheel(&mut self.core.camera, Point::new(x, y), dx, dy, ctrl);
@@ -573,6 +673,9 @@ impl Editor {
     }
 
     pub fn zoom_at(&mut self, x: f64, y: f64, factor: f64) {
+        if !x.is_finite() || !y.is_finite() || !factor.is_finite() {
+            return;
+        }
         self.core.camera.zoom_at(Point::new(x, y), factor);
         self.render();
     }
@@ -691,6 +794,35 @@ impl Editor {
     pub fn screen_to_world(&self, x: f64, y: f64) -> Vec<f64> {
         let p = self.core.camera.screen_to_world(Point::new(x, y));
         vec![p.x, p.y]
+    }
+
+    /// The routed polyline currently drawn for a connector, as flat x/y
+    /// world coordinates. Empty for anything that is not a connector.
+    pub fn route_for(&self, id: &str) -> Vec<f64> {
+        let Some(element) = self.core.doc.element(id) else {
+            return Vec::new();
+        };
+        let canvas_core::model::ElementKind::Arrow {
+            start,
+            end,
+            routing,
+            waypoints,
+            ..
+        } = &element.kind
+        else {
+            return Vec::new();
+        };
+        canvas_core::connector::route_avoiding(
+            start,
+            end,
+            *routing,
+            waypoints,
+            &self.core.doc,
+            &self.core.obstacles,
+        )
+        .into_iter()
+        .flat_map(|p| [p.x, p.y])
+        .collect()
     }
 }
 
@@ -928,7 +1060,48 @@ impl Editor {
         self.renderer.end_frame();
     }
 
+    /// Paint the optional grid on its own canvas, under the elements. The
+    /// spacing doubles as the view zooms out so lines never crowd together.
+    fn draw_grid(&mut self) {
+        let (w, h) = (
+            self.grid_canvas.width() as f64,
+            self.grid_canvas.height() as f64,
+        );
+        self.grid.save();
+        let _ = self.grid.set_transform(1.0, 0.0, 0.0, 1.0, 0.0, 0.0);
+        self.grid.clear_rect(0.0, 0.0, w, h);
+        if self.core.grid_visible && w > 0.0 && h > 0.0 {
+            let camera = self.core.camera;
+            let mut step = self.core.grid_size;
+            while step * camera.zoom * self.dpr < GRID_MIN_SPACING_PX {
+                step *= 2.0;
+            }
+            let top_left = camera.screen_to_world(Point::ZERO);
+            let bottom_right = camera.screen_to_world(Point::new(w / self.dpr, h / self.dpr));
+            self.grid.set_stroke_style_str(GRID_LINE);
+            self.grid.set_line_width(1.0);
+            self.grid.begin_path();
+            let mut x = (top_left.x / step).floor() * step;
+            while x <= bottom_right.x {
+                let sx = (camera.world_to_screen(Point::new(x, 0.0)).x * self.dpr).round();
+                self.grid.move_to(sx, 0.0);
+                self.grid.line_to(sx, h);
+                x += step;
+            }
+            let mut y = (top_left.y / step).floor() * step;
+            while y <= bottom_right.y {
+                let sy = (camera.world_to_screen(Point::new(0.0, y)).y * self.dpr).round();
+                self.grid.move_to(0.0, sy);
+                self.grid.line_to(w, sy);
+                y += step;
+            }
+            self.grid.stroke();
+        }
+        self.grid.restore();
+    }
+
     fn draw_overlay(&mut self) {
+        self.draw_grid();
         let (w, h) = (
             self.overlay_canvas.width() as f64,
             self.overlay_canvas.height() as f64,
@@ -957,6 +1130,27 @@ impl Editor {
                 r.w * self.dpr,
                 r.h * self.dpr,
             );
+        }
+
+        // Bend handles on a selected connector: filled = existing waypoint,
+        // hollow = drag to add one.
+        for handle in self.core.arrow_path_handles() {
+            let screen = self.core.camera.world_to_screen(handle.point());
+            let (x, y) = (screen.x * self.dpr, screen.y * self.dpr);
+            let existing = matches!(handle, ArrowHandle::Waypoint { .. });
+            let radius = if existing { 4.0 } else { 3.5 } * self.dpr;
+            self.overlay.begin_path();
+            let _ = self.overlay.arc(x, y, radius, 0.0, std::f64::consts::TAU);
+            if existing {
+                self.overlay.set_fill_style_str(ACCENT);
+                self.overlay.fill();
+            } else {
+                self.overlay.set_fill_style_str(BACKGROUND);
+                self.overlay.fill();
+            }
+            self.overlay.set_stroke_style_str(ACCENT);
+            self.overlay.set_line_width(self.dpr * 1.5);
+            self.overlay.stroke();
         }
 
         let anchors = self.core.hover_anchor_points();

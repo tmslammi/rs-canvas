@@ -22,6 +22,7 @@ pub mod nav;
 pub mod rough;
 pub mod scene;
 pub mod serialization;
+pub mod spatial;
 pub mod svg;
 pub mod text;
 pub mod tool;
@@ -33,8 +34,8 @@ pub use delta::{Delta, EditError};
 pub use demo::demo_document;
 pub use display::{Dash, DisplayList, DrawOp, FillStyle, PathOp, Renderer, StrokeStyle, TextOp};
 pub use editor::{
-    element_style, element_style_mut, translate_element, Editor, Effects, Handle, Modifiers,
-    ShellAction,
+    element_style, element_style_mut, translate_element, ArrowHandle, Editor, Effects, Handle,
+    Modifiers, ShellAction, GRID_SIZE,
 };
 pub use geometry::{Affine, Point, Rect};
 pub use glyphs::{catalog as glyph_catalog, lookup as glyph_lookup, GlyphCategory, GlyphInfo};
@@ -47,5 +48,6 @@ pub use model::{
 };
 pub use nav::NavigationState;
 pub use scene::{Scene, SceneLayer};
+pub use spatial::ObstacleIndex;
 pub use text::{layout_text, ApproxMeasurer, TextLayout, TextMeasurer};
 pub use tool::Tool;

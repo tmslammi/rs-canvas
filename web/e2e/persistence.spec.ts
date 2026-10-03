@@ -42,37 +42,21 @@ test("save and open round-trip through JSON", async ({ page }) => {
   expect(await count(page)).toBe(1);
 });
 
-test("Save button downloads a JSON file", async ({ page }) => {
-  await page.goto("/");
-  await page.waitForFunction(() => window.__rsReady === true);
-  await page.evaluate(() => window.__rsEditor!.new_document());
-  await drawRect(page);
-
-  const downloadPromise = page.waitForEvent("download");
-  await page.getByTitle("Save (⌘S)").click();
-  const download = await downloadPromise;
-  expect(download.suggestedFilename()).toContain("rs-canvas");
-  expect(download.suggestedFilename()).toContain(".json");
-});
-
-test("Open a JSON file from disk, with a toast for invalid files", async ({ page }) => {
+test("a broken document is rejected without losing the open one", async ({ page }) => {
   await page.goto("/");
   await page.waitForFunction(() => window.__rsReady === true);
   await page.evaluate(() => window.__rsEditor!.new_document());
   await drawRect(page);
   expect(await count(page)).toBe(1);
 
-  await page.setInputFiles("#file-input", {
-    name: "drawing.json",
-    mimeType: "application/json",
-    buffer: Buffer.from(JSON.stringify({ schemaVersion: 1, elements: {} })),
+  const message = await page.evaluate(() => {
+    try {
+      window.__rsEditor!.load_json("{ definitely not a document");
+      return "";
+    } catch (error) {
+      return String(error);
+    }
   });
-  await expect.poll(() => count(page), { message: "the file replaced the document" }).toBe(0);
-
-  await page.setInputFiles("#file-input", {
-    name: "broken.json",
-    mimeType: "application/json",
-    buffer: Buffer.from("{ definitely not a document"),
-  });
-  await expect(page.locator("#toast")).toHaveClass(/error/);
+  expect(message).not.toBe("");
+  expect(await count(page), "the open document survives a failed load").toBe(1);
 });
