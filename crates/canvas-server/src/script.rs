@@ -532,7 +532,7 @@ fn beat_label(beat: &ScriptBeat) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::doc_ops::describe;
+    use canvas_core::describe::describe;
 
     fn beat(json: serde_json::Value) -> ScriptBeat {
         serde_json::from_value(json).expect("valid beat")
@@ -572,8 +572,8 @@ mod tests {
         assert_eq!(outcome.created.len(), 4);
         let described = describe(&doc);
         assert!(described.contains("frame"), "{described}");
-        assert!(described.contains("name=\"VPC\""), "{described}");
-        assert!(described.contains("label=\"queries\""), "{described}");
+        assert!(described.contains("\"VPC\""), "{described}");
+        assert!(described.contains("\"queries\""), "{described}");
     }
 
     #[test]
@@ -711,7 +711,7 @@ mod tests {
         )
         .unwrap();
         let described = describe(&doc);
-        assert!(described.contains(&format!("to={existing}")), "{described}");
+        assert!(described.contains(&format!(">{existing}")), "{described}");
         assert_eq!(outcome.created.len(), 2);
     }
 
@@ -791,7 +791,7 @@ mod tests {
         // a + label + b + label, then two cross strokes.
         assert_eq!(outcome.steps[2].created.len(), 2, "a cross is two strokes");
         let described = describe(&doc);
-        assert!(described.contains("freehand"), "{described}");
+        assert!(described.contains("stroke"), "{described}");
         // The clear beat tombstoned a and its label; b and the mark remain.
         let id_for = |handle: &str| {
             outcome

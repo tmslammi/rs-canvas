@@ -8,6 +8,7 @@ pub mod camera;
 pub mod connector;
 pub mod delta;
 pub mod demo;
+pub mod describe;
 pub mod display;
 pub mod editor;
 pub mod geometry;
@@ -19,6 +20,7 @@ pub mod index;
 pub mod merge;
 pub mod model;
 pub mod nav;
+pub mod patch;
 pub mod rough;
 pub mod scene;
 pub mod serialization;
@@ -32,6 +34,9 @@ pub use camera::{Camera, CameraTween};
 pub use connector::{anchor_points, nearest_anchor, resolve_endpoint, route, AnchorSide};
 pub use delta::{Delta, EditError};
 pub use demo::demo_document;
+pub use describe::{
+    describe, describe_element, describe_element_with, describe_with, IdMap, UuidMap,
+};
 pub use display::{Dash, DisplayList, DrawOp, FillStyle, PathOp, Renderer, StrokeStyle, TextOp};
 pub use editor::{
     element_style, element_style_mut, translate_element, ArrowHandle, Editor, Effects, Handle,
@@ -47,6 +52,7 @@ pub use model::{
     StrokeDash, Style, StylePatch, TextAlign, SCHEMA_VERSION,
 };
 pub use nav::NavigationState;
+pub use patch::{merge_element, Patch};
 pub use scene::{Scene, SceneLayer};
 pub use spatial::ObstacleIndex;
 pub use text::{layout_text, ApproxMeasurer, TextLayout, TextMeasurer};

@@ -38,7 +38,7 @@ test("a human edit reaches the agent", async ({ page, request }) => {
       timeout: 5_000,
     })
     .toBe(before + 1);
-  expect(await mcp.text("canvas_read", {})).toContain("rectangle");
+  expect(await mcp.text("canvas_read", {})).toContain("rect");
 });
 
 test("undoing a creation propagates as a deletion", async ({
@@ -77,7 +77,7 @@ test("undoing a creation propagates as a deletion", async ({
   });
   expect(liveRectangle, "the purged rectangle resurrected").toBe(false);
   const described = await mcp.text("canvas_read", {});
-  expect(described).not.toContain("rectangle");
+  expect(described).not.toContain(" rect ");
   expect(described).toContain("Titanic");
 });
 
@@ -126,13 +126,15 @@ test("a canvas_pen stroke lands as a freehand element", async ({
     { timeout: 3_000 },
   );
   expect(typeof created.id).toBe("string");
-  expect(await mcp.text("canvas_read", {})).toContain("freehand");
+  expect(await mcp.text("canvas_read", {})).toContain("stroke");
 
   // The pressure profile and ink style survive the trip to the page.
-  const element = await page.evaluate((id) => {
+  const element = await page.evaluate(() => {
     const doc = JSON.parse(window.__rsEditor!.save_json());
-    return doc.elements[id];
-  }, created.id as string);
+    return Object.values<Record<string, any>>(doc.elements).find(
+      (e) => e.type === "freehand",
+    );
+  });
   expect(element.pressures).toEqual([0.2, 1.0, 0.6]);
   expect(element.style.strokeColor).toBe("#ff8787");
   expect(element.style.strokeWidth).toBe(5);
@@ -190,15 +192,13 @@ test("the server keeps drawings while no page is open", async ({
   request,
 }) => {
   const mcp = mcpClient(request, BASE);
-  const created = toolJson(
-    await mcp.call("canvas_draw", { kind: "ellipse", text: "LB" }),
-  );
+  await mcp.call("canvas_draw", { kind: "ellipse", text: "LB" });
 
   const page = await context.newPage();
   await openPage(page);
   await page.waitForFunction(
-    (id) => window.__rsEditor!.save_json().includes(id),
-    created.id,
+    () => window.__rsEditor!.save_json().includes("LB"),
+    undefined,
     { timeout: 3_000 },
   );
   await page.close();
@@ -267,7 +267,7 @@ test("the agent sees the human's view and what changed", async ({
     })
     .toContain("changed now:");
   const report = await mcp.text("canvas_read", { since: revision });
-  expect(report).toContain("rectangle");
+  expect(report).toContain("rect");
   const status = JSON.parse(await mcp.text("canvas_status", {}));
   expect(status.hints.camera.zoom).toBeGreaterThan(0);
   expect(status.hints.note).toContain("transient");
@@ -302,7 +302,7 @@ test("discussion verbs work on the live canvas", async ({ page, request }) => {
     { timeout: 3_000 },
   );
   const json = await page.evaluate(() => window.__rsEditor!.save_json());
-  expect(json).toContain(b);
+  expect(json).toContain('"text": "B"');
   expect(json).toContain('"type": "freehand"');
 });
 
@@ -325,9 +325,7 @@ test("an autosave and the server mirror merge on reconnect", async ({
   await first.close();
 
   // The agent draws while the page is closed; the server keeps it.
-  const created = toolJson(
-    await mcp.call("canvas_draw", { kind: "sticky", text: "Cache" }),
-  );
+  await mcp.call("canvas_draw", { kind: "sticky", text: "Cache" });
 
   // A fresh page loads its IndexedDB autosave first, then reconciles the
   // server mirror: both sides survive.
@@ -339,7 +337,7 @@ test("an autosave and the server mirror merge on reconnect", async ({
     { timeout: 3_000 },
   );
   const json = await second.evaluate(() => window.__rsEditor!.save_json());
-  expect(json).toContain(created.id);
+  expect(json).toContain("Cache");
   await second.close();
 });
 
@@ -386,6 +384,7 @@ test("a server restart preserves the document", async ({ request }) => {
     expect(described).toContain("Decision");
   } finally {
     server.kill();
+    if (server.exitCode === null) await waitForExit(server);
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

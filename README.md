@@ -45,14 +45,10 @@ camera focus — presented beat by beat on the user's canvas),
 share one document through the merge-ready model, and the mirror persists to
 `.rs-canvas/current.json`.
 
-The toolbar's ✉ button opens an in-canvas chat backed by the local OpenCode
-service: `canvas-server` discovers it from its registration file, creates one
-session at the project root — so it inherits the canvas MCP config — and the
-answers appear in the drawer, pinned to DeepSeek 4.1 Flash for now. The ◎
-button opens live agent preferences the server enforces: camera moves
-(off / gentle / full — focus skips targets that are already visible and never
-zooms past 2× on gentle) and presentation pacing, persisted to
-`.rs-canvas/settings.json`. Everything is local-only.
+The toolbar's ◎ button opens live agent preferences the server enforces:
+camera moves (off / gentle / full — focus skips targets that are already
+visible and never zooms past 2× on gentle) and presentation pacing, persisted
+to `.rs-canvas/settings.json`. Everything is local-only.
 
 The app is served as-is: `index.html` loads `/src/main.js` as an ES module, the wasm-bindgen `--target web` output is imported directly, and CSS/fonts are plain files. There is no Vite, no TypeScript and no bundler in the app — `npm run dev` also watches Rust sources and rebuilds the wasm for you (reload the page after a rebuild).
 

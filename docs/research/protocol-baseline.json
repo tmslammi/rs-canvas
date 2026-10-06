@@ -1,0 +1,47 @@
+{
+  "config": {
+    "runs": 3
+  },
+  "fixture": {
+    "doc_json_bytes": 20290004,
+    "elements": 12000,
+    "live": 10000,
+    "points": 280603,
+    "strokes": 7000,
+    "tombstones": 2000
+  },
+  "patch": {
+    "element_bytes": 3332,
+    "frame_bytes": 3356,
+    "frame_parse_ms": 0.017,
+    "frame_serialize_ms": 0.006,
+    "merge_ms": 0.0,
+    "roundtrip_ms": 0.077,
+    "scene_update_ms": 0.053
+  },
+  "points": {
+    "binary_varint_bytes": 1845103,
+    "current_json_bytes": 15428532,
+    "flat_f64_json_bytes": 9642141,
+    "quant_0_01_json_bytes": 4152094
+  },
+  "read": {
+    "chars": 1109183,
+    "describe_ms": 6277.293,
+    "lines": 10001,
+    "tokens_est": 367296.0,
+    "uuid_chars": 360000
+  },
+  "snapshot": {
+    "clone_ms": 2.85,
+    "frame_object_bytes": 20290038,
+    "frame_string_bytes": 22110437,
+    "obstacles_rebuild_ms": 0.659,
+    "page_roundtrip_ms": 439.173,
+    "parse_ms": 114.634,
+    "reconcile_ms": 84.638,
+    "reconcile_one_ms": 84.753,
+    "scene_rebuild_ms": 201.65,
+    "serialize_ms": 38.25
+  }
+}

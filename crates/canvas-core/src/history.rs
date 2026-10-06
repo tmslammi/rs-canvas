@@ -116,6 +116,7 @@ impl Transaction {
     /// Close the transaction and push it onto the history.
     pub fn commit(self, history: &mut History) {
         if !self.deltas.is_empty() {
+            history.outbox.extend(self.deltas.iter().cloned());
             history.undo_stack.push(self);
             history.redo_stack.clear();
         }
@@ -127,6 +128,10 @@ impl Transaction {
 pub struct History {
     undo_stack: Vec<Transaction>,
     redo_stack: Vec<Transaction>,
+    /// Deltas applied since the last drain, in application order. Commits,
+    /// undos and redos all land here; the page bridge projects them into wire
+    /// patches so peers see every change, not just the document snapshots.
+    outbox: Vec<Delta>,
 }
 
 impl History {
@@ -164,7 +169,9 @@ impl History {
                     .map(|delta| delta.element_id().clone())
                     .collect();
                 for delta in tx.deltas().iter().rev() {
-                    doc.apply(&delta.invert())?;
+                    let inverse = delta.invert();
+                    doc.apply(&inverse)?;
+                    self.outbox.push(inverse);
                 }
                 self.redo_stack.push(tx);
                 Ok(ids)
@@ -184,11 +191,17 @@ impl History {
                     .collect();
                 for delta in tx.deltas() {
                     doc.apply(delta)?;
+                    self.outbox.push(delta.clone());
                 }
                 self.undo_stack.push(tx);
                 Ok(ids)
             }
         }
+    }
+
+    /// Take every delta applied since the last drain.
+    pub fn drain_outbox(&mut self) -> Vec<Delta> {
+        std::mem::take(&mut self.outbox)
     }
 }
 
@@ -241,6 +254,35 @@ mod tests {
         assert!(!history.redo(&mut doc).unwrap().is_empty());
         assert_eq!(doc.ordered_live().len(), 1);
         assert_eq!(doc.ordered_live()[0].id, id);
+    }
+
+    #[test]
+    fn outbox_records_commits_undos_and_redos() {
+        let mut doc = Document::new();
+        let mut history = History::new();
+
+        let mut tx = Transaction::begin();
+        let element = Element::new(shape(0.0, 0.0), "a0".into(), 1);
+        tx.add(&mut doc, element).unwrap();
+        tx.commit(&mut history);
+
+        let committed = history.drain_outbox();
+        assert_eq!(committed.len(), 1);
+        assert!(matches!(committed[0], Delta::Add { .. }));
+        assert!(history.drain_outbox().is_empty(), "a drain empties the box");
+
+        history.undo(&mut doc).unwrap();
+        let undone = history.drain_outbox();
+        assert_eq!(undone.len(), 1);
+        assert!(
+            matches!(undone[0], Delta::Purge { .. }),
+            "undoing an add purges the element"
+        );
+
+        history.redo(&mut doc).unwrap();
+        let redone = history.drain_outbox();
+        assert_eq!(redone.len(), 1);
+        assert!(matches!(redone[0], Delta::Add { .. }));
     }
 
     #[test]

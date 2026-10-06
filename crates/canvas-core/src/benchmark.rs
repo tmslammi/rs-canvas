@@ -119,6 +119,151 @@ fn next_index(last: &mut Option<String>) -> String {
     key
 }
 
+/// A deterministic UUID-shaped id, so wire/read benchmarks pay the same id
+/// cost a real element does.
+fn uuid_like(rng: &mut Lcg) -> String {
+    let a = rng.next() as u32;
+    let b = rng.next() as u16;
+    let c = (rng.next() as u16 & 0x0fff) | 0x4000;
+    let d = (rng.next() as u16 & 0x3fff) | 0x8000;
+    let e = ((rng.next() << 16) | (rng.next() & 0xffff)) & 0xffff_ffff_ffff;
+    format!("{a:08x}-{b:04x}-{c:04x}-{d:04x}-{e:012x}")
+}
+
+/// A freehand-heavy sketch like a real drawing: `live` elements on a grid
+/// (70% freehand strokes with 20–60 samples, the rest shapes, text and bound
+/// connectors) plus `tombstones` deleted elements. Deterministic, for
+/// wire-cost benchmarking against `benchmark_fixture`'s architecture board.
+pub fn sketch_fixture(live: usize, tombstones: usize) -> Document {
+    let mut doc = Document::new();
+    let mut rng = Lcg(90210);
+    let palette = ["#ffec99", "#b2f2bb", "#a5d8ff", "#ffc9c9", "#d0bfff"];
+    let mut last_index: Option<String> = None;
+    let mut shapes: Vec<String> = Vec::new();
+
+    for i in 0..live {
+        let col = i % 40;
+        let row = i / 40;
+        let x = col as f64 * 260.0 + 20.0;
+        let y = row as f64 * 200.0 + 20.0;
+        let index = next_index(&mut last_index);
+        let style = Style {
+            fill_color: palette[rng.next() as usize % palette.len()].into(),
+            fill_style: match rng.next() % 3 {
+                0 => FillPattern::Hachure,
+                1 => FillPattern::CrossHatch,
+                _ => FillPattern::Solid,
+            },
+            roughness: (rng.next() % 3) as u8,
+            stroke_width: 1.0 + (rng.next() % 30) as f64 / 10.0,
+            opacity: 0.5 + (rng.next() % 50) as f64 / 100.0,
+            ..Style::default()
+        };
+        let kind = match i % 10 {
+            0..=6 => {
+                let n = 20 + (rng.next() % 41) as usize;
+                let mut points = Vec::with_capacity(n);
+                let (mut px, mut py) = (x, y);
+                for _ in 0..n {
+                    // Fractional steps, like real pointer input: full-precision
+                    // floats on the wire, not round numbers.
+                    px += ((rng.next() % 24_001) as f64 / 10.0 - 1200.0) / 3.0;
+                    py += ((rng.next() % 18_001) as f64 / 10.0 - 600.0) / 3.0;
+                    points.push(Point::new(px, py));
+                }
+                let pressures: Vec<f64> = (0..n)
+                    .map(|_| 0.2 + (rng.next() % 800) as f64 / 1000.0)
+                    .collect();
+                ElementKind::Freehand {
+                    points,
+                    pressures,
+                    style,
+                }
+            }
+            7 => {
+                let id = uuid_like(&mut rng);
+                let element = Element::new(
+                    ElementKind::Shape {
+                        shape: match i % 3 {
+                            0 => ShapeKind::Rectangle,
+                            1 => ShapeKind::Ellipse,
+                            _ => ShapeKind::Diamond,
+                        },
+                        rect: Rect::new(x, y, 140.0, 90.0),
+                        style,
+                        bound_text_id: None,
+                    },
+                    index,
+                    i as u64,
+                )
+                .with_id(id.clone());
+                shapes.push(id);
+                doc.insert(element);
+                continue;
+            }
+            8 if shapes.len() >= 2 => {
+                let from = shapes[shapes.len() - 1].clone();
+                let to = shapes[shapes.len() - 2].clone();
+                let from_rect = doc.element(&from).map(|e| e.bounds()).unwrap_or(Rect::ZERO);
+                let to_rect = doc.element(&to).map(|e| e.bounds()).unwrap_or(Rect::ZERO);
+                ElementKind::Arrow {
+                    start: crate::model::Endpoint {
+                        x: from_rect.center().x,
+                        y: from_rect.center().y,
+                        binding: Some(crate::model::Binding {
+                            element_id: from,
+                            focus: None,
+                        }),
+                    },
+                    end: crate::model::Endpoint {
+                        x: to_rect.center().x,
+                        y: to_rect.center().y,
+                        binding: Some(crate::model::Binding {
+                            element_id: to,
+                            focus: None,
+                        }),
+                    },
+                    routing: Routing::Elbow,
+                    start_arrowhead: false,
+                    end_arrowhead: true,
+                    style: Style::default(),
+                    waypoints: Vec::new(),
+                    label_id: None,
+                }
+            }
+            _ => ElementKind::Text {
+                rect: Rect::new(x, y, 160.0, 26.0),
+                text: format!("Note {i}"),
+                align: TextAlign::Left,
+                fixed_width: true,
+                container_id: None,
+                style: Style::default(),
+            },
+        };
+        let element = Element::new(kind, index, i as u64).with_id(uuid_like(&mut rng));
+        doc.insert(element);
+    }
+
+    for t in 0..tombstones {
+        let index = next_index(&mut last_index);
+        let mut element = Element::new(
+            ElementKind::Shape {
+                shape: ShapeKind::Rectangle,
+                rect: Rect::new(t as f64 * 10.0, 0.0, 100.0, 60.0),
+                style: Style::default(),
+                bound_text_id: None,
+            },
+            index,
+            0,
+        )
+        .with_id(uuid_like(&mut rng));
+        element.is_deleted = true;
+        element.touch(1);
+        doc.insert(element);
+    }
+    doc
+}
+
 /// A dense architecture-like board: `nodes` shapes on a square grid, each
 /// wired to its right and/or lower neighbour by a bound elbow connector.
 /// `arrows_per_node` picks how many of those two links are drawn (0..=2),
@@ -224,6 +369,22 @@ mod tests {
     fn fixture_has_the_requested_size() {
         let doc = benchmark_fixture(500);
         assert_eq!(doc.ordered_live().len(), 500);
+    }
+
+    #[test]
+    fn sketch_fixture_is_freehand_heavy_and_carries_tombstones() {
+        let doc = sketch_fixture(500, 100);
+        assert_eq!(doc.len(), 600);
+        assert_eq!(doc.live_count(), 500);
+        let strokes = doc
+            .ordered_live()
+            .iter()
+            .filter(|e| matches!(e.kind, ElementKind::Freehand { .. }))
+            .count();
+        assert!(
+            strokes > 300,
+            "expected a freehand-heavy mix, got {strokes}"
+        );
     }
 
     #[test]

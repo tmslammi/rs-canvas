@@ -53,6 +53,13 @@ pub fn to_json_pretty(doc: &Document) -> Result<String, SchemaError> {
 
 pub fn from_json(input: &str) -> Result<Document, SchemaError> {
     let value: Value = serde_json::from_str(input)?;
+    from_value(value)
+}
+
+/// Load a document from an already-parsed JSON value, with the same schema
+/// check, migration and sanitizing as `from_json`. Used by the wire protocol,
+/// where the document arrives as an embedded JSON object.
+pub fn from_value(value: Value) -> Result<Document, SchemaError> {
     let version = value
         .get("schemaVersion")
         .and_then(Value::as_u64)

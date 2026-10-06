@@ -9,12 +9,38 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use canvas_core::model::Document;
+use canvas_core::model::{Document, Element};
 use canvas_core::serialization;
 use tokio::sync::{broadcast, Mutex, Notify};
 
+use crate::aliases::Aliases;
+
 /// How many recent changes `canvas_read(since)` can recall.
 const CHANGE_LOG_LIMIT: usize = 200;
+
+/// How long a burst of edits coalesces before the mirror is written to disk.
+const PERSIST_DEBOUNCE: Duration = Duration::from_millis(500);
+
+/// One broadcast frame plus the page that must not receive it (the origin of
+/// a patch never gets its own change echoed back).
+#[derive(Clone, Debug)]
+pub struct PageMessage {
+    pub text: String,
+    pub except: Option<u64>,
+}
+
+impl PageMessage {
+    pub fn all(text: String) -> Self {
+        Self { text, except: None }
+    }
+
+    pub fn except(text: String, page: u64) -> Self {
+        Self {
+            text,
+            except: Some(page),
+        }
+    }
+}
 
 /// One recorded document change, for `canvas_read(since)`.
 #[derive(Clone, Debug)]
@@ -164,8 +190,14 @@ pub struct AppState {
     pub sync: bool,
     /// Connected pages.
     pub pages: AtomicUsize,
+    /// Connection ids, so a patch broadcast can skip its origin page.
+    next_page: AtomicU64,
     /// Server-to-page messages (JSON text over the WebSocket).
-    pub to_pages: broadcast::Sender<String>,
+    pub to_pages: broadcast::Sender<PageMessage>,
+    /// A persist is queued; bursts coalesce into one write.
+    persist_pending: AtomicBool,
+    /// Wakes the persist loop.
+    persist_notify: Notify,
     /// Page acknowledgements of a finished presentation: (id, cancelled).
     pub present_acks: broadcast::Sender<(u64, bool)>,
     /// Presentation ids, so each timeline can be matched to its ack.
@@ -184,6 +216,8 @@ pub struct AppState {
     change_log: Mutex<Vec<ChangeRecord>>,
     /// Transient view state from the most recent page report.
     pub view_hint: Mutex<Option<ViewHint>>,
+    /// Short handles for element ids, as the agent sees them.
+    pub aliases: Mutex<Aliases>,
     /// The user's live agent preferences.
     pub settings: Mutex<AgentSettings>,
     /// Where settings persist; follows the document's directory.
@@ -205,7 +239,10 @@ impl AppState {
             web_dir,
             sync,
             pages: AtomicUsize::new(0),
+            next_page: AtomicU64::new(0),
             to_pages,
+            persist_pending: AtomicBool::new(false),
+            persist_notify: Notify::new(),
             present_acks,
             present_counter: AtomicU64::new(0),
             present_active: AtomicBool::new(false),
@@ -215,6 +252,7 @@ impl AppState {
             revision: AtomicU64::new(0),
             change_log: Mutex::new(Vec::new()),
             view_hint: Mutex::new(None),
+            aliases: Mutex::new(Aliases::default()),
             settings: Mutex::new(AgentSettings::default()),
             settings_path,
         }
@@ -278,9 +316,9 @@ impl AppState {
                 }
             }
         }
-        let _ = self
-            .to_pages
-            .send(serde_json::json!({ "type": "settings", "settings": settings }).to_string());
+        let _ = self.to_pages.send(PageMessage::all(
+            serde_json::json!({ "type": "settings", "settings": settings }).to_string(),
+        ));
         Ok(settings)
     }
 
@@ -290,23 +328,170 @@ impl AppState {
         serialization::to_json(&doc).unwrap_or_default()
     }
 
-    /// Merge an already-parsed page document into the mirror. Returns whether
-    /// the mirror changed.
-    pub async fn absorb_document(&self, remote: &Document) -> bool {
-        let mut doc = self.doc.lock().await;
-        let before = doc.clone();
-        let merged = canvas_core::merge::reconcile(&doc, remote);
-        if merged == *doc {
-            return false;
+    /// The next connection id.
+    pub fn new_page_id(&self) -> u64 {
+        self.next_page.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// The element id behind a handle; unknown names pass through.
+    pub async fn resolve_id(&self, name: &str) -> String {
+        self.aliases.lock().await.resolve(name)
+    }
+
+    /// Resolve a batch of handles.
+    pub async fn resolve_ids(&self, names: &[String]) -> Vec<String> {
+        let aliases = self.aliases.lock().await;
+        names.iter().map(|name| aliases.resolve(name)).collect()
+    }
+
+    /// The `{"type":"snapshot","rev":N,"doc":{...}}` frame for the mirror.
+    /// The document is embedded as an object, not an escaped string: one
+    /// parse on the page and no escaping overhead.
+    pub async fn snapshot_frame(&self) -> String {
+        let revision = self.revision.load(Ordering::SeqCst);
+        self.snapshot_json(revision).await
+    }
+
+    async fn snapshot_json(&self, revision: u64) -> String {
+        #[derive(serde::Serialize)]
+        struct Snapshot<'a> {
+            #[serde(rename = "type")]
+            kind: &'static str,
+            rev: u64,
+            doc: &'a Document,
         }
-        *doc = merged;
-        self.record_change(&before, &doc, "page").await;
+        let doc = self.doc.lock().await;
+        serde_json::to_string(&Snapshot {
+            kind: "snapshot",
+            rev: revision,
+            doc: &doc,
+        })
+        .unwrap_or_default()
+    }
+
+    /// The `{"type":"patch","rev":N,"put":[...]}` frame.
+    pub fn patch_frame(revision: u64, put: &[Element]) -> String {
+        #[derive(serde::Serialize)]
+        struct Patch<'a> {
+            #[serde(rename = "type")]
+            kind: &'static str,
+            rev: u64,
+            put: &'a [Element],
+        }
+        serde_json::to_string(&Patch {
+            kind: "patch",
+            rev: revision,
+            put,
+        })
+        .unwrap_or_default()
+    }
+
+    /// Merge an already-parsed page document into the mirror. Returns whether
+    /// the mirror changed. Connect-time path: the merged result is broadcast
+    /// as a full snapshot, because the page may be missing server-side edits.
+    pub async fn absorb_document(&self, remote: &Document) -> bool {
+        let before = {
+            let mut doc = self.doc.lock().await;
+            let before = doc.clone();
+            let merged = canvas_core::merge::reconcile(&doc, remote);
+            if merged == *doc {
+                return false;
+            }
+            *doc = merged;
+            before
+        };
+        let doc = self.doc.lock().await;
+        let (revision, _) = self.record_change(&before, &doc, "page").await;
+        drop(doc);
+        self.broadcast_snapshot(revision).await;
         true
     }
 
+    /// Merge a page patch into the mirror. Changed elements broadcast to the
+    /// other pages; elements whose copy lost to a newer mirror version come
+    /// back to the origin as corrections, so a concurrent agent edit cannot
+    /// leave the page stale. Returns whether the mirror changed.
+    pub async fn absorb_patch(&self, put: Vec<Element>, origin: u64) -> bool {
+        let mut changed_ids: Vec<String> = Vec::new();
+        let mut corrections: Vec<Element> = Vec::new();
+        {
+            let mut doc = self.doc.lock().await;
+            for element in &put {
+                if canvas_core::merge_element(&mut doc, element) {
+                    changed_ids.push(element.id.clone());
+                } else if let Some(stored) = doc.elements.get(&element.id) {
+                    if stored != element && !corrections.iter().any(|e| e.id == element.id) {
+                        corrections.push(stored.clone());
+                    }
+                }
+            }
+        }
+        if changed_ids.is_empty() && corrections.is_empty() {
+            return false;
+        }
+
+        let revision = if changed_ids.is_empty() {
+            self.revision.load(Ordering::SeqCst)
+        } else {
+            self.record_ids(changed_ids.clone(), "page").await
+        };
+        let winners: Vec<Element> = {
+            let doc = self.doc.lock().await;
+            changed_ids
+                .iter()
+                .filter_map(|id| doc.element(id).cloned())
+                .collect()
+        };
+
+        if changed_ids.is_empty() {
+            // Nothing moved in the mirror; only the origin needs the truth.
+            let _ = self
+                .to_pages
+                .send(PageMessage::all(Self::patch_frame(revision, &corrections)));
+        } else if corrections.is_empty() {
+            // Normal case: the origin already holds these changes.
+            let _ = self.to_pages.send(PageMessage::except(
+                Self::patch_frame(revision, &winners),
+                origin,
+            ));
+        } else {
+            // The page's copy lost to a concurrent edit; converge everyone.
+            let mut all = winners;
+            all.extend(corrections);
+            let _ = self
+                .to_pages
+                .send(PageMessage::all(Self::patch_frame(revision, &all)));
+        }
+        if !changed_ids.is_empty() {
+            self.schedule_persist().await;
+        }
+        !changed_ids.is_empty()
+    }
+
+    /// Broadcast an agent-side edit as a patch and queue the persist.
+    pub async fn publish_patch(&self, revision: u64, put: Vec<Element>) {
+        let _ = self
+            .to_pages
+            .send(PageMessage::all(Self::patch_frame(revision, &put)));
+        self.schedule_persist().await;
+    }
+
+    /// Broadcast the whole mirror (connect/resync path) and queue the persist.
+    pub async fn broadcast_snapshot(&self, revision: u64) {
+        let frame = self.snapshot_json(revision).await;
+        let _ = self.to_pages.send(PageMessage::all(frame));
+        self.schedule_persist().await;
+    }
+
     /// Record a document change: diff old vs new, bump the revision and
-    /// append to the bounded change log. Returns the new revision.
-    pub async fn record_change(&self, before: &Document, after: &Document, source: &str) -> u64 {
+    /// append to the bounded change log. Returns the new revision and the
+    /// elements as they now stand (tombstones included), ready to broadcast.
+    pub async fn record_change(
+        &self,
+        before: &Document,
+        after: &Document,
+        source: &str,
+    ) -> (u64, Vec<Element>) {
         let mut changed: Vec<String> = Vec::new();
         for (id, after_element) in &after.elements {
             match before.elements.get(id) {
@@ -319,6 +504,16 @@ impl AppState {
                 changed.push(id.clone());
             }
         }
+        let put: Vec<Element> = changed
+            .iter()
+            .filter_map(|id| after.element(id).cloned())
+            .collect();
+        let revision = self.record_ids(changed, source).await;
+        (revision, put)
+    }
+
+    /// Record a change by the ids it touched.
+    async fn record_ids(&self, changed: Vec<String>, source: &str) -> u64 {
         let revision = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
         let mut log = self.change_log.lock().await;
         log.push(ChangeRecord {
@@ -344,16 +539,22 @@ impl AppState {
             .collect()
     }
 
-    /// The `{"type":"snapshot"}` frame for `json`.
-    pub fn snapshot_frame(json: &str) -> String {
-        serde_json::json!({ "type": "snapshot", "json": json }).to_string()
+    /// Queue a persist; bursts within `PERSIST_DEBOUNCE` coalesce into one
+    /// write. The loop runs from `main` (and in tests that need it).
+    pub async fn schedule_persist(&self) {
+        self.persist_pending.store(true, Ordering::SeqCst);
+        self.persist_notify.notify_one();
     }
 
-    /// Broadcast the mirror to every page and persist it.
-    pub async fn publish_document(&self) {
-        let json = self.document_json().await;
-        let _ = self.to_pages.send(Self::snapshot_frame(&json));
-        self.persist_document().await;
+    /// The debounced persist loop. Call once at startup.
+    pub async fn persist_loop(self: std::sync::Arc<Self>) {
+        loop {
+            self.persist_notify.notified().await;
+            tokio::time::sleep(PERSIST_DEBOUNCE).await;
+            if self.persist_pending.swap(false, Ordering::SeqCst) {
+                self.persist_document().await;
+            }
+        }
     }
 
     /// In-memory mirrors live only while a page is watching: without a
@@ -492,6 +693,61 @@ mod tests {
             style: canvas_core::model::Style::default(),
             bound_text_id: None,
         }
+    }
+
+    #[tokio::test]
+    async fn patches_merge_and_broadcast_to_everyone_but_the_origin() {
+        let state = AppState::new(PathBuf::from("."), None, true);
+        let mut from_server = state.to_pages.subscribe();
+        let element = Element::new(shape_at(0.0), "a0".into(), 1).with_id("one");
+
+        assert!(state.absorb_patch(vec![element.clone()], 7).await);
+        let message = from_server.recv().await.unwrap();
+        assert_eq!(message.except, Some(7), "the origin page is skipped");
+        let frame: serde_json::Value = serde_json::from_str(&message.text).unwrap();
+        assert_eq!(frame["type"], "patch");
+        assert_eq!(frame["put"].as_array().unwrap().len(), 1);
+        assert_eq!(state.revision.load(Ordering::SeqCst), 1);
+
+        assert!(
+            !state.absorb_patch(vec![element], 7).await,
+            "replaying a patch is a no-op"
+        );
+        assert_eq!(state.revision.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_stale_patch_cannot_clobber_a_newer_mirror() {
+        let state = AppState::new(PathBuf::from("."), None, true);
+        let mut newer = Element::new(shape_at(5.0), "a0".into(), 1).with_id("one");
+        newer.version = 4;
+        state.absorb_patch(vec![newer], 1).await;
+
+        let mut from_server = state.to_pages.subscribe();
+        let older = Element::new(shape_at(0.0), "a0".into(), 1).with_id("one");
+        assert!(!state.absorb_patch(vec![older], 1).await);
+        assert_eq!(
+            state.doc.lock().await.element("one").unwrap().kind,
+            shape_at(5.0)
+        );
+
+        // The page that sent the stale copy is corrected back to the winner.
+        let frame: serde_json::Value =
+            serde_json::from_str(&from_server.recv().await.unwrap().text).unwrap();
+        assert_eq!(frame["type"], "patch");
+        let put = frame["put"].as_array().unwrap();
+        assert_eq!(put.len(), 1);
+        assert_eq!(put[0]["version"], 4);
+    }
+
+    #[tokio::test]
+    async fn snapshot_frames_embed_the_document_as_an_object() {
+        let state = AppState::new(PathBuf::from("."), None, true);
+        state.doc.lock().await.add(shape_at(0.0), 1);
+        let frame: serde_json::Value = serde_json::from_str(&state.snapshot_frame().await).unwrap();
+        assert_eq!(frame["type"], "snapshot");
+        assert!(frame["doc"]["elements"].is_object());
+        assert_eq!(frame["rev"], 0);
     }
 
     #[test]

@@ -83,9 +83,14 @@ test("canvas_focus gently frames an off-screen element", async ({
   await mcp.call("canvas_focus", { id });
 
   await page.waitForFunction(
-    ({ id }) => {
+    () => {
       const doc = JSON.parse(window.__rsEditor!.save_json());
-      const rect = doc.elements[id]?.rect;
+      const label = Object.values<Record<string, any>>(doc.elements).find(
+        (e) => e.text === "Far" && !e.isDeleted,
+      );
+      const rect = label?.container_id
+        ? doc.elements[label.container_id]?.rect
+        : undefined;
       if (!rect) return false;
       const cx = rect.x + rect.w / 2;
       const cy = rect.y + rect.h / 2;
@@ -97,7 +102,7 @@ test("canvas_focus gently frames an off-screen element", async ({
       const wy = sy + canvas.clientHeight / 2 / zoom;
       return Math.hypot(wx - cx, wy - cy) < 2 / zoom;
     },
-    { id },
+    undefined,
     { timeout: 3_000 },
   );
 

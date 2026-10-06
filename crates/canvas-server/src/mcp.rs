@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use canvas_core::geometry::Point;
+use canvas_core::model::Document;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
 use rmcp::{schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
@@ -18,14 +19,15 @@ use rmcp::{schemars, tool, tool_handler, tool_router, ErrorData as McpError, Ser
 use crate::doc_ops;
 use crate::render;
 use crate::script::{self, ScriptBeat};
-use crate::state::AppState;
+use crate::state::{AppState, PageMessage};
 use crate::verbs;
 
 const INSTRUCTIONS: &str =
     "rs-canvas is a hand-drawn architecture canvas open in the user's browser. \
 Use canvas_status to check that the local bridge and the page are up before acting. \
-canvas_read shows the current drawing; canvas_draw creates one element and \
-canvas_pen draws a freehand stroke with per-point pressure and ink style \
+canvas_read shows the current drawing as compact lines, each starting with a short \
+handle (e1, e2, ...); every tool accepts handles or raw ids. canvas_draw creates one \
+element and canvas_pen draws a freehand stroke with per-point pressure and ink style \
 (width, colour, roughness, dash, opacity, fill/shading). \
 Camera and presentation tools move the user's view; they never change the drawing.";
 
@@ -283,7 +285,7 @@ async fn deliver_view(
              (the dev server must be running).",
         )]));
     }
-    let _ = state.to_pages.send(message.to_string());
+    let _ = state.to_pages.send(PageMessage::all(message.to_string()));
     Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::json!({ "ok": true, "delivered_to_pages": pages }).to_string(),
     )]))
@@ -344,6 +346,7 @@ fn describe_changes(
     records: &[crate::state::ChangeRecord],
     since: u64,
     revision: u64,
+    ids: &mut dyn canvas_core::describe::IdMap,
 ) -> String {
     if records.is_empty() {
         return format!("revision {revision}\nno changes since revision {since}");
@@ -370,8 +373,12 @@ fn describe_changes(
     let mut removed = Vec::new();
     for id in &changed_ids {
         match doc.element(id).filter(|element| !element.is_deleted) {
-            Some(element) => live.push(doc_ops::describe_element(doc, element)),
-            None => removed.push(id.clone()),
+            Some(element) => {
+                live.push(canvas_core::describe::describe_element_with(
+                    doc, element, ids,
+                ));
+            }
+            None => removed.push(ids.map(id)),
         }
     }
     if !live.is_empty() {
@@ -390,6 +397,47 @@ fn describe_changes(
 #[derive(Clone)]
 pub struct CanvasServer {
     state: Arc<AppState>,
+}
+
+impl CanvasServer {
+    /// Apply an edit to the mirror. On success the change is recorded and
+    /// broadcast as an element patch; on failure the document and the change
+    /// log stay untouched. Returns the edit's own result.
+    async fn apply_edit<T, E>(
+        &self,
+        source: &str,
+        run: impl FnOnce(&mut Document) -> Result<T, E>,
+    ) -> Result<T, E> {
+        let (result, change) = {
+            let mut doc = self.state.doc.lock().await;
+            let before = doc.clone();
+            let result = run(&mut doc);
+            let change = if result.is_ok() {
+                Some(self.state.record_change(&before, &doc, source).await)
+            } else {
+                None
+            };
+            (result, change)
+        };
+        if let Some((revision, put)) = change {
+            self.state.publish_patch(revision, put).await;
+        }
+        result
+    }
+
+    /// The agent-facing identity of one element: its handle and compact line.
+    async fn describe_one(&self, id: &str) -> serde_json::Value {
+        let doc = self.state.doc.lock().await;
+        let mut aliases = self.state.aliases.lock().await;
+        let handle = aliases.handle(id);
+        let line = doc
+            .element(id)
+            .map(|element| {
+                canvas_core::describe::describe_element_with(&doc, element, &mut *aliases)
+            })
+            .unwrap_or_default();
+        serde_json::json!({ "id": handle, "line": line })
+    }
 }
 
 #[tool_router]
@@ -431,10 +479,11 @@ impl CanvasServer {
     }
 
     #[tool(
-        description = "Read the current drawing as a compact scene graph: element ids, \
-                       kinds, labels, bounds, frame membership and connections. Read it \
-                       before drawing to learn ids and available space. Pass `since` with \
-                       a revision from an earlier read or canvas_status to hear only what \
+        description = "Read the current drawing as compact lines: `handle kind x,y wxh`, \
+                       then membership and labels. Every line starts with a short handle \
+                       (e1, e2, ...) that all id-taking tools accept. Read it before \
+                       drawing to learn handles and available space. Pass `since` with a \
+                       revision from an earlier read or canvas_status to hear only what \
                        changed while you were away."
     )]
     async fn canvas_read(
@@ -444,10 +493,17 @@ impl CanvasServer {
         let revision = self.state.revision.load(Ordering::SeqCst);
         let doc = self.state.doc.lock().await;
         let text = match args.since {
-            None => format!("revision {revision}\n{}", doc_ops::describe(&doc)),
+            None => {
+                let mut aliases = self.state.aliases.lock().await;
+                format!(
+                    "revision {revision}\n{}",
+                    canvas_core::describe::describe_with(&doc, &mut *aliases)
+                )
+            }
             Some(since) => {
                 let records = self.state.changes_since(since).await;
-                describe_changes(&doc, &records, since, revision)
+                let mut aliases = self.state.aliases.lock().await;
+                describe_changes(&doc, &records, since, revision, &mut *aliases)
             }
         };
         Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
@@ -458,12 +514,17 @@ impl CanvasServer {
                        kind: rectangle, ellipse, diamond, sticky, frame, glyph or text. \
                        Shapes and stickies take an optional `text` label; text needs one. \
                        Placement is automatic — pass `near` and `side` to put it beside \
-                       an element, or x/y to place explicitly. Returns the new element id."
+                       an element, or x/y to place explicitly. Returns the new element's \
+                       handle and compact line."
     )]
     async fn canvas_draw(
         &self,
         Parameters(args): Parameters<DrawArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let near = match args.near.as_deref() {
+            Some(near) => Some(self.state.resolve_id(near).await),
+            None => None,
+        };
         let request = doc_ops::DrawRequest {
             kind: args.kind,
             text: args.text,
@@ -473,24 +534,19 @@ impl CanvasServer {
             y: args.y,
             w: args.w,
             h: args.h,
-            near: args.near,
+            near,
             side: args.side,
         };
-        let created = {
-            let mut doc = self.state.doc.lock().await;
-            let before = doc.clone();
-            let result = doc_ops::draw(&mut doc, &request, now_ms());
-            if result.is_ok() {
-                self.state.record_change(&before, &doc, "agent").await;
-            }
-            result
-        };
+        let created = self
+            .apply_edit("agent", |doc| doc_ops::draw(doc, &request, now_ms()))
+            .await;
         match created {
             Ok(id) => {
-                self.state.publish_document().await;
                 let elements = self.state.doc.lock().await.live_count();
+                let mut body = self.describe_one(&id).await;
+                body["elements"] = serde_json::json!(elements);
                 Ok(CallToolResult::success(vec![ContentBlock::text(
-                    serde_json::json!({ "id": id, "elements": elements }).to_string(),
+                    body.to_string(),
                 )]))
             }
             Err(message) => Ok(CallToolResult::error(vec![ContentBlock::text(message)])),
@@ -529,21 +585,16 @@ impl CanvasServer {
             pressures,
             style: pen_style(&args),
         };
-        let result = {
-            let mut doc = self.state.doc.lock().await;
-            let before = doc.clone();
-            let result = doc_ops::pen(&mut doc, &request, now_ms());
-            if result.is_ok() {
-                self.state.record_change(&before, &doc, "agent").await;
-            }
-            result
-        };
+        let result = self
+            .apply_edit("agent", |doc| doc_ops::pen(doc, &request, now_ms()))
+            .await;
         match result {
             Ok(id) => {
-                self.state.publish_document().await;
                 let elements = self.state.doc.lock().await.live_count();
+                let mut body = self.describe_one(&id).await;
+                body["elements"] = serde_json::json!(elements);
                 Ok(CallToolResult::success(vec![ContentBlock::text(
-                    serde_json::json!({ "id": id, "elements": elements }).to_string(),
+                    body.to_string(),
                 )]))
             }
             Err(message) => Ok(CallToolResult::error(vec![ContentBlock::text(message)])),
@@ -567,26 +618,55 @@ impl CanvasServer {
         Parameters(args): Parameters<ScriptArgs>,
     ) -> Result<CallToolResult, McpError> {
         let beat_count = args.beats.len();
-        let outcome = {
-            let mut doc = self.state.doc.lock().await;
-            let before = doc.clone();
-            let result = script::execute(&mut doc, &args.beats, now_ms());
-            if result.is_ok() {
-                self.state.record_change(&before, &doc, "agent").await;
+        let mut beats = args.beats;
+        for beat in &mut beats {
+            if let Some(draw) = &mut beat.draw {
+                if let Some(near) = draw.near.take() {
+                    draw.near = Some(self.state.resolve_id(&near).await);
+                }
+                if let Some(around) = &mut draw.around {
+                    *around = self.state.resolve_ids(around).await;
+                }
             }
-            result
-        };
+            if let Some(connect) = &mut beat.connect {
+                connect.from = self.state.resolve_id(&connect.from).await;
+                connect.to = self.state.resolve_id(&connect.to).await;
+            }
+            if let Some(annotate) = &mut beat.annotate {
+                annotate.target = self.state.resolve_id(&annotate.target).await;
+            }
+            if let Some(emphasis) = &mut beat.emphasis {
+                emphasis.targets = self.state.resolve_ids(&emphasis.targets).await;
+            }
+            if let Some(tidy) = &mut beat.tidy {
+                *tidy = self.state.resolve_ids(tidy).await;
+            }
+            if let Some(clear) = &mut beat.clear {
+                *clear = self.state.resolve_ids(clear).await;
+            }
+            if let Some(focus) = beat.focus.take() {
+                beat.focus = Some(self.state.resolve_id(&focus).await);
+            }
+            if let Some(point) = beat.point.take() {
+                beat.point = Some(self.state.resolve_id(&point).await);
+            }
+        }
+        let outcome = self
+            .apply_edit("agent", |doc| script::execute(doc, &beats, now_ms()))
+            .await;
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(message) => return Ok(CallToolResult::error(vec![ContentBlock::text(message)])),
         };
 
-        self.state.publish_document().await;
-        let created: serde_json::Map<String, serde_json::Value> = outcome
-            .created
-            .iter()
-            .map(|(handle, id)| (handle.clone(), serde_json::json!(id)))
-            .collect();
+        let created: serde_json::Map<String, serde_json::Value> = {
+            let mut aliases = self.state.aliases.lock().await;
+            outcome
+                .created
+                .iter()
+                .map(|(handle, id)| (handle.clone(), serde_json::json!(aliases.handle(id))))
+                .collect()
+        };
 
         let mut played = false;
         let mut cancelled = false;
@@ -625,7 +705,7 @@ impl CanvasServer {
             })
             .to_string();
             self.state.presentation_started();
-            let _ = self.state.to_pages.send(frame);
+            let _ = self.state.to_pages.send(PageMessage::all(frame));
             played = true;
             cancelled = wait_for_present_ack(&mut acks, presentation_id, total_hold).await;
             self.state.presentation_finished();
@@ -653,21 +733,19 @@ impl CanvasServer {
         &self,
         Parameters(args): Parameters<AnnotateArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let result = {
-            let mut doc = self.state.doc.lock().await;
-            let before = doc.clone();
-            let result = verbs::annotate(&mut doc, &args.id, &args.mark, now_ms());
-            if result.is_ok() {
-                self.state.record_change(&before, &doc, "agent").await;
-            }
-            result
-        };
+        let id = self.state.resolve_id(&args.id).await;
+        let result = self
+            .apply_edit("agent", |doc| {
+                verbs::annotate(doc, &id, &args.mark, now_ms())
+            })
+            .await;
         match result {
             Ok(ids) => {
-                self.state.publish_document().await;
                 let elements = self.state.doc.lock().await.live_count();
+                let mut aliases = self.state.aliases.lock().await;
+                let handles: Vec<String> = ids.iter().map(|id| aliases.handle(id)).collect();
                 Ok(CallToolResult::success(vec![ContentBlock::text(
-                    serde_json::json!({ "ids": ids, "elements": elements }).to_string(),
+                    serde_json::json!({ "ids": handles, "elements": elements }).to_string(),
                 )]))
             }
             Err(message) => Ok(CallToolResult::error(vec![ContentBlock::text(message)])),
@@ -683,18 +761,14 @@ impl CanvasServer {
         &self,
         Parameters(args): Parameters<EmphasisArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let result = {
-            let mut doc = self.state.doc.lock().await;
-            let before = doc.clone();
-            let result = verbs::emphasis(&mut doc, &args.ids, &args.mode, now_ms());
-            if result.is_ok() {
-                self.state.record_change(&before, &doc, "agent").await;
-            }
-            result
-        };
+        let ids = self.state.resolve_ids(&args.ids).await;
+        let result = self
+            .apply_edit("agent", |doc| {
+                verbs::emphasis(doc, &ids, &args.mode, now_ms())
+            })
+            .await;
         match result {
             Ok(changed) => {
-                self.state.publish_document().await;
                 let elements = self.state.doc.lock().await.live_count();
                 Ok(CallToolResult::success(vec![ContentBlock::text(
                     serde_json::json!({ "changed": changed, "elements": elements }).to_string(),
@@ -714,18 +788,12 @@ impl CanvasServer {
         &self,
         Parameters(args): Parameters<ElementIdsArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let result = {
-            let mut doc = self.state.doc.lock().await;
-            let before = doc.clone();
-            let result = verbs::tidy(&mut doc, &args.ids, now_ms());
-            if result.is_ok() {
-                self.state.record_change(&before, &doc, "agent").await;
-            }
-            result
-        };
+        let ids = self.state.resolve_ids(&args.ids).await;
+        let result = self
+            .apply_edit("agent", |doc| verbs::tidy(doc, &ids, now_ms()))
+            .await;
         match result {
             Ok(moved) => {
-                self.state.publish_document().await;
                 let elements = self.state.doc.lock().await.live_count();
                 Ok(CallToolResult::success(vec![ContentBlock::text(
                     serde_json::json!({ "moved": moved, "elements": elements }).to_string(),
@@ -744,18 +812,12 @@ impl CanvasServer {
         &self,
         Parameters(args): Parameters<ElementIdsArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let result = {
-            let mut doc = self.state.doc.lock().await;
-            let before = doc.clone();
-            let result = verbs::clear(&mut doc, &args.ids, now_ms());
-            if result.is_ok() {
-                self.state.record_change(&before, &doc, "agent").await;
-            }
-            result
-        };
+        let ids = self.state.resolve_ids(&args.ids).await;
+        let result = self
+            .apply_edit("agent", |doc| verbs::clear(doc, &ids, now_ms()))
+            .await;
         match result {
             Ok(cleared) => {
-                self.state.publish_document().await;
                 let elements = self.state.doc.lock().await.live_count();
                 Ok(CallToolResult::success(vec![ContentBlock::text(
                     serde_json::json!({ "cleared": cleared, "elements": elements }).to_string(),
@@ -789,7 +851,7 @@ impl CanvasServer {
                 "scale": scale,
             })
             .to_string();
-            let _ = self.state.to_pages.send(frame);
+            let _ = self.state.to_pages.send(PageMessage::all(frame));
             if let Ok(Some(data_url)) = tokio::time::timeout(
                 Duration::from_secs(8),
                 wait_for_screenshot(&mut replies, id),
@@ -822,7 +884,7 @@ impl CanvasServer {
     ) -> Result<CallToolResult, McpError> {
         let mut message = serde_json::json!({ "type": "view", "action": "focus" });
         if let Some(id) = args.id {
-            message["id"] = id.into();
+            message["id"] = self.state.resolve_id(&id).await.into();
         }
         if let Some(pad) = args.pad {
             message["pad"] = pad.into();
@@ -841,10 +903,11 @@ impl CanvasServer {
         &self,
         Parameters(args): Parameters<PointArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let id = self.state.resolve_id(&args.id).await;
         let message = serde_json::json!({
             "type": "view",
             "action": "point",
-            "id": args.id,
+            "id": id,
         });
         deliver_view(&self.state, message).await
     }
@@ -962,7 +1025,7 @@ mod tests {
         assert_ne!(result.is_error, Some(true));
 
         let message: serde_json::Value =
-            serde_json::from_str(&from_server.recv().await.unwrap()).unwrap();
+            serde_json::from_str(&from_server.recv().await.unwrap().text).unwrap();
         assert_eq!(message["type"], "view");
         assert_eq!(message["action"], "focus");
         assert_eq!(message["id"], "abc");
@@ -1001,7 +1064,7 @@ mod tests {
             .await
             .unwrap();
         let message: serde_json::Value =
-            serde_json::from_str(&from_server.recv().await.unwrap()).unwrap();
+            serde_json::from_str(&from_server.recv().await.unwrap().text).unwrap();
         assert_eq!(message["action"], "point");
         assert_eq!(message["id"], "db");
         assert!(message.get("animate").is_none());
@@ -1035,11 +1098,14 @@ mod tests {
         assert!(state.doc.lock().await.live_count() == 2);
 
         let frame: serde_json::Value =
-            serde_json::from_str(&from_server.recv().await.unwrap()).unwrap();
-        assert_eq!(frame["type"], "snapshot");
-        let snapshot: serde_json::Value =
-            serde_json::from_str(frame["json"].as_str().unwrap()).unwrap();
-        assert_eq!(snapshot["elements"].as_object().unwrap().len(), 2);
+            serde_json::from_str(&from_server.recv().await.unwrap().text).unwrap();
+        assert_eq!(frame["type"], "patch");
+        assert_eq!(
+            frame["put"].as_array().unwrap().len(),
+            2,
+            "sticky plus its bound label travel in one patch"
+        );
+        assert!(frame["rev"].as_u64().unwrap() >= 1);
     }
 
     #[tokio::test]
@@ -1063,11 +1129,10 @@ mod tests {
         assert!(created["id"].is_string());
 
         let frame: serde_json::Value =
-            serde_json::from_str(&from_server.recv().await.unwrap()).unwrap();
-        assert_eq!(frame["type"], "snapshot");
-        let snapshot: serde_json::Value =
-            serde_json::from_str(frame["json"].as_str().unwrap()).unwrap();
-        assert_eq!(snapshot["elements"].as_object().unwrap().len(), 1);
+            serde_json::from_str(&from_server.recv().await.unwrap().text).unwrap();
+        assert_eq!(frame["type"], "patch");
+        assert_eq!(frame["put"].as_array().unwrap().len(), 1);
+        assert!(frame["rev"].as_u64().unwrap() >= 1);
     }
 
     #[tokio::test]
@@ -1120,10 +1185,9 @@ mod tests {
             .await
             .unwrap();
         let created: serde_json::Value = serde_json::from_str(&error_text(&result)).unwrap();
+        let id = state.resolve_id(created["id"].as_str().unwrap()).await;
         let doc = state.doc.lock().await;
-        let element = doc
-            .element(created["id"].as_str().unwrap())
-            .expect("created stroke");
+        let element = doc.element(&id).expect("created stroke");
         let canvas_core::model::ElementKind::Freehand {
             pressures, style, ..
         } = &element.kind
@@ -1167,7 +1231,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        assert!(described.contains("freehand"), "{described}");
+        assert!(described.contains("stroke"), "{described}");
         assert!(described.contains(id), "{described}");
     }
 
@@ -1196,8 +1260,8 @@ mod tests {
             .await
             .unwrap();
         let described = error_text(&result);
-        assert!(described.contains("rectangle"), "{described}");
-        assert!(described.contains("text=\"API\""), "{described}");
+        assert!(described.contains("rect"), "{described}");
+        assert!(described.contains("\"API\""), "{described}");
         assert!(described.starts_with("revision 1"), "{described}");
     }
 
@@ -1264,6 +1328,7 @@ mod tests {
         );
         state.record_change(&before, &doc, "page").await;
         drop(doc);
+        let handle = state.aliases.lock().await.handle(&id);
 
         let report = error_text(
             &server
@@ -1276,7 +1341,7 @@ mod tests {
         assert!(report.contains("(agent)"), "{report}");
         assert!(report.contains("(page)"), "{report}");
         assert!(report.contains("changed now:"), "{report}");
-        assert!(report.contains(&id), "{report}");
+        assert!(report.contains(&handle), "{report}");
     }
 
     #[tokio::test]
@@ -1342,8 +1407,8 @@ mod tests {
         let ack_state = state.clone();
         let (frame_tx, frame_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
-            while let Ok(text) = from_server.recv().await {
-                let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+            while let Ok(message) = from_server.recv().await {
+                let frame: serde_json::Value = serde_json::from_str(&message.text).unwrap();
                 if frame["type"] == "present" {
                     let id = frame["id"].as_u64().unwrap();
                     let _ = ack_state.present_acks.send((id, false));
@@ -1450,8 +1515,8 @@ mod tests {
         state.pages.store(1, Ordering::SeqCst);
         let ack_state = state.clone();
         tokio::spawn(async move {
-            while let Ok(text) = from_server.recv().await {
-                let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+            while let Ok(message) = from_server.recv().await {
+                let frame: serde_json::Value = serde_json::from_str(&message.text).unwrap();
                 if frame["type"] == "present" {
                     let id = frame["id"].as_u64().unwrap();
                     let _ = ack_state.present_acks.send((id, false));
@@ -1546,8 +1611,8 @@ mod tests {
         state.pages.store(1, Ordering::SeqCst);
         let reply_state = state.clone();
         tokio::spawn(async move {
-            while let Ok(text) = from_server.recv().await {
-                let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+            while let Ok(message) = from_server.recv().await {
+                let frame: serde_json::Value = serde_json::from_str(&message.text).unwrap();
                 if frame["type"] == "screenshot" {
                     let id = frame["id"].as_u64().unwrap();
                     let _ = reply_state
@@ -1592,7 +1657,7 @@ mod tests {
                 .unwrap(),
         ))
         .unwrap();
-        let first_id = first["id"].as_str().unwrap().to_string();
+        let first_id = state.resolve_id(first["id"].as_str().unwrap()).await;
         server
             .canvas_draw(Parameters(draw("sticky", Some("DB"))))
             .await

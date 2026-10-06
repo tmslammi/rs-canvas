@@ -422,9 +422,8 @@ mod tests {
             }
         }
         // The arrow is still bound to both endpoints.
-        let described = doc_ops::describe(&doc);
-        assert!(described.contains(&format!("from={a}")), "{described}");
-        assert!(described.contains(&format!("to={b}")), "{described}");
+        let described = canvas_core::describe::describe(&doc);
+        assert!(described.contains(&format!("{a}>{b}")), "{described}");
         let _ = arrow_id;
     }
 

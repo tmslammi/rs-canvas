@@ -341,6 +341,8 @@ pub struct Editor {
     pulse: Option<Pulse>,
     /// A server snapshot that arrived mid-gesture, applied on pointer-up.
     pending_remote: Option<String>,
+    /// Server patches that arrived mid-gesture, applied on pointer-up.
+    pending_patches: Vec<String>,
     /// Agent explanation playback in flight, if any (view state only).
     presentation: Option<Presentation>,
     /// Finished/cancelled playbacks the shell must acknowledge.
@@ -405,6 +407,7 @@ impl Editor {
             tween: None,
             pulse: None,
             pending_remote: None,
+            pending_patches: Vec::new(),
             presentation: None,
             present_outcomes: Vec::new(),
         };
@@ -483,6 +486,22 @@ impl Editor {
         canvas_core::serialization::to_json(&self.core.doc).unwrap_or_default()
     }
 
+    /// The live document wrapped as a `{"type":"snapshot","doc":{...}}` frame,
+    /// so the shell sends it without a parse/stringify round trip.
+    pub fn snapshot_frame_json(&self) -> String {
+        #[derive(serde::Serialize)]
+        struct Snapshot<'a> {
+            #[serde(rename = "type")]
+            kind: &'static str,
+            doc: &'a Document,
+        }
+        serde_json::to_string(&Snapshot {
+            kind: "snapshot",
+            doc: &self.core.doc,
+        })
+        .unwrap_or_default()
+    }
+
     /// Merge a server snapshot into this page's document using the merge-ready
     /// rules, keeping local edits. Inbound merges never touch history, so the
     /// user's undo stack stays theirs. Returns whether anything changed.
@@ -495,6 +514,31 @@ impl Editor {
             return Ok(false);
         }
         self.reconcile_now(json)
+    }
+
+    /// Drain the deltas applied since the last call as one wire patch frame
+    /// (`{"type":"patch","put":[...]}`), or an empty string when nothing
+    /// changed. The shell sends it to the bridge; when the bridge is down the
+    /// frame is dropped and the full snapshot sent on reconnect catches the
+    /// server up.
+    pub fn take_outbound_frame(&mut self) -> String {
+        let deltas = self.core.history.drain_outbox();
+        if deltas.is_empty() {
+            return String::new();
+        }
+        let patch = canvas_core::Patch::from_deltas(&deltas, now_ms());
+        serde_json::json!({ "type": "patch", "put": patch.put }).to_string()
+    }
+
+    /// Merge a server patch — a JSON array of full elements, tombstones
+    /// included — into the document with the merge rules. Returns whether
+    /// anything changed. Mid-gesture patches are deferred to pointer-up.
+    pub fn merge_patch_json(&mut self, json: &str) -> Result<bool, JsValue> {
+        if self.core.is_interacting() {
+            self.pending_patches.push(json.to_string());
+            return Ok(false);
+        }
+        self.merge_patch_now(json)
     }
 
     /// Serialize the document and hand it to storage (the shell's debounced
@@ -831,6 +875,9 @@ impl Editor {
         // A remote snapshot deferred during the gesture can land now.
         if let Some(pending) = self.pending_remote.take() {
             let _ = self.reconcile_now(&pending);
+        }
+        for patch in std::mem::take(&mut self.pending_patches) {
+            let _ = self.merge_patch_now(&patch);
         }
     }
 
@@ -1381,6 +1428,28 @@ impl Editor {
         self.last_paint = None;
         self.core.refresh_scene();
         self.render();
+        Ok(true)
+    }
+
+    /// Merge a remote patch now: per-element LWW, then rebuild only the
+    /// changed layers and repaint them. This is the steady-state path — the
+    /// cost is proportional to what changed, not to the document.
+    fn merge_patch_now(&mut self, json: &str) -> Result<bool, JsValue> {
+        let elements: Vec<canvas_core::Element> =
+            serde_json::from_str(json).map_err(|error| JsValue::from_str(&error.to_string()))?;
+        let patch = canvas_core::Patch { put: elements };
+        let changed: BTreeSet<canvas_core::ElementId> =
+            patch.apply_to(&mut self.core.doc).into_iter().collect();
+        if changed.is_empty() {
+            return Ok(false);
+        }
+        self.core
+            .selection
+            .retain(|id| self.core.doc.element(id).is_some_and(|e| !e.is_deleted));
+        self.last_paint = None;
+        let dirty = self.core.rebuild_changed(&changed);
+        self.paint_dirty(&dirty);
+        self.draw_overlay();
         Ok(true)
     }
 

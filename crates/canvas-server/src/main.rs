@@ -4,7 +4,7 @@
 //! Binding is `127.0.0.1` only: the agent bridge is a local dev surface, not
 //! a networked service.
 
-mod chat;
+mod aliases;
 mod doc_ops;
 mod mcp;
 mod render;
@@ -17,8 +17,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::http::{header, HeaderValue};
-use axum::routing::{get, post};
-use axum::{Extension, Router};
+use axum::routing::get;
+use axum::Router;
 use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
@@ -32,7 +32,6 @@ struct Args {
     port: u16,
     doc: Option<PathBuf>,
     sync: bool,
-    project: Option<PathBuf>,
 }
 
 fn parse_args() -> Args {
@@ -40,7 +39,6 @@ fn parse_args() -> Args {
     let mut port = 5173;
     let mut doc = None;
     let mut sync = true;
-    let mut project = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -55,11 +53,10 @@ fn parse_args() -> Args {
                 }
             }
             "--doc" => doc = args.next().map(PathBuf::from),
-            "--project" => project = args.next().map(PathBuf::from),
             "--no-sync" => sync = false,
-            other => panic!(
-                "unknown argument {other:?} (expected --web, --port, --doc, --project or --no-sync)"
-            ),
+            other => {
+                panic!("unknown argument {other:?} (expected --web, --port, --doc or --no-sync)")
+            }
         }
     }
     Args {
@@ -67,7 +64,6 @@ fn parse_args() -> Args {
         port,
         doc,
         sync,
-        project,
     }
 }
 
@@ -84,20 +80,7 @@ async fn main() {
     let state = Arc::new(AppState::new(args.web.clone(), args.doc.clone(), args.sync));
     state.load_document().await;
     state.load_settings().await;
-
-    // The chat session lives at the project root: the parent of the served
-    // app, unless the caller names it. OpenCode requires absolute locations.
-    let project = args
-        .project
-        .clone()
-        .map(|path| std::fs::canonicalize(&path).unwrap_or(path))
-        .or_else(|| {
-            std::fs::canonicalize(&args.web)
-                .ok()
-                .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
-        })
-        .unwrap_or_else(|| PathBuf::from("."));
-    let chat = Arc::new(chat::ChatBridge::new(project));
+    tokio::spawn(state.clone().persist_loop());
 
     // The page's document is authoritative; the factory runs per MCP session
     // and every instance shares the same process-wide state.
@@ -118,13 +101,10 @@ async fn main() {
 
     let app = Router::new()
         .route("/ws", get(ws::handler))
-        .route("/chat", post(chat::chat_handler))
-        .route("/chat/models", get(chat::models_handler))
-        .layer(Extension(chat))
         .nest_service("/mcp", mcp_service)
         .fallback_service(ServeDir::new(&args.web))
         .layer(no_store)
-        .with_state(state);
+        .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", args.port))
         .await
@@ -132,9 +112,30 @@ async fn main() {
     tracing::info!("rs-canvas: http://localhost:{} (MCP at /mcp)", args.port);
 
     axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            tokio::signal::ctrl_c().await.ok();
-        })
+        .with_graceful_shutdown(shutdown_signal())
         .await
         .expect("canvas server failed");
+
+    // The debounced writer may still owe a write.
+    state.persist_document().await;
+}
+
+/// Ctrl-C or SIGTERM; either ends the process gracefully so the debounced
+/// mirror write lands before exit.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c().await.ok();
+    };
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = ctrl_c => {},
+            _ = terminate.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    ctrl_c.await;
 }

@@ -2,10 +2,8 @@
 //! can create. Everything here goes through `canvas-core`, so headless edits
 //! are shaped exactly like the ones the browser makes.
 
-use std::fmt::Write as _;
-
 use canvas_core::geometry::{Point, Rect};
-use canvas_core::model::{Document, ElementId, ElementKind, Endpoint, ShapeKind, Style, TextAlign};
+use canvas_core::model::{Document, ElementId, ElementKind, ShapeKind, Style, TextAlign};
 use canvas_core::text::{layout_text, ApproxMeasurer};
 
 /// Gap between a new element and the thing it is placed beside, in world px.
@@ -393,133 +391,6 @@ pub fn place_label(doc: &mut Document, container: &ElementId, text_id: ElementId
     }
 }
 
-/// The drawing as a compact text scene graph for the agent.
-pub fn describe(doc: &Document) -> String {
-    let live = doc.ordered_live();
-    let mut out = String::new();
-    let _ = writeln!(out, "{} elements", live.len());
-    for element in &live {
-        out.push_str(&describe_element(doc, element));
-        out.push('\n');
-    }
-    out
-}
-
-/// One element as a compact line for the agent.
-pub fn describe_element(doc: &Document, element: &canvas_core::model::Element) -> String {
-    let live = doc.ordered_live();
-    let bounds = element.bounds();
-    let mut line = format!(
-        "- {} {} x={:.0} y={:.0} w={:.0} h={:.0}",
-        element.id,
-        kind_name(element),
-        bounds.x,
-        bounds.y,
-        bounds.w,
-        bounds.h
-    );
-    if let Some(frame) = &element.frame_id {
-        let _ = write!(line, " frame={frame}");
-    }
-    match &element.kind {
-        ElementKind::Shape { bound_text_id, .. } => {
-            if let Some(text) = bound_text_id.as_ref().and_then(|id| text_of(doc, id)) {
-                let _ = write!(line, " text={text:?}");
-            }
-        }
-        ElementKind::Glyph {
-            glyph, caption_id, ..
-        } => {
-            let _ = write!(line, " glyph={glyph:?}");
-            if let Some(text) = caption_id.as_ref().and_then(|id| text_of(doc, id)) {
-                let _ = write!(line, " caption={text:?}");
-            }
-        }
-        ElementKind::Text { text, .. } => {
-            let _ = write!(line, " text={text:?}");
-        }
-        ElementKind::Frame { name, .. } => {
-            let children: Vec<&str> = live
-                .iter()
-                .filter(|child| child.frame_id.as_deref() == Some(element.id.as_str()))
-                .map(|child| child.id.as_str())
-                .collect();
-            if !name.is_empty() {
-                let _ = write!(line, " name={name:?}");
-            }
-            if !children.is_empty() {
-                let _ = write!(line, " children=[{}]", children.join(" "));
-            }
-        }
-        ElementKind::Arrow {
-            start,
-            end,
-            routing,
-            label_id,
-            ..
-        } => {
-            let _ = write!(
-                line,
-                " from={} to={} routing={}",
-                endpoint_name(start),
-                endpoint_name(end),
-                match routing {
-                    canvas_core::model::Routing::Straight => "straight",
-                    canvas_core::model::Routing::Elbow => "elbow",
-                    canvas_core::model::Routing::Curved => "curved",
-                }
-            );
-            if let Some(text) = label_id.as_ref().and_then(|id| text_of(doc, id)) {
-                let _ = write!(line, " label={text:?}");
-            }
-        }
-        ElementKind::Freehand { points, style, .. } => {
-            let _ = write!(
-                line,
-                " points={} width={:.1}",
-                points.len(),
-                style.stroke_width
-            );
-            if style.fill_color != "transparent" {
-                let _ = write!(line, " fill={:?}", style.fill_color);
-            }
-        }
-        ElementKind::StickyStack { .. } => {}
-    }
-    line
-}
-
-fn kind_name(element: &canvas_core::model::Element) -> &'static str {
-    match &element.kind {
-        ElementKind::Shape { shape, .. } => match shape {
-            ShapeKind::Rectangle => "rectangle",
-            ShapeKind::Ellipse => "ellipse",
-            ShapeKind::Diamond => "diamond",
-            ShapeKind::Sticky => "sticky",
-        },
-        ElementKind::Freehand { .. } => "freehand",
-        ElementKind::Glyph { .. } => "glyph",
-        ElementKind::Arrow { .. } => "arrow",
-        ElementKind::Text { .. } => "text",
-        ElementKind::StickyStack { .. } => "sticky_stack",
-        ElementKind::Frame { .. } => "frame",
-    }
-}
-
-fn endpoint_name(endpoint: &Endpoint) -> String {
-    match &endpoint.binding {
-        Some(binding) => binding.element_id.clone(),
-        None => format!("({:.0},{:.0})", endpoint.x, endpoint.y),
-    }
-}
-
-fn text_of(doc: &Document, id: &str) -> Option<String> {
-    match &doc.element(id)?.kind {
-        ElementKind::Text { text, .. } => Some(text.clone()),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -719,7 +590,10 @@ mod tests {
             panic!("expected a sticky shape");
         };
         let text_id = bound_text_id.as_ref().expect("bound text");
-        assert_eq!(text_of(&doc, text_id).as_deref(), Some("Cache"));
+        assert_eq!(
+            canvas_core::describe::text_of(&doc, text_id).as_deref(),
+            Some("Cache")
+        );
         let ElementKind::Text {
             container_id,
             align,
@@ -756,58 +630,5 @@ mod tests {
         let mut glyph = request("glyph");
         glyph.glyph = Some("not_a_glyph".into());
         assert!(draw(&mut doc, &glyph, 1).is_err());
-    }
-
-    #[test]
-    fn describe_lists_elements_connections_and_children() {
-        let mut doc = Document::new();
-        let frame = doc.add(
-            ElementKind::Frame {
-                rect: Rect::new(0.0, 0.0, 400.0, 300.0),
-                name: "VPC".into(),
-            },
-            1,
-        );
-        let mut sticky = request("sticky");
-        sticky.text = Some("DB".into());
-        sticky.x = Some(10.0);
-        sticky.y = Some(10.0);
-        let sticky_id = draw(&mut doc, &sticky, 2).unwrap();
-        doc.element_mut(&sticky_id).unwrap().frame_id = Some(frame.clone());
-        let arrow = doc.add(
-            ElementKind::Arrow {
-                start: Endpoint {
-                    x: 0.0,
-                    y: 0.0,
-                    binding: Some(canvas_core::model::Binding {
-                        element_id: frame.clone(),
-                        focus: None,
-                    }),
-                },
-                end: Endpoint {
-                    x: 0.0,
-                    y: 0.0,
-                    binding: Some(canvas_core::model::Binding {
-                        element_id: sticky_id.clone(),
-                        focus: None,
-                    }),
-                },
-                routing: canvas_core::model::Routing::Elbow,
-                start_arrowhead: false,
-                end_arrowhead: true,
-                style: Style::default(),
-                waypoints: Vec::new(),
-                label_id: None,
-            },
-            3,
-        );
-
-        let described = describe(&doc);
-        assert!(described.contains(&format!("- {sticky_id} sticky")));
-        assert!(described.contains("text=\"DB\""));
-        assert!(described.contains(&format!("{arrow} arrow")));
-        assert!(described.contains(&format!("from={frame}")));
-        assert!(described.contains(&format!("to={sticky_id}")));
-        assert!(described.contains(&format!("children=[{sticky_id}]")));
     }
 }

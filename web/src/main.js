@@ -1,7 +1,6 @@
 import init, { Editor, load_saved_json } from "./wasm/canvas_wasm.js";
 import { createStylePanel } from "./stylePanel.js";
 import { createAgentPanel } from "./agentPanel.js";
-import { createChatPanel } from "./chatPanel.js";
 import { connectAgentBridge } from "./agentBridge.js";
 
 const TOOLS = [
@@ -263,20 +262,14 @@ async function boot() {
   const agentPanel = createAgentPanel(document.getElementById("app"), {
     onChange: (patch) => bridge?.patchSettings(patch),
   });
-  const chatPanel = createChatPanel(document.getElementById("app"));
   const agentDivider = document.createElement("div");
   agentDivider.className = "divider";
   const agentButton = document.createElement("button");
   agentButton.textContent = "◎";
   agentButton.title = "Agent settings";
   agentButton.addEventListener("click", () => agentPanel.toggle());
-  const chatButton = document.createElement("button");
-  chatButton.textContent = "✉";
-  chatButton.title = "Chat";
-  chatButton.addEventListener("click", () => chatPanel.toggle());
   toolbar.appendChild(agentDivider);
   toolbar.appendChild(agentButton);
-  toolbar.appendChild(chatButton);
 
   const refreshToolbar = () => {
     const active = editor.active_tool();
@@ -314,10 +307,17 @@ async function boot() {
     updateCursor();
   };
 
+  // The bridge is assigned once the local autosave is in place; the action
+  // handler fires during boot, so the binding exists first.
+  let bridge = null;
+
   editor.set_action_handler((json) => {
     const action = JSON.parse(json);
     if (action.type === "document_changed") {
       scheduleAutosave();
+      // Deferred: the handler runs inside the wasm call that produced the
+      // change, and calling back into the editor re-entrantly would panic.
+      queueMicrotask(() => bridge?.publishChanges());
       return;
     }
     if (action.type !== "open_text_editor") return;
@@ -343,14 +343,12 @@ async function boot() {
   // happens inside a pointer or keyboard handler.
   let autosaveTimer = 0;
   let autosavePaused = false;
-  let bridge = null;
   const scheduleAutosave = () => {
     if (autosavePaused) return;
     window.clearTimeout(autosaveTimer);
     autosaveTimer = window.setTimeout(() => {
       autosaveTimer = 0;
       editor.flush_save();
-      bridge?.publishDocument();
     }, 700);
   };
   // Test hook: let frame-time measurements on huge documents skip the
@@ -365,7 +363,6 @@ async function boot() {
       window.clearTimeout(autosaveTimer);
       autosaveTimer = 0;
       editor.flush_save();
-      bridge?.publishDocument();
     }
   };
   // IndexedDB writes spawned during unload can be torn down before they

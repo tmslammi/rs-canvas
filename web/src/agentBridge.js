@@ -23,12 +23,23 @@ export function connectAgentBridge(editor, hooks = {}) {
 
   // Hand the server the page's current document; the server reconciles it
   // with its mirror and answers with the merged result if anything differs.
+  // Snapshots only travel on connect and resync now — steady state is patches.
   const publishDocument = () => {
     if (!syncEnabled) return;
     if (socket && socket.readyState === WebSocket.OPEN) {
-      socket.send(
-        JSON.stringify({ type: "snapshot", json: editor.snapshot_json() }),
-      );
+      socket.send(editor.snapshot_frame_json());
+    }
+  };
+
+  // Deltas committed since the last drain travel as one patch per gesture.
+  // Drained even when disconnected so the outbox cannot grow; the snapshot
+  // sent on reconnect catches the server up.
+  const publishChanges = () => {
+    if (!syncEnabled) return;
+    const frame = editor.take_outbound_frame();
+    if (!frame) return;
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(frame);
     }
   };
 
@@ -84,9 +95,16 @@ export function connectAgentBridge(editor, hooks = {}) {
       }
       return;
     }
-    if (message.type === "snapshot" && typeof message.json === "string") {
+    if (message.type === "snapshot" && message.doc) {
       if (!syncEnabled) return;
-      if (editor.reconcile_json(message.json)) {
+      if (editor.reconcile_json(JSON.stringify(message.doc))) {
+        hooks.onRemoteChange?.();
+      }
+      return;
+    }
+    if (message.type === "patch" && Array.isArray(message.put)) {
+      if (!syncEnabled) return;
+      if (editor.merge_patch_json(JSON.stringify(message.put))) {
         hooks.onRemoteChange?.();
       }
       return;
@@ -173,5 +191,5 @@ export function connectAgentBridge(editor, hooks = {}) {
     }
   };
 
-  return { publishDocument, patchSettings };
+  return { publishDocument, publishChanges, patchSettings };
 }
