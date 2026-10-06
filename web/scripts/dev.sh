@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Serve the app as-is: no bundler, no transpiler, plain ES modules.
+# Serve the app, the WebSocket agent bridge and the MCP endpoint from the Rust
+# server: no bundler, no transpiler, plain ES modules.
 #
-# Cache-Control: no-store, because a stale main.js or wasm in the browser
-# looks exactly like "the new feature isn't there" — reloads then appear to
-# do nothing until a hard refresh.
+# The server sets Cache-Control: no-store on every response, because a stale
+# main.js or wasm in the browser looks exactly like "the new feature isn't
+# there" — reloads then appear to do nothing until a hard refresh.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -12,17 +13,5 @@ WATCH_PID=$!
 trap 'kill "$WATCH_PID" 2>/dev/null || true' EXIT
 
 echo "rs-canvas: http://localhost:5173 (plain files; reload after Rust changes)"
-python3 - <<'PY'
-import http.server
-import functools
-
-
-class NoStoreHandler(http.server.SimpleHTTPRequestHandler):
-    def end_headers(self):
-        self.send_header("Cache-Control", "no-store, max-age=0")
-        super().end_headers()
-
-
-handler = functools.partial(NoStoreHandler, directory=".")
-http.server.ThreadingHTTPServer(("127.0.0.1", 5173), handler).serve_forever()
-PY
+cargo run --manifest-path ../Cargo.toml -p canvas-server -- \
+  --web . --port 5173 --doc ../.rs-canvas/current.json

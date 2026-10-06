@@ -1,0 +1,15 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "servers": {
+      "canvas": {
+        "type": "remote",
+        "url": "http://127.0.0.1:5173/mcp",
+        "oauth": false,
+        "timeout": {
+          "catalog": 45000
+        }
+      }
+    }
+  }
+}

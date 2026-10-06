@@ -28,7 +28,7 @@ pub mod text;
 pub mod tool;
 
 pub use benchmark::benchmark_fixture;
-pub use camera::Camera;
+pub use camera::{Camera, CameraTween};
 pub use connector::{anchor_points, nearest_anchor, resolve_endpoint, route, AnchorSide};
 pub use delta::{Delta, EditError};
 pub use demo::demo_document;

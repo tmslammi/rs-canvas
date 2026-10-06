@@ -1,6 +1,7 @@
 declare global {
   interface Window {
     __rsReady?: boolean;
+    __rsAgentConnected?: boolean;
     __rsEditor?: {
       scroll(): Float64Array;
       zoom(): number;
@@ -35,6 +36,8 @@ declare global {
       set_snap_enabled(enabled: boolean): void;
       snap_enabled(): boolean;
       route_for(id: string): Float64Array;
+      presentation_state(): string;
+      presentation_outcomes(): string;
     };
   }
 }

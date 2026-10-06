@@ -378,6 +378,18 @@ impl Editor {
         self.viewport_size
     }
 
+    /// A camera that fits an element — frames include their descendants — or
+    /// the whole document when `id` is `None`, with `padding` screen px.
+    pub fn focus_camera(&self, id: Option<&str>, padding: f64) -> Option<Camera> {
+        let bounds = match id {
+            Some(id) => self.doc.framing_bounds(id)?,
+            None => self.doc.bounds()?,
+        };
+        let mut camera = self.camera;
+        camera.zoom_to_fit(bounds, self.viewport_size, padding);
+        Some(camera)
+    }
+
     /// Select a tool (single-shot: reverts to Select after one use). The
     /// freehand brush is the exception: it stays armed for repeated strokes,
     /// like Excalidraw's freedraw and Miro's pen.
@@ -4149,6 +4161,60 @@ mod tests {
         editor.pointer_down(from, 0, mods, now);
         editor.pointer_move(to, mods, now + 1);
         editor.pointer_up(to, mods, now + 2);
+    }
+
+    #[test]
+    fn focus_camera_frames_an_element_and_requires_content() {
+        let mut e = editor();
+        assert!(e.focus_camera(None, 40.0).is_none());
+        assert!(e.focus_camera(Some("missing"), 40.0).is_none());
+
+        e.set_viewport(800.0, 600.0);
+        drag_shape(
+            &mut e,
+            Point::new(100.0, 100.0),
+            Point::new(300.0, 200.0),
+            1,
+        );
+        let id = e.doc.ordered_live()[0].id.clone();
+        let camera = e.focus_camera(Some(&id), 40.0).expect("focus target");
+        let bounds = e.doc.framing_bounds(&id).unwrap();
+        let screen = camera.world_to_screen(bounds.center());
+        assert!((screen.x - 400.0).abs() < 1e-9);
+        assert!((screen.y - 300.0).abs() < 1e-9);
+        assert!(camera.zoom > 1.0);
+
+        let fit_all = e.focus_camera(None, 40.0).expect("document fits");
+        assert!((fit_all.zoom - camera.zoom).abs() < 1e-9);
+    }
+
+    #[test]
+    fn focus_camera_of_a_frame_includes_its_children() {
+        let mut e = editor();
+        e.set_viewport(800.0, 600.0);
+        let frame = e.doc.add(
+            ElementKind::Frame {
+                rect: Rect::new(0.0, 0.0, 200.0, 200.0),
+                name: "VPC".into(),
+            },
+            1,
+        );
+        let child = e.doc.add(
+            ElementKind::Shape {
+                shape: ShapeKind::Rectangle,
+                rect: Rect::new(400.0, 100.0, 100.0, 60.0),
+                style: Style::default(),
+                bound_text_id: None,
+            },
+            2,
+        );
+        e.doc.element_mut(&child).unwrap().frame_id = Some(frame.clone());
+        let camera = e.focus_camera(Some(&frame), 40.0).unwrap();
+        let screen = camera.world_to_screen(Point::new(250.0, 100.0));
+        assert!(
+            (screen.x - 400.0).abs() < 1e-9,
+            "frame focus missed the child"
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/canvas-core", "crates/canvas-wasm"]
+members = ["crates/canvas-core", "crates/canvas-wasm", "crates/canvas-server"]
 
 [workspace.package]
 version = "0.1.0"

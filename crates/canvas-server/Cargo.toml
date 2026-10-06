@@ -1,0 +1,19 @@
+[package]
+name = "canvas-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+canvas-core = { path = "../canvas-core" }
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time", "fs"] }
+tower-http = { version = "0.7", features = ["fs", "set-header"] }
+rmcp = { version = "3.5", features = ["server", "transport-streamable-http-server"] }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+resvg = { version = "0.48", default-features = false, features = ["text"] }
+base64 = "0.22"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

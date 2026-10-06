@@ -470,6 +470,28 @@ impl Document {
             .map(|e| e.bounds())
             .reduce(|acc, r| acc.union(&r))
     }
+
+    /// Bounds for framing an element: a frame includes its live descendants,
+    /// so focusing a container shows everything inside it.
+    pub fn framing_bounds(&self, id: &str) -> Option<Rect> {
+        let seed = self.element(id).filter(|e| !e.is_deleted)?;
+        let mut bounds = seed.bounds();
+        if !seed.is_frame() {
+            return Some(bounds);
+        }
+        let mut frontier: Vec<&str> = vec![id];
+        while let Some(parent) = frontier.pop() {
+            for element in self.ordered_live() {
+                if element.frame_id.as_deref() == Some(parent) {
+                    bounds = bounds.union(&element.bounds());
+                    if element.is_frame() {
+                        frontier.push(element.id.as_str());
+                    }
+                }
+            }
+        }
+        Some(bounds)
+    }
 }
 
 #[cfg(test)]
@@ -571,6 +593,41 @@ mod tests {
         doc.add(shape(0.0, 0.0), 1);
         doc.add(shape(200.0, 100.0), 1);
         assert_eq!(doc.bounds(), Some(Rect::new(0.0, 0.0, 300.0, 160.0)));
+    }
+
+    #[test]
+    fn framing_bounds_of_a_frame_include_descendants() {
+        let mut doc = Document::new();
+        let inner = doc.add(
+            ElementKind::Frame {
+                rect: Rect::new(400.0, 400.0, 200.0, 200.0),
+                name: "inner".into(),
+            },
+            1,
+        );
+        let frame = doc.add(
+            ElementKind::Frame {
+                rect: Rect::new(0.0, 0.0, 400.0, 300.0),
+                name: "outer".into(),
+            },
+            1,
+        );
+        let child = doc.add(shape(50.0, 50.0), 1);
+        let grandchild = doc.add(shape(420.0, 420.0), 1);
+        let _outside = doc.add(shape(1_000.0, 1_000.0), 1);
+        doc.element_mut(&child).unwrap().frame_id = Some(frame.clone());
+        doc.element_mut(&inner).unwrap().frame_id = Some(frame.clone());
+        doc.element_mut(&grandchild).unwrap().frame_id = Some(inner);
+
+        assert_eq!(
+            doc.framing_bounds(&frame),
+            Some(Rect::new(0.0, 0.0, 600.0, 600.0))
+        );
+        assert_eq!(
+            doc.framing_bounds(&child),
+            Some(Rect::new(50.0, 50.0, 100.0, 60.0))
+        );
+        assert_eq!(doc.framing_bounds("missing"), None);
     }
 
     #[test]

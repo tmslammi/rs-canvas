@@ -6,12 +6,12 @@
 mod storage;
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use canvas_core::{
-    Affine, ArrowHandle, Dash, Document, DrawOp, Editor as CoreEditor, Effects, FillStyle,
-    Modifiers, Point, Rect, Renderer, ShellAction, StrokeStyle, StylePatch, TextAlign,
-    TextMeasurer, TextOp, Tool,
+    Affine, ArrowHandle, Camera, CameraTween, Dash, Document, DrawOp, Editor as CoreEditor,
+    Effects, FillStyle, Modifiers, Point, Rect, Renderer, ShellAction, StrokeStyle, StylePatch,
+    TextAlign, TextMeasurer, TextOp, Tool,
 };
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -23,6 +23,27 @@ const GRID_LINE: &str = "rgba(236, 228, 214, 0.07)";
 /// Line spacing at which the grid doubles rather than getting denser, in
 /// device px (at 6 device px a 1px line is still readable).
 const GRID_MIN_SPACING_PX: f64 = 6.0;
+/// Agent camera moves glide for this long; user input cancels them early.
+const CAMERA_TWEEN_MS: u64 = 380;
+/// How long a `point` highlight pulses for.
+const PULSE_MS: u64 = 1100;
+/// Focus never zooms past this unless the server grants a higher cap: small
+/// elements should not cause a dramatic jump.
+const DEFAULT_FOCUS_MAX_ZOOM: f64 = 2.0;
+/// A focus target already inside the viewport by this margin is left alone.
+const FOCUS_MARGIN_PX: f64 = 32.0;
+
+fn default_zoom_cap() -> f64 {
+    DEFAULT_FOCUS_MAX_ZOOM
+}
+
+/// Clamp a camera's zoom without moving the world point at its centre.
+fn cap_zoom(camera: Camera, viewport: (f64, f64), cap: f64) -> Camera {
+    if camera.zoom <= cap {
+        return camera;
+    }
+    Camera::from_center(camera.center(viewport), cap, viewport)
+}
 
 fn now_ms() -> u64 {
     js_sys::Date::now() as u64
@@ -245,6 +266,57 @@ struct ViewSnapshot {
     height: u32,
 }
 
+/// A fading highlight ring the agent asked for; view state only.
+#[derive(Clone, Copy)]
+struct Pulse {
+    bounds: Rect,
+    started_ms: u64,
+    duration_ms: u64,
+}
+
+/// One step of an agent presentation timeline.
+#[derive(Clone, Debug, serde::Deserialize)]
+struct PresentStep {
+    #[serde(default)]
+    reveal: Vec<canvas_core::ElementId>,
+    #[serde(default)]
+    focus: Option<canvas_core::ElementId>,
+    #[serde(default)]
+    point: Option<canvas_core::ElementId>,
+    #[serde(default)]
+    caption: Option<String>,
+    #[serde(default)]
+    hold_ms: u64,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct PresentScript {
+    id: u64,
+    steps: Vec<PresentStep>,
+    #[serde(default = "default_zoom_cap")]
+    zoom_cap: f64,
+}
+
+/// Playback of an agent explanation: the document is already final; this is
+/// the reveal frontier, caption and camera cue over it. View state only.
+struct Presentation {
+    id: u64,
+    steps: Vec<PresentStep>,
+    index: usize,
+    step_started_ms: u64,
+    /// Elements not yet revealed.
+    hidden: BTreeSet<canvas_core::ElementId>,
+    caption: Option<String>,
+    /// The server's zoom cap for focus beats.
+    zoom_cap: f64,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct PresentOutcome {
+    id: u64,
+    cancelled: bool,
+}
+
 /// The editor handle the shell talks to.
 #[wasm_bindgen]
 pub struct Editor {
@@ -263,6 +335,16 @@ pub struct Editor {
     on_action: Option<js_sys::Function>,
     /// Where the scene canvas pixels currently sit in world space.
     last_paint: Option<ViewSnapshot>,
+    /// Agent camera tween in flight, if any (view state only).
+    tween: Option<CameraTween>,
+    /// Agent highlight pulse in flight, if any (view state only).
+    pulse: Option<Pulse>,
+    /// A server snapshot that arrived mid-gesture, applied on pointer-up.
+    pending_remote: Option<String>,
+    /// Agent explanation playback in flight, if any (view state only).
+    presentation: Option<Presentation>,
+    /// Finished/cancelled playbacks the shell must acknowledge.
+    present_outcomes: Vec<PresentOutcome>,
 }
 
 fn offscreen_ctx() -> Result<CanvasRenderingContext2d, JsValue> {
@@ -320,6 +402,11 @@ impl Editor {
             core,
             on_action: None,
             last_paint: None,
+            tween: None,
+            pulse: None,
+            pending_remote: None,
+            presentation: None,
+            present_outcomes: Vec::new(),
         };
         editor
             .core
@@ -391,6 +478,25 @@ impl Editor {
         canvas_core::serialization::to_json_pretty(&self.core.doc).unwrap_or_default()
     }
 
+    /// The live document as compact JSON for the agent bridge.
+    pub fn snapshot_json(&self) -> String {
+        canvas_core::serialization::to_json(&self.core.doc).unwrap_or_default()
+    }
+
+    /// Merge a server snapshot into this page's document using the merge-ready
+    /// rules, keeping local edits. Inbound merges never touch history, so the
+    /// user's undo stack stays theirs. Returns whether anything changed.
+    ///
+    /// A snapshot that lands mid-gesture is deferred to pointer-up: replacing
+    /// the document under an in-flight drag would corrupt the gesture.
+    pub fn reconcile_json(&mut self, json: &str) -> Result<bool, JsValue> {
+        if self.core.is_interacting() {
+            self.pending_remote = Some(json.to_string());
+            return Ok(false);
+        }
+        self.reconcile_now(json)
+    }
+
     /// Serialize the document and hand it to storage (the shell's debounced
     /// autosave calls this; serializing inside input handlers is what makes
     /// large documents stutter).
@@ -442,6 +548,54 @@ impl Editor {
         renderer.clear(BACKGROUND);
         renderer.set_transform(Affine::translate(-bounds.x, -bounds.y).then(Affine::scale(scale)));
         for layer in &self.core.scene.layers {
+            renderer.draw_ops(&layer.ops);
+        }
+        canvas.to_data_url_with_type("image/png")
+    }
+
+    /// The current viewport as a PNG data URL: exactly what the user is
+    /// looking at, camera included. Overlay decorations (selection, captions)
+    /// are excluded — this is the drawing, not the UI. The long edge is
+    /// capped so the image stays a sane size for the model.
+    pub fn export_viewport_png(&self, scale: f64) -> Result<String, JsValue> {
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(JsValue::from_str(
+                "viewport scale must be a positive, finite number",
+            ));
+        }
+        let (css_w, css_h) = (self.css_width().max(1.0), self.css_height().max(1.0));
+        let scale = scale.clamp(0.1, 4.0).min(1600.0 / css_w.max(css_h));
+        let width = (css_w * scale).ceil().max(1.0);
+        let height = (css_h * scale).ceil().max(1.0);
+
+        let document = web_sys::window()
+            .and_then(|window| window.document())
+            .ok_or_else(|| JsValue::from_str("no document"))?;
+        let canvas: HtmlCanvasElement = document
+            .create_element("canvas")
+            .map_err(|_| JsValue::from_str("cannot create canvas"))?
+            .dyn_into()
+            .map_err(|_| JsValue::from_str("cannot create canvas"))?;
+        canvas.set_width(width as u32);
+        canvas.set_height(height as u32);
+        let ctx = canvas
+            .get_context("2d")?
+            .ok_or_else(|| JsValue::from_str("no 2d context"))?
+            .dyn_into::<CanvasRenderingContext2d>()?;
+
+        let hidden = self
+            .presentation
+            .as_ref()
+            .map(|presentation| presentation.hidden.clone())
+            .unwrap_or_default();
+        let mut renderer = Canvas2dRenderer::new(ctx);
+        renderer.clear(BACKGROUND);
+        renderer.set_transform(self.core.camera.transform().then(Affine::scale(scale)));
+        let viewport = self.core.camera.viewport(css_w, css_h);
+        for layer in self.core.scene.visible(viewport) {
+            if hidden.contains(&layer.element_id) {
+                continue;
+            }
             renderer.draw_ops(&layer.ops);
         }
         canvas.to_data_url_with_type("image/png")
@@ -605,14 +759,28 @@ impl Editor {
     pub fn render(&mut self) {
         let (w, h) = self.core.viewport_size();
         let viewport = self.core.camera.viewport(w, h);
-        self.renderer.begin_frame();
-        self.renderer.clear(BACKGROUND);
-        self.renderer
-            .set_transform(self.core.camera.transform().then(Affine::scale(self.dpr)));
-        for layer in self.core.scene.visible(viewport) {
-            self.renderer.draw_ops(&layer.ops);
+        // During playback, unrevealed elements stay off the canvas. The
+        // document is final the whole time; this is view state only.
+        let hidden = self
+            .presentation
+            .as_ref()
+            .map(|presentation| presentation.hidden.clone())
+            .unwrap_or_default();
+        let transform = self.core.camera.transform().then(Affine::scale(self.dpr));
+        {
+            let scene = &self.core.scene;
+            let renderer = &mut self.renderer;
+            renderer.begin_frame();
+            renderer.clear(BACKGROUND);
+            renderer.set_transform(transform);
+            for layer in scene.visible(viewport) {
+                if hidden.contains(&layer.element_id) {
+                    continue;
+                }
+                renderer.draw_ops(&layer.ops);
+            }
+            renderer.end_frame();
         }
-        self.renderer.end_frame();
         self.draw_overlay();
         self.remember_view();
     }
@@ -623,6 +791,8 @@ impl Editor {
         if !x.is_finite() || !y.is_finite() {
             return;
         }
+        self.cancel_camera_transition();
+        self.cancel_presentation();
         let mods = parse_modifiers(&mods);
         let effects = self
             .core
@@ -658,12 +828,18 @@ impl Editor {
         // End of a pan gesture: replace the shifted approximation with a
         // crisp render.
         self.settle_view();
+        // A remote snapshot deferred during the gesture can land now.
+        if let Some(pending) = self.pending_remote.take() {
+            let _ = self.reconcile_now(&pending);
+        }
     }
 
     pub fn wheel(&mut self, x: f64, y: f64, dx: f64, dy: f64, ctrl: bool) {
         if !x.is_finite() || !y.is_finite() || !dx.is_finite() || !dy.is_finite() {
             return;
         }
+        self.cancel_camera_transition();
+        self.cancel_presentation();
         self.core
             .nav
             .wheel(&mut self.core.camera, Point::new(x, y), dx, dy, ctrl);
@@ -676,12 +852,17 @@ impl Editor {
         if !x.is_finite() || !y.is_finite() || !factor.is_finite() {
             return;
         }
+        self.cancel_camera_transition();
+        self.cancel_presentation();
         self.core.camera.zoom_at(Point::new(x, y), factor);
         self.render();
     }
 
     /// Returns true when the shell should preventDefault.
     pub fn key_down(&mut self, key: &str, shift: bool, alt: bool, ctrl: bool, meta: bool) -> bool {
+        if !matches!(key, "Shift" | "Control" | "Alt" | "Meta" | "CapsLock") {
+            self.cancel_presentation();
+        }
         let mods = Modifiers {
             shift,
             alt,
@@ -766,6 +947,7 @@ impl Editor {
     }
 
     pub fn zoom_to_fit(&mut self) {
+        self.cancel_camera_transition();
         if let Some(bounds) = self.core.scene.bounds() {
             self.core.camera.zoom_to_fit(
                 bounds,
@@ -782,12 +964,230 @@ impl Editor {
     }
 
     pub fn reset_zoom(&mut self) {
+        self.cancel_camera_transition();
         let center = Point::new(
             self.scene_canvas.client_width() as f64 / 2.0,
             self.scene_canvas.client_height() as f64 / 2.0,
         );
         self.core.camera.set_zoom_at(center, 1.0);
         self.render();
+    }
+
+    /// Apply a view command from the agent bridge (JSON:
+    /// `{action: "focus"|"zoom"|"point", id?, pad?, mode?, animate?}` —
+    /// `animate: false` jumps instead of gliding). Returns true when an
+    /// animation is running and the shell should pump `advance_animation`.
+    ///
+    /// View commands never touch the document: no deltas, no history, no
+    /// persistence.
+    pub fn apply_view_command(&mut self, json: &str) -> bool {
+        let Ok(command) = serde_json::from_str::<serde_json::Value>(json) else {
+            return false;
+        };
+        let Some(action) = command.get("action").and_then(|value| value.as_str()) else {
+            return false;
+        };
+        let animate = command
+            .get("animate")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(true);
+        let zoom_cap = command
+            .get("zoom_cap")
+            .and_then(|value| value.as_f64())
+            .unwrap_or(DEFAULT_FOCUS_MAX_ZOOM);
+        match action {
+            "focus" => {
+                let id = command.get("id").and_then(|value| value.as_str());
+                let pad = command
+                    .get("pad")
+                    .and_then(|value| value.as_f64())
+                    .unwrap_or(64.0);
+                match self.focus_plan(id, pad, zoom_cap) {
+                    Some(target) => self.start_camera_transition(target, animate),
+                    None => false,
+                }
+            }
+            "zoom" => {
+                let mode = command
+                    .get("mode")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("in");
+                let viewport = (self.css_width(), self.css_height());
+                let target = match mode {
+                    "in" => {
+                        let mut camera = self.core.camera;
+                        camera.zoom_at(Point::new(viewport.0 / 2.0, viewport.1 / 2.0), 1.3);
+                        Some(cap_zoom(camera, viewport, zoom_cap))
+                    }
+                    "out" => {
+                        let mut camera = self.core.camera;
+                        camera.zoom_at(Point::new(viewport.0 / 2.0, viewport.1 / 2.0), 1.0 / 1.3);
+                        Some(camera)
+                    }
+                    "fit" => self
+                        .core
+                        .focus_camera(None, 48.0)
+                        .map(|camera| cap_zoom(camera, viewport, zoom_cap)),
+                    "reset" => Some(Camera::from_center(
+                        self.core.camera.center(viewport),
+                        1.0,
+                        viewport,
+                    )),
+                    _ => None,
+                };
+                target
+                    .map(|camera| self.start_camera_transition(camera, animate))
+                    .unwrap_or(false)
+            }
+            "point" => {
+                let Some(id) = command.get("id").and_then(|value| value.as_str()) else {
+                    return false;
+                };
+                let Some(bounds) = self.core.doc.framing_bounds(id) else {
+                    return false;
+                };
+                self.pulse = Some(Pulse {
+                    bounds,
+                    started_ms: now_ms(),
+                    duration_ms: PULSE_MS,
+                });
+                self.draw_overlay();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Advance any in-flight agent animation to `now_ms`; returns whether
+    /// another frame is needed. The shell's requestAnimationFrame loop drives
+    /// this, so the core stays clock-free.
+    pub fn advance_animation(&mut self, now_ms: f64) -> bool {
+        if !now_ms.is_finite() || now_ms < 0.0 {
+            return false;
+        }
+        let now = now_ms as u64;
+        let mut active = false;
+        if let Some(tween) = self.tween {
+            let viewport = (self.css_width(), self.css_height());
+            let (camera, done) = tween.camera_at(now, viewport);
+            self.core.camera = camera;
+            if done {
+                self.tween = None;
+            } else {
+                active = true;
+            }
+            self.render();
+        }
+        if let Some(pulse) = self.pulse {
+            if now >= pulse.started_ms + pulse.duration_ms {
+                self.pulse = None;
+                self.draw_overlay();
+            } else {
+                active = true;
+                if self.tween.is_none() {
+                    self.draw_overlay();
+                }
+            }
+        }
+        // Presentation pacing: hold the step, then reveal the next one (or
+        // finish). The pump stays alive for the whole timeline; pure holds
+        // cost a rAF tick, not a repaint.
+        let advance_step = match &self.presentation {
+            Some(presentation) => {
+                now >= presentation.step_started_ms + presentation.steps[presentation.index].hold_ms
+            }
+            None => false,
+        };
+        if advance_step {
+            let last = self
+                .presentation
+                .as_ref()
+                .is_some_and(|presentation| presentation.index + 1 >= presentation.steps.len());
+            if last {
+                self.finish_presentation(false);
+            } else {
+                if let Some(presentation) = self.presentation.as_mut() {
+                    presentation.index += 1;
+                }
+                self.begin_presentation_step();
+            }
+        }
+        if self.presentation.is_some() {
+            active = true;
+        }
+        active
+    }
+
+    /// Start an agent presentation timeline (JSON: `{id, steps:[{reveal,
+    /// focus, point, caption, hold_ms}]}`). The document is already final;
+    /// this stages the reveal, caption and camera cues over it. Returns true
+    /// when the shell should pump `advance_animation`.
+    pub fn start_presentation(&mut self, json: &str) -> bool {
+        let Ok(script) = serde_json::from_str::<PresentScript>(json) else {
+            return false;
+        };
+        if script.steps.is_empty() {
+            return false;
+        }
+        self.cancel_presentation();
+        let mut hidden: BTreeSet<canvas_core::ElementId> = BTreeSet::new();
+        for step in &script.steps {
+            hidden.extend(step.reveal.iter().cloned());
+        }
+        self.presentation = Some(Presentation {
+            id: script.id,
+            steps: script.steps,
+            index: 0,
+            step_started_ms: now_ms(),
+            hidden,
+            caption: None,
+            zoom_cap: script.zoom_cap,
+        });
+        self.begin_presentation_step();
+        true
+    }
+
+    /// Finished/cancelled playbacks the shell must acknowledge, as JSON like
+    /// `[{"id":3,"cancelled":false}]`; empty string when there are none.
+    pub fn presentation_outcomes(&mut self) -> String {
+        if self.present_outcomes.is_empty() {
+            return String::new();
+        }
+        let json = serde_json::to_string(&self.present_outcomes).unwrap_or_default();
+        self.present_outcomes.clear();
+        json
+    }
+
+    /// Introspection for the shell and tests: empty when idle, else JSON with
+    /// `playing`, `hidden` and `caption`. View state only.
+    pub fn presentation_state(&self) -> String {
+        match &self.presentation {
+            None => String::new(),
+            Some(presentation) => serde_json::json!({
+                "playing": true,
+                "hidden": presentation.hidden.len(),
+                "caption": presentation.caption,
+            })
+            .to_string(),
+        }
+    }
+
+    /// The page's transient view state for the agent: camera, viewport and
+    /// selection. Never persisted, never merged; the server treats it as a
+    /// hint (see ADR 0006).
+    pub fn view_state_json(&self) -> String {
+        let (w, h) = (self.css_width(), self.css_height());
+        let selection: Vec<&str> = self.core.selection.iter().map(String::as_str).collect();
+        serde_json::json!({
+            "camera": {
+                "x": self.core.camera.scroll.x,
+                "y": self.core.camera.scroll.y,
+                "zoom": self.core.camera.zoom,
+            },
+            "viewport": { "w": w, "h": h },
+            "selection": selection,
+        })
+        .to_string()
     }
 
     /// Screen point -> world point, through the current camera.
@@ -852,6 +1252,136 @@ impl Editor {
                 self.render();
             }
         }
+    }
+
+    /// Begin an eased camera move to `target`, or jump when motion is
+    /// unwanted. Returns whether the shell should pump frames.
+    fn start_camera_transition(&mut self, target: Camera, animate: bool) -> bool {
+        if !animate {
+            self.tween = None;
+            self.core.camera = target;
+            self.render();
+            return false;
+        }
+        let viewport = (self.css_width(), self.css_height());
+        self.tween = Some(CameraTween::between(
+            &self.core.camera,
+            &target,
+            viewport,
+            now_ms(),
+            CAMERA_TWEEN_MS,
+        ));
+        true
+    }
+
+    /// Any direct user camera input wins over the agent's animation.
+    fn cancel_camera_transition(&mut self) {
+        self.tween = None;
+    }
+
+    /// The camera move a focus request implies: `None` when the target is
+    /// already comfortably visible — the camera belongs to the user — and the
+    /// fit zoom is capped so small elements don't cause a dramatic jump.
+    fn focus_plan(&self, id: Option<&str>, pad: f64, zoom_cap: f64) -> Option<Camera> {
+        let bounds = match id {
+            Some(id) => self.core.doc.framing_bounds(id)?,
+            None => self.core.doc.bounds()?,
+        };
+        let viewport = (self.css_width(), self.css_height());
+        if viewport.0 <= 0.0 || viewport.1 <= 0.0 {
+            return None;
+        }
+        let visible = self.core.camera.viewport(viewport.0, viewport.1);
+        let margin = FOCUS_MARGIN_PX / self.core.camera.zoom;
+        let comfortably_visible = bounds.x >= visible.x + margin
+            && bounds.y >= visible.y + margin
+            && bounds.max_x() <= visible.max_x() - margin
+            && bounds.max_y() <= visible.max_y() - margin;
+        if comfortably_visible {
+            return None;
+        }
+        let mut camera = self.core.camera;
+        camera.zoom_to_fit(bounds, viewport, pad);
+        Some(Camera::from_center(
+            bounds.center(),
+            camera.zoom.min(zoom_cap),
+            viewport,
+        ))
+    }
+
+    /// Apply the current presentation step: reveal its elements, move the
+    /// camera, pulse the point target and show the caption.
+    fn begin_presentation_step(&mut self) {
+        let Some(presentation) = self.presentation.as_mut() else {
+            return;
+        };
+        if presentation.index >= presentation.steps.len() {
+            return;
+        }
+        let step = presentation.steps[presentation.index].clone();
+        let zoom_cap = presentation.zoom_cap;
+        for id in &step.reveal {
+            presentation.hidden.remove(id);
+        }
+        presentation.caption = step.caption.clone();
+        presentation.step_started_ms = now_ms();
+        if let Some(id) = step.focus.as_deref() {
+            if let Some(target) = self.focus_plan(Some(id), 64.0, zoom_cap) {
+                self.start_camera_transition(target, true);
+            }
+        }
+        if let Some(id) = step.point.as_deref() {
+            if let Some(bounds) = self.core.doc.framing_bounds(id) {
+                self.pulse = Some(Pulse {
+                    bounds,
+                    started_ms: now_ms(),
+                    duration_ms: PULSE_MS,
+                });
+            }
+        }
+        self.last_paint = None;
+        self.render();
+    }
+
+    /// End playback: reveal everything (the document was always final), drop
+    /// its decorations, and record the outcome for the shell to report.
+    fn finish_presentation(&mut self, cancelled: bool) {
+        let Some(presentation) = self.presentation.take() else {
+            return;
+        };
+        self.present_outcomes.push(PresentOutcome {
+            id: presentation.id,
+            cancelled,
+        });
+        self.pulse = None;
+        self.tween = None;
+        self.last_paint = None;
+        self.render();
+    }
+
+    /// Any direct user input wins over the agent's explanation.
+    fn cancel_presentation(&mut self) {
+        if self.presentation.is_some() {
+            self.finish_presentation(true);
+        }
+    }
+
+    /// Merge a remote snapshot now: reconcile, rebuild the scene, repaint.
+    fn reconcile_now(&mut self, json: &str) -> Result<bool, JsValue> {
+        let remote = canvas_core::serialization::from_json(json)
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        let merged = canvas_core::reconcile(&self.core.doc, &remote);
+        if merged == self.core.doc {
+            return Ok(false);
+        }
+        self.core.doc = merged;
+        self.core
+            .selection
+            .retain(|id| self.core.doc.element(id).is_some_and(|e| !e.is_deleted));
+        self.last_paint = None;
+        self.core.refresh_scene();
+        self.render();
+        Ok(true)
     }
 
     /// Shift the existing scene pixels by a pure pan and repaint only the
@@ -1209,6 +1739,60 @@ impl Editor {
                 self.overlay
                     .stroke_rect(x - handle, y - handle, handle * 2.0, handle * 2.0);
             }
+        }
+
+        // The agent's highlight: an expanding, fading ring around one element.
+        if let Some(pulse) = self.pulse {
+            let elapsed = now_ms().saturating_sub(pulse.started_ms) as f64;
+            let t = (elapsed / pulse.duration_ms as f64).clamp(0.0, 1.0);
+            let grow = 6.0 + 26.0 * t;
+            let alpha = (1.0 - t) * (1.0 - t);
+            let a = camera.world_to_screen(Point::new(pulse.bounds.x, pulse.bounds.y));
+            let b = camera.world_to_screen(Point::new(pulse.bounds.max_x(), pulse.bounds.max_y()));
+            let r = Rect::new(
+                a.x - grow,
+                a.y - grow,
+                (b.x - a.x) + 2.0 * grow,
+                (b.y - a.y) + 2.0 * grow,
+            );
+            self.overlay
+                .set_stroke_style_str(&format!("rgba(217, 142, 50, {alpha:.3})"));
+            self.overlay.set_line_width(2.5 * self.dpr);
+            self.overlay.stroke_rect(
+                r.x * self.dpr,
+                r.y * self.dpr,
+                r.w * self.dpr,
+                r.h * self.dpr,
+            );
+        }
+
+        // The agent's caption: a bar at the bottom of the viewport.
+        if let Some(caption) = self
+            .presentation
+            .as_ref()
+            .and_then(|presentation| presentation.caption.clone())
+        {
+            let font_size = 22.0 * self.dpr;
+            self.overlay
+                .set_font(&format!("{font_size}px ComicShanns, sans-serif"));
+            self.overlay.set_text_align("center");
+            self.overlay.set_text_baseline("middle");
+            let text_width = self
+                .overlay
+                .measure_text(&caption)
+                .map(|metrics| metrics.width())
+                .unwrap_or(0.0);
+            let bar_w = (text_width + 56.0 * self.dpr).min(w - 24.0);
+            let bar_h = 46.0 * self.dpr;
+            let x = (w - bar_w) / 2.0;
+            let y = h - bar_h - 32.0 * self.dpr;
+            self.overlay.set_fill_style_str("rgba(26, 24, 21, 0.92)");
+            self.overlay.fill_rect(x, y, bar_w, bar_h);
+            self.overlay.set_stroke_style_str(ACCENT);
+            self.overlay.set_line_width(self.dpr);
+            self.overlay.stroke_rect(x, y, bar_w, bar_h);
+            self.overlay.set_fill_style_str("#ece4d6");
+            let _ = self.overlay.fill_text(&caption, w / 2.0, y + bar_h / 2.0);
         }
         self.overlay.restore();
     }

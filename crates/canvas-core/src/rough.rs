@@ -640,21 +640,27 @@ pub fn build_element_ops(
             style,
             ..
         } => {
+            // A visible fill shades the closed path under the ink: solid
+            // colour, hachure or cross-hatch, so a stroke can carry shadow or
+            // texture instead of bare outline.
+            let mut ops = fill_ops(points, style, seed);
             if points.len() < 2 || style.stroke_color == "transparent" {
-                return Vec::new();
+                return ops;
             }
             if style.dash != crate::model::StrokeDash::Solid {
-                return vec![DrawOp::Path(PathOp {
+                ops.push(DrawOp::Path(PathOp {
                     points: points.clone(),
                     closed: false,
                     stroke: Some(stroke_of(style, style.stroke_width)),
                     fill: None,
-                })];
+                }));
+                return ops;
             }
             let mut rng = RoughRng::seeded(seed ^ 0x55);
             let base = style.stroke_width.max(0.5);
             let band = brush_band(points, pressures, base, &mut rng);
-            ink_path(band, style).into_iter().collect()
+            ops.extend(ink_path(band, style));
+            ops
         }
         ElementKind::Arrow {
             start,
@@ -1020,6 +1026,50 @@ mod tests {
         assert!(
             spread_end < spread_mid,
             "ends taper: end spread {spread_end} < mid spread {spread_mid}"
+        );
+    }
+
+    #[test]
+    fn freehand_fill_shades_the_closed_path() {
+        use crate::model::{Element, ElementKind, FillPattern, Style};
+        use crate::text::ApproxMeasurer;
+        let ops = |fill_color: &str| {
+            let element = Element::new(
+                ElementKind::Freehand {
+                    points: vec![
+                        Point::new(0.0, 0.0),
+                        Point::new(60.0, 0.0),
+                        Point::new(60.0, 60.0),
+                        Point::new(0.0, 60.0),
+                    ],
+                    pressures: vec![0.5; 4],
+                    style: Style {
+                        fill_color: fill_color.into(),
+                        fill_style: FillPattern::CrossHatch,
+                        ..Style::default()
+                    },
+                },
+                "a0".into(),
+                0,
+            );
+            build_element_ops(
+                &element,
+                &Document::new(),
+                &ApproxMeasurer,
+                &ObstacleIndex::new(),
+            )
+        };
+        assert!(
+            ops("#ffec99")
+                .iter()
+                .any(|op| matches!(op, DrawOp::LineBatch { .. })),
+            "cross-hatch fill emits a line batch under the ink"
+        );
+        assert!(
+            !ops("transparent")
+                .iter()
+                .any(|op| matches!(op, DrawOp::LineBatch { .. })),
+            "no fill means ink only"
         );
     }
 }
