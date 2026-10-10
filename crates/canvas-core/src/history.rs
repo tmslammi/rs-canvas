@@ -192,7 +192,7 @@ impl History {
                     let current = doc
                         .element(&id)
                         .cloned()
-                        .ok_or_else(|| EditError::UnknownElement(id))?;
+                        .ok_or(EditError::UnknownElement(id))?;
                     // Purge the live copy; the wire projects the purge as a
                     // freshly touched tombstone, so peers accept the deletion.
                     let purge = Delta::Purge {
@@ -212,7 +212,7 @@ impl History {
                     let current = doc
                         .element(&id)
                         .cloned()
-                        .ok_or_else(|| EditError::UnknownElement(id))?;
+                        .ok_or(EditError::UnknownElement(id))?;
                     let restored = Delta::Update {
                         before: current.clone(),
                         after: Self::freshen(Some(&current), before, now_ms),
@@ -654,7 +654,10 @@ mod tests {
             history.undo(&mut doc, 10 + round * 2).unwrap();
             let restored = doc.element(&id).unwrap().clone();
             assert!(restored.content_eq(&base), "round {round}: undo restores");
-            assert!(restored.version > last_version, "round {round}: version rises");
+            assert!(
+                restored.version > last_version,
+                "round {round}: version rises"
+            );
             last_version = restored.version;
 
             history.redo(&mut doc, 11 + round * 2).unwrap();

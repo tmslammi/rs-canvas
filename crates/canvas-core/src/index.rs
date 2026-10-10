@@ -54,7 +54,7 @@ fn integer_part(key: &str) -> Result<&str, IndexError> {
     if len > key.len() {
         return Err(IndexError::InvalidKey);
     }
-    Ok(&key[..len])
+    key.get(..len).ok_or(IndexError::InvalidKey)
 }
 
 /// Check a key obeys the invariants (non-empty, no trailing zero).
@@ -63,6 +63,12 @@ pub fn validate_order_key(key: &str) -> Result<(), IndexError> {
         return Err(IndexError::InvalidKey);
     }
     let int = integer_part(key)?;
+    if !key.as_bytes()[1..]
+        .iter()
+        .all(|c| digit_index(*c).is_some())
+    {
+        return Err(IndexError::InvalidKey);
+    }
     if key[int.len()..].ends_with('0') {
         return Err(IndexError::InvalidKey);
     }
@@ -256,6 +262,19 @@ pub fn key_between(a: Option<&str>, b: Option<&str>) -> Result<String, IndexErro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn malformed_keys_are_rejected_without_panicking() {
+        for key in ["aé", "a!", "a0!", "a0é", "a0/", "a0\\"] {
+            assert_eq!(
+                validate_order_key(key),
+                Err(IndexError::InvalidKey),
+                "{key}"
+            );
+            assert_eq!(key_between(Some(key), None), Err(IndexError::InvalidKey));
+            assert_eq!(key_between(None, Some(key)), Err(IndexError::InvalidKey));
+        }
+    }
 
     #[test]
     fn first_key() {

@@ -32,7 +32,9 @@ async function boot() {
   const overlay = document.getElementById("overlay");
   const toolbar = document.getElementById("toolbar");
   const stylePanelHost = document.getElementById("style-panel");
+  const workspace = new URLSearchParams(location.search).get("ws") || "default";
   const editor = new Editor(scene, overlay, grid);
+  editor.set_workspace(workspace);
   const stylePanel = createStylePanel(stylePanelHost, editor);
 
   const toast = document.createElement("div");
@@ -317,7 +319,11 @@ async function boot() {
       scheduleAutosave();
       // Deferred: the handler runs inside the wasm call that produced the
       // change, and calling back into the editor re-entrantly would panic.
-      queueMicrotask(() => bridge?.publishChanges());
+      queueMicrotask(() => {
+        bridge?.publishChanges();
+        refreshToolbar();
+        updateCursor();
+      });
       return;
     }
     if (action.type !== "open_text_editor") return;
@@ -367,7 +373,9 @@ async function boot() {
   };
   // IndexedDB writes spawned during unload can be torn down before they
   // commit, so the unload path also writes a synchronous checkpoint.
-  const UNLOAD_CHECKPOINT = "rs-canvas-unload-checkpoint";
+  const UNLOAD_CHECKPOINT = workspace === "default"
+    ? "rs-canvas-unload-checkpoint"
+    : `rs-canvas-unload-checkpoint:workspace:${workspace}`;
   const checkpointAutosave = () => {
     if (!autosaveTimer) return; // nothing pending — IndexedDB is already current
     window.clearTimeout(autosaveTimer);
@@ -421,6 +429,7 @@ async function boot() {
 
   const activePointers = new Map();
   let pinchDistance = 0;
+  let pinching = false;
 
   scene.addEventListener("pointerdown", (event) => {
     event.preventDefault();
@@ -442,6 +451,20 @@ async function boot() {
     } catch {
       // pointer capture is best-effort
     }
+    if (activePointers.size >= 2) {
+      if (!pinching) {
+        // A second finger takes over navigation; discard the first finger's
+        // incomplete drawing before it can become an accidental element.
+        editor.pointer_cancel();
+        pinching = true;
+        const [a, b] = [...activePointers.values()];
+        pinchDistance = Math.hypot(a.x - b.x, a.y - b.y);
+        refreshToolbar();
+        updateCursor();
+      }
+      return;
+    }
+    if (pinching) return;
     editor.set_pressure(event.pressure);
     editor.pointer_down(event.offsetX, event.offsetY, event.button, modifiers(event));
     refreshToolbar();
@@ -462,6 +485,9 @@ async function boot() {
       pinchDistance = distance;
       return;
     }
+    // Wait until every finger has lifted after a pinch. The remaining finger
+    // must not resume the drawing gesture that was cancelled on takeover.
+    if (pinching) return;
     editor.set_pressure(event.pressure);
     editor.pointer_move(event.offsetX, event.offsetY, modifiers(event));
     updateCursor();
@@ -469,10 +495,21 @@ async function boot() {
 
   const endPointer = (event) => {
     activePointers.delete(event.pointerId);
+    if (pinching) {
+      if (activePointers.size === 0) {
+        pinching = false;
+        pinchDistance = 0;
+      }
+      return;
+    }
     if (activePointers.size < 2) {
       pinchDistance = 0;
     }
-    editor.pointer_up(event.offsetX, event.offsetY, event.button, modifiers(event));
+    if (event.type === "pointercancel") {
+      editor.pointer_cancel();
+    } else {
+      editor.pointer_up(event.offsetX, event.offsetY, event.button, modifiers(event));
+    }
     refreshToolbar();
     updateCursor();
   };
@@ -558,7 +595,7 @@ async function boot() {
   redraw();
 
   try {
-    const saved = await load_saved_json();
+    const saved = await load_saved_json(workspace);
     if (saved) {
       editor.load_json(saved);
       showToast("Restored your last drawing");
@@ -585,7 +622,12 @@ async function boot() {
   // Connect only after the local autosave and checkpoint are in place: the
   // server hands over its mirror, and the two reconcile.
   bridge = connectAgentBridge(editor, {
-    onRemoteChange: () => editor.flush_save(),
+    workspace,
+    onRemoteChange: () => {
+      editor.flush_save();
+      refreshToolbar();
+      updateCursor();
+    },
     onSettingsChange: (settings) => agentPanel.setSettings(settings),
   });
 

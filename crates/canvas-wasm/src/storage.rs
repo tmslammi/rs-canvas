@@ -10,6 +10,14 @@ const STORE: &str = "documents";
 /// autosaves are ignored rather than loaded invisible.
 const KEY: &str = "current-v2";
 
+fn autosave_key(workspace: &str) -> String {
+    if workspace.is_empty() || workspace == "default" {
+        KEY.to_string()
+    } else {
+        format!("{KEY}:workspace:{workspace}")
+    }
+}
+
 fn error_string<E: std::fmt::Debug>(error: E) -> String {
     format!("{error:?}")
 }
@@ -24,14 +32,18 @@ async fn open() -> Result<Database, String> {
 }
 
 /// Persist a serialized document as the current autosave.
-pub async fn save_document(json: &str) -> Result<(), String> {
+pub async fn save_document(json: &str, workspace: &str) -> Result<(), String> {
     let db = open().await?;
     let transaction = db
         .transaction(&[STORE], TransactionMode::ReadWrite)
         .map_err(error_string)?;
     let store = transaction.object_store(STORE).map_err(error_string)?;
     let value = js_sys::Object::new();
-    let _ = js_sys::Reflect::set(&value, &"id".into(), &JsValue::from_str(KEY));
+    let _ = js_sys::Reflect::set(
+        &value,
+        &"id".into(),
+        &JsValue::from_str(&autosave_key(workspace)),
+    );
     let _ = js_sys::Reflect::set(&value, &"json".into(), &JsValue::from_str(json));
     let _ = js_sys::Reflect::set(
         &value,
@@ -52,14 +64,14 @@ pub async fn save_document(json: &str) -> Result<(), String> {
 }
 
 /// Load the current autosave, if any.
-pub async fn load_document() -> Result<Option<String>, String> {
+pub async fn load_document(workspace: &str) -> Result<Option<String>, String> {
     let db = open().await?;
     let transaction = db
         .transaction(&[STORE], TransactionMode::ReadOnly)
         .map_err(error_string)?;
     let store = transaction.object_store(STORE).map_err(error_string)?;
     let value = store
-        .get(Query::Key(JsValue::from_str(KEY)))
+        .get(Query::Key(JsValue::from_str(&autosave_key(workspace))))
         .map_err(error_string)?
         .await
         .map_err(error_string)?;
@@ -68,4 +80,17 @@ pub async fn load_document() -> Result<Option<String>, String> {
     };
     let json = js_sys::Reflect::get(&value, &"json".into()).map_err(error_string)?;
     Ok(json.as_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_keys_are_isolated_and_preserve_default_autosaves() {
+        assert_eq!(autosave_key(""), KEY);
+        assert_eq!(autosave_key("default"), KEY);
+        assert_ne!(autosave_key("alpha"), autosave_key("beta"));
+        assert_ne!(autosave_key("alpha"), autosave_key("default"));
+    }
 }

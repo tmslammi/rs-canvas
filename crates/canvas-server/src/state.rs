@@ -184,14 +184,16 @@ impl AgentSettings {
     }
 
     pub fn apply_patch(&mut self, patch: &serde_json::Value) -> Result<(), String> {
+        let mut updated = self.clone();
         if let Some(camera) = patch.get("camera") {
-            self.camera = serde_json::from_value(camera.clone())
+            updated.camera = serde_json::from_value(camera.clone())
                 .map_err(|_| "camera must be off, gentle or full".to_string())?;
         }
         if let Some(pacing) = patch.get("pacing") {
-            self.pacing = serde_json::from_value(pacing.clone())
+            updated.pacing = serde_json::from_value(pacing.clone())
                 .map_err(|_| "pacing must be fast, normal or slow".to_string())?;
         }
+        *self = updated;
         Ok(())
     }
 }
@@ -676,10 +678,7 @@ impl AppState {
         for ws in workspaces {
             let elements = ws.doc.lock().await.live_count();
             let pages = ws.pages.load(Ordering::SeqCst);
-            if ws.name != DEFAULT_WORKSPACE
-                && ws.doc_path.is_none()
-                && pages == 0
-                && elements == 0
+            if ws.name != DEFAULT_WORKSPACE && ws.doc_path.is_none() && pages == 0 && elements == 0
             {
                 continue;
             }
@@ -841,8 +840,22 @@ mod tests {
             "ümlaut",
             "x".repeat(41).as_str(),
         ] {
-            assert!(!valid_workspace_name(invalid), "{invalid} should be invalid");
+            assert!(
+                !valid_workspace_name(invalid),
+                "{invalid} should be invalid"
+            );
         }
+    }
+
+    #[test]
+    fn invalid_settings_patch_does_not_apply_valid_fields() {
+        let mut settings = AgentSettings::default();
+        let before = settings.clone();
+        let result = settings.apply_patch(&serde_json::json!({
+            "camera": "off", "pacing": "invalid"
+        }));
+        assert!(result.is_err());
+        assert_eq!(settings, before);
     }
 
     #[tokio::test]
@@ -851,7 +864,7 @@ mod tests {
         let path = dir.join("document.json");
         let state = AppState::new(PathBuf::from("."), Some(path.clone()), true);
         let ws = state.workspace(DEFAULT_WORKSPACE).await;
-        add_shape(&mut ws.doc.lock().await, 10.0, 1);
+        add_shape(&mut *ws.doc.lock().await, 10.0, 1);
         ws.persist_document().await;
 
         let restored = AppState::new(PathBuf::from("."), Some(path), true);
@@ -882,7 +895,7 @@ mod tests {
             alpha.doc_path.as_deref(),
             Some(dir.join("workspaces/alpha.json").as_path())
         );
-        add_shape(&mut alpha.doc.lock().await, 5.0, 1);
+        add_shape(&mut *alpha.doc.lock().await, 5.0, 1);
         alpha.persist_document().await;
 
         let reopened = AppState::new(PathBuf::from("."), Some(dir.join("current.json")), true);
@@ -961,7 +974,7 @@ mod tests {
     async fn in_memory_mirrors_clear_when_the_last_page_leaves() {
         let state = AppState::new(PathBuf::from("."), None, true);
         let ws = state.workspace(DEFAULT_WORKSPACE).await;
-        add_shape(&mut ws.doc.lock().await, 0.0, 1);
+        add_shape(&mut *ws.doc.lock().await, 0.0, 1);
 
         ws.release_when_idle(1).await;
         assert_eq!(ws.doc.lock().await.live_count(), 1, "a page is watching");
@@ -974,7 +987,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rs-canvas-idle-{}", std::process::id()));
         let state = AppState::new(PathBuf::from("."), Some(dir.join("document.json")), true);
         let ws = state.workspace(DEFAULT_WORKSPACE).await;
-        add_shape(&mut ws.doc.lock().await, 0.0, 1);
+        add_shape(&mut *ws.doc.lock().await, 0.0, 1);
         ws.release_when_idle(0).await;
         assert_eq!(ws.doc.lock().await.live_count(), 1);
         let _ = tokio::fs::remove_dir_all(dir).await;
@@ -1013,7 +1026,10 @@ mod tests {
         let mut from_server = ws.to_pages.subscribe();
         let older = Element::new(shape_at(0.0), "a0".into(), 1).with_id("one");
         assert!(!ws.absorb_patch(vec![older], 1).await);
-        assert_eq!(ws.doc.lock().await.element("one").unwrap().kind, shape_at(5.0));
+        assert_eq!(
+            ws.doc.lock().await.element("one").unwrap().kind,
+            shape_at(5.0)
+        );
 
         // The page that sent the stale copy is corrected back to the winner.
         let frame: serde_json::Value =
@@ -1028,7 +1044,7 @@ mod tests {
     async fn snapshot_frames_embed_the_document_as_an_object() {
         let state = AppState::new(PathBuf::from("."), None, true);
         let ws = state.workspace(DEFAULT_WORKSPACE).await;
-        add_shape(&mut ws.doc.lock().await, 0.0, 1);
+        add_shape(&mut *ws.doc.lock().await, 0.0, 1);
         let frame: serde_json::Value = serde_json::from_str(&ws.snapshot_frame().await).unwrap();
         assert_eq!(frame["type"], "snapshot");
         assert!(frame["doc"]["elements"].is_object());

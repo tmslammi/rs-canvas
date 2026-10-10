@@ -20,6 +20,14 @@ export function connectAgentBridge(editor, hooks = {}) {
   // hello frame says so before any snapshot is sent.
   let syncEnabled = true;
   let settings = null;
+  let lastHint = "";
+  const publishHint = (force = false) => {
+    if (!syncEnabled || !socket || socket.readyState !== WebSocket.OPEN) return;
+    const hint = editor.view_state_json();
+    if (!force && hint === lastHint) return;
+    lastHint = hint;
+    socket.send(JSON.stringify({ type: "hint", ...JSON.parse(hint) }));
+  };
 
   // Hand the server the page's current document; the server reconciles it
   // with its mirror and answers with the merged result if anything differs.
@@ -81,6 +89,7 @@ export function connectAgentBridge(editor, hooks = {}) {
         settings = message.settings;
         hooks.onSettingsChange?.(settings);
       }
+      publishHint(true);
       return;
     }
     if (message.type === "settings" && message.settings) {
@@ -145,10 +154,12 @@ export function connectAgentBridge(editor, hooks = {}) {
 
   const connect = () => {
     const scheme = location.protocol === "https:" ? "wss" : "ws";
-    socket = new WebSocket(`${scheme}://${location.host}/ws`);
+    const workspace = hooks.workspace || "default";
+    socket = new WebSocket(`${scheme}://${location.host}/ws?ws=${encodeURIComponent(workspace)}`);
 
     socket.addEventListener("open", () => {
       retry = RETRY_MIN_MS;
+      lastHint = "";
       window.__rsAgentConnected = true;
       console.info("[agent] bridge connected");
       publishDocument();
@@ -175,14 +186,13 @@ export function connectAgentBridge(editor, hooks = {}) {
   // Report transient view state (camera, viewport, selection) so the agent
   // can see what the user is looking at. Hints only flow when the server
   // asked for sync; they are never persisted.
-  let lastHint = "";
   window.setInterval(() => {
-    if (!syncEnabled || !socket || socket.readyState !== WebSocket.OPEN) return;
-    const hint = editor.view_state_json();
-    if (hint === lastHint) return;
-    lastHint = hint;
-    socket.send(JSON.stringify({ type: "hint", ...JSON.parse(hint) }));
+    if (document.visibilityState === "visible") publishHint();
   }, 400);
+  window.addEventListener("focus", () => publishHint(true));
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") publishHint(true);
+  });
 
   // Send a settings patch to the server, which enforces and persists it.
   const patchSettings = (patch) => {

@@ -40,9 +40,7 @@ pub async fn handler(
     if !valid_workspace_name(&name) {
         return (
             StatusCode::BAD_REQUEST,
-            format!(
-                "invalid workspace name {name:?}; use lowercase letters, digits and dashes"
-            ),
+            format!("invalid workspace name {name:?}; use lowercase letters, digits and dashes"),
         )
             .into_response();
     }

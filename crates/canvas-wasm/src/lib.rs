@@ -347,6 +347,7 @@ pub struct Editor {
     measure_ctx: CanvasRenderingContext2d,
     dpr: f64,
     core: CoreEditor,
+    workspace: String,
     on_action: Option<js_sys::Function>,
     /// Where the scene canvas pixels currently sit in world space.
     last_paint: Option<ViewSnapshot>,
@@ -417,6 +418,7 @@ impl Editor {
             measure_ctx: measure_ctx.clone(),
             dpr,
             core,
+            workspace: "default".into(),
             on_action: None,
             last_paint: None,
             tween: None,
@@ -430,6 +432,11 @@ impl Editor {
             .core
             .set_measurer(Box::new(FontMeasurer::new(measure_ctx)));
         Ok(editor)
+    }
+
+    /// Set the autosave namespace before loading or editing this workspace.
+    pub fn set_workspace(&mut self, workspace: &str) {
+        self.workspace = workspace.to_string();
     }
 
     /// Match every backing store to its layout size.
@@ -561,8 +568,9 @@ impl Editor {
     /// large documents stutter).
     pub fn flush_save(&self) {
         let json = canvas_core::serialization::to_json(&self.core.doc).unwrap_or_default();
+        let workspace = self.workspace.clone();
         wasm_bindgen_futures::spawn_local(async move {
-            let _ = storage::save_document(&json).await;
+            let _ = storage::save_document(&json, &workspace).await;
         });
     }
 
@@ -888,6 +896,24 @@ impl Editor {
         // crisp render.
         self.settle_view();
         // A remote snapshot deferred during the gesture can land now.
+        if let Some(pending) = self.pending_remote.take() {
+            let _ = self.reconcile_now(&pending);
+        }
+        for patch in std::mem::take(&mut self.pending_patches) {
+            let _ = self.merge_patch_now(&patch);
+        }
+    }
+
+    /// Abort an interrupted pointer gesture instead of committing its last
+    /// preview. Used by browser pointer cancellation and touch pinch takeover.
+    pub fn pointer_cancel(&mut self) {
+        self.core.nav.cancel();
+        if self.core.is_interacting() {
+            let effects = self.core.cancel();
+            self.apply(effects);
+        }
+        self.settle_view();
+        // The cancelled gesture no longer blocks incoming document edits.
         if let Some(pending) = self.pending_remote.take() {
             let _ = self.reconcile_now(&pending);
         }
@@ -1894,8 +1920,11 @@ impl Editor {
 
 /// Load the autosaved document, if any (the shell calls this at boot).
 #[wasm_bindgen]
-pub async fn load_saved_json() -> Option<String> {
-    storage::load_document().await.ok().flatten()
+pub async fn load_saved_json(workspace: Option<String>) -> Option<String> {
+    storage::load_document(workspace.as_deref().unwrap_or("default"))
+        .await
+        .ok()
+        .flatten()
 }
 
 /// The shape-library catalog (JSON) for the panel.

@@ -1,5 +1,38 @@
 import { expect, test } from "@playwright/test";
 
+test("a touch pinch zooms without drawing or leaving a finger gesture active", async ({ page }) => {
+  await page.goto("/");
+  await page.waitForFunction(() => window.__rsReady === true);
+  await page.keyboard.press("r");
+  await page.evaluate(() => {
+    const scene = document.getElementById("scene")!;
+    const touch = (type: string, id: number, x: number, y: number) =>
+      scene.dispatchEvent(new PointerEvent(type, {
+        bubbles: true, pointerType: "touch", pointerId: id,
+        clientX: x, clientY: y, button: 0, buttons: type === "pointerup" ? 0 : 1,
+      }));
+    touch("pointerdown", 10, 300, 300);
+    touch("pointermove", 10, 310, 310);
+    touch("pointerdown", 11, 500, 300);
+    touch("pointermove", 11, 600, 300);
+    touch("pointermove", 11, 700, 300);
+    touch("pointerdown", 12, 800, 300);
+    touch("pointermove", 12, 900, 300);
+    touch("pointerup", 12, 900, 300);
+    touch("pointerup", 11, 700, 300);
+    touch("pointermove", 10, 350, 350);
+    touch("pointerup", 10, 350, 350);
+  });
+  expect(await page.evaluate(() => window.__rsEditor!.zoom())).toBeGreaterThan(1);
+  expect(await page.evaluate(() => window.__rsEditor!.element_count())).toBe(0);
+  expect(await page.evaluate(() => window.__rsEditor!.can_undo())).toBe(false);
+  await page.mouse.move(300, 300);
+  await page.mouse.down();
+  await page.mouse.move(400, 400, { steps: 3 });
+  await page.mouse.up();
+  expect(await page.evaluate(() => window.__rsEditor!.element_count())).toBe(1);
+});
+
 const scroll = (page: import("@playwright/test").Page): Promise<number[]> =>
   page.evaluate(() => Array.from(window.__rsEditor!.scroll()));
 

@@ -61,6 +61,23 @@ test("undo and redo work from the toolbar", async ({ page }) => {
   expect(await count(page)).toBe(1);
 });
 
+test("styling a restored shape enables the undo toolbar button", async ({ page }) => {
+  await page.goto("/");
+  await page.waitForFunction(() => window.__rsReady === true);
+  await drawRect(page);
+  const saved = await page.evaluate(() => window.__rsEditor!.save_json());
+  await page.evaluate((json) => window.__rsEditor!.load_json(json), saved);
+  await page.keyboard.press("v");
+  await page.mouse.click(300, 250);
+  await expect(page.getByTitle("Undo — ⌘Z")).toBeDisabled();
+  await page.getByTitle("Stroke #ff8787").click();
+  expect(await page.evaluate(() => window.__rsEditor!.can_undo())).toBe(true);
+  await expect(page.getByTitle("Undo — ⌘Z")).toBeEnabled();
+  await page.getByTitle("Undo — ⌘Z").click();
+  const restored = JSON.parse(await page.evaluate(() => window.__rsEditor!.save_json()));
+  expect(Object.values<any>(restored.elements)[0].style.strokeColor).toBe("#ece4d6");
+});
+
 test("placed text can be selected and moved", async ({ page }) => {
   await page.goto("/");
   await page.waitForFunction(() => window.__rsReady === true);

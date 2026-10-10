@@ -431,3 +431,26 @@ test("undoing a move survives the sync round trip", async ({ page }) => {
   await page.waitForTimeout(1_000);
   expect(await snapshot(page), "undo restored the rectangle").toBe(before);
 });
+
+test("named tabs sync only their own workspace and focus selects the agent workspace", async ({
+  context,
+  request,
+}) => {
+  const mcp = mcpClient(request, BASE);
+  const first = await context.newPage();
+  await first.goto(`${BASE}/?ws=alpha`);
+  await first.waitForFunction(() => window.__rsReady && window.__rsAgentConnected);
+  await drawRectangle(first);
+  await expect.poll(async () => JSON.parse(await mcp.text("canvas_status", {})).workspace).toBe("alpha");
+
+  const second = await context.newPage();
+  await second.goto(`${BASE}/?ws=beta`);
+  await second.waitForFunction(() => window.__rsReady && window.__rsAgentConnected);
+  expect(await second.evaluate(() => window.__rsEditor!.element_count())).toBe(0);
+  await mcp.call("canvas_draw", { kind: "ellipse" });
+  await expect.poll(() => second.evaluate(() => window.__rsEditor!.element_count())).toBe(1);
+  expect(await first.evaluate(() => window.__rsEditor!.element_count())).toBe(1);
+  await first.bringToFront();
+  await first.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await expect.poll(async () => JSON.parse(await mcp.text("canvas_status", {})).workspace).toBe("alpha");
+});

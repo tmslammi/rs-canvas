@@ -33,6 +33,44 @@ test("escape cancels an in-progress freehand stroke", async ({ page }) => {
   await page.keyboard.press("Escape");
   await page.mouse.up();
   expect(await count(page)).toBe(0);
+  expect(await page.evaluate(() => window.__rsEditor!.can_undo())).toBe(false);
+});
+
+test("pointer cancellation rolls back a move without adding an undo step", async ({ page }) => {
+  await page.goto("/");
+  await page.waitForFunction(() => window.__rsReady === true);
+  await page.keyboard.press("r");
+  await page.mouse.move(300, 300);
+  await page.mouse.down();
+  await page.mouse.move(450, 400, { steps: 3 });
+  await page.mouse.up();
+  const saved = await page.evaluate(() => window.__rsEditor!.save_json());
+  await page.evaluate((json) => window.__rsEditor!.load_json(json), saved);
+  await page.keyboard.press("v");
+  await page.mouse.move(375, 350);
+  await page.mouse.down();
+  await page.mouse.move(550, 500, { steps: 3 });
+  await page.evaluate(() => document.getElementById("scene")!.dispatchEvent(
+    new PointerEvent("pointercancel", { pointerId: 1, bubbles: true }),
+  ));
+  await page.mouse.up();
+  expect(await page.evaluate(() => window.__rsEditor!.save_json())).toBe(saved);
+  expect(await page.evaluate(() => window.__rsEditor!.can_undo())).toBe(false);
+});
+
+test("pointer cancellation discards the incomplete shape", async ({ page }) => {
+  await page.goto("/");
+  await page.waitForFunction(() => window.__rsReady === true);
+  await page.keyboard.press("r");
+  await page.mouse.move(300, 300);
+  await page.mouse.down();
+  await page.mouse.move(450, 400, { steps: 3 });
+  await page.evaluate(() => document.getElementById("scene")!.dispatchEvent(
+    new PointerEvent("pointercancel", { pointerId: 1, bubbles: true }),
+  ));
+  await page.mouse.up();
+  expect(await count(page)).toBe(0);
+  expect(await page.evaluate(() => window.__rsEditor!.can_undo())).toBe(false);
 });
 
 test("line tool draws a segment between drag endpoints", async ({ page }) => {

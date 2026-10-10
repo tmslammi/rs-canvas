@@ -67,6 +67,16 @@ pub fn from_value(value: Value) -> Result<Document, SchemaError> {
         as u32;
     let value = migrate(value, version)?;
     let mut doc: Document = serde_json::from_value(value)?;
+    for (id, element) in &doc.elements {
+        if id != &element.id {
+            return Err(SchemaError::Invalid(format!(
+                "element key {id:?} does not match its id"
+            )));
+        }
+        crate::index::validate_order_key(&element.index).map_err(|_| {
+            SchemaError::Invalid(format!("element {id:?} has an invalid order key"))
+        })?;
+    }
     sanitize(&mut doc);
     Ok(doc)
 }
@@ -276,6 +286,34 @@ mod tests {
             6,
         );
         doc
+    }
+
+    #[test]
+    fn load_rejects_mismatched_element_identity() {
+        let mut value = serde_json::to_value(full_document()).unwrap();
+        let elements = value["elements"].as_object_mut().unwrap();
+        let id = elements.keys().next().unwrap().clone();
+        let element = elements.remove(&id).unwrap();
+        elements.insert("other-key".into(), element);
+        assert!(matches!(from_value(value), Err(SchemaError::Invalid(_))));
+    }
+
+    #[test]
+    fn load_rejects_invalid_order_keys() {
+        for index in ["", "b0", "aé", "a!", "a0!"] {
+            let mut value = serde_json::to_value(full_document()).unwrap();
+            let element = value["elements"]
+                .as_object_mut()
+                .unwrap()
+                .values_mut()
+                .next()
+                .unwrap();
+            element["index"] = Value::from(index);
+            assert!(
+                matches!(from_value(value), Err(SchemaError::Invalid(_))),
+                "{index}"
+            );
+        }
     }
 
     #[test]
