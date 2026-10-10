@@ -2135,8 +2135,8 @@ impl Editor {
             "ArrowLeft" => self.nudge(-self.nudge_step(mods), 0.0, now),
             "ArrowRight" => self.nudge(self.nudge_step(mods), 0.0, now),
             "a" | "A" if mods.command() => self.select_all(),
-            "z" | "Z" if mods.command() && mods.shift => self.redo(),
-            "z" | "Z" if mods.command() => self.undo(),
+            "z" | "Z" if mods.command() && mods.shift => self.redo(now),
+            "z" | "Z" if mods.command() => self.undo(now),
             "d" | "D" if mods.command() => self.duplicate(now),
             "c" | "C" if mods.command() => self.copy(),
             "x" | "X" if mods.command() => self.cut(now),
@@ -2332,8 +2332,8 @@ impl Editor {
         }
     }
 
-    pub fn undo(&mut self) -> Effects {
-        let changed: BTreeSet<ElementId> = match self.history.undo(&mut self.doc) {
+    pub fn undo(&mut self, now: u64) -> Effects {
+        let changed: BTreeSet<ElementId> = match self.history.undo(&mut self.doc, now) {
             Ok(ids) => ids.into_iter().collect(),
             Err(err) => {
                 debug_assert!(false, "undo failed: {err}");
@@ -2349,8 +2349,8 @@ impl Editor {
         }
     }
 
-    pub fn redo(&mut self) -> Effects {
-        let changed: BTreeSet<ElementId> = match self.history.redo(&mut self.doc) {
+    pub fn redo(&mut self, now: u64) -> Effects {
+        let changed: BTreeSet<ElementId> = match self.history.redo(&mut self.doc, now) {
             Ok(ids) => ids.into_iter().collect(),
             Err(err) => {
                 debug_assert!(false, "redo failed: {err}");

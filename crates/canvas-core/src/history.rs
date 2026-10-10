@@ -5,6 +5,7 @@
 //! same element inside one transaction coalesce, so a drag is one undo step.
 
 use crate::delta::{Delta, EditError};
+use crate::id::new_version_nonce;
 use crate::model::{Document, Element, ElementId};
 
 /// A recorded, closed group of deltas: one user gesture.
@@ -156,47 +157,130 @@ impl History {
         self.undo_stack.len()
     }
 
+    /// Stamp a freshly written element: strictly newer than both the copy
+    /// currently in the document (if any) and the historical copy being
+    /// replayed. An undo or redo is a new edit, not a rewind of the clock —
+    /// without this the merge rules read the replayed copy as stale and a
+    /// synced peer "corrects" it back to the pre-undo state.
+    fn freshen(current: Option<&Element>, mut target: Element, now_ms: u64) -> Element {
+        let base = current
+            .map(|element| element.version)
+            .unwrap_or(0)
+            .max(target.version);
+        target.version = base + 1;
+        target.version_nonce = new_version_nonce();
+        target.updated = now_ms;
+        target
+    }
+
     /// Undo the most recent transaction; returns the ids it touched so the
     /// caller can repaint exactly those layers. An empty vec means the stack
     /// was empty.
-    pub fn undo(&mut self, doc: &mut Document) -> Result<Vec<ElementId>, EditError> {
-        match self.undo_stack.pop() {
-            None => Ok(Vec::new()),
-            Some(tx) => {
-                let ids: Vec<ElementId> = tx
-                    .deltas()
-                    .iter()
-                    .map(|delta| delta.element_id().clone())
-                    .collect();
-                for delta in tx.deltas().iter().rev() {
-                    let inverse = delta.invert();
+    pub fn undo(&mut self, doc: &mut Document, now_ms: u64) -> Result<Vec<ElementId>, EditError> {
+        let Some(mut tx) = self.undo_stack.pop() else {
+            return Ok(Vec::new());
+        };
+        let ids: Vec<ElementId> = tx
+            .deltas()
+            .iter()
+            .map(|delta| delta.element_id().clone())
+            .collect();
+        for index in (0..tx.deltas.len()).rev() {
+            match tx.deltas[index].clone() {
+                Delta::Add { .. } => {
+                    let id = tx.deltas[index].element_id().clone();
+                    let current = doc
+                        .element(&id)
+                        .cloned()
+                        .ok_or_else(|| EditError::UnknownElement(id))?;
+                    // Purge the live copy; the wire projects the purge as a
+                    // freshly touched tombstone, so peers accept the deletion.
+                    let purge = Delta::Purge {
+                        element: current.clone(),
+                    };
+                    doc.apply(&purge)?;
+                    self.outbox.push(purge);
+                    // Peers now hold a tombstone one version newer than the
+                    // purged copy; record that lineage on the stored delta so
+                    // a redo lands one newer still.
+                    let mut lineage = current;
+                    lineage.touch(now_ms);
+                    tx.deltas[index] = Delta::Add { element: lineage };
+                }
+                Delta::Update { before, .. } | Delta::Remove { before, .. } => {
+                    let id = before.id.clone();
+                    let current = doc
+                        .element(&id)
+                        .cloned()
+                        .ok_or_else(|| EditError::UnknownElement(id))?;
+                    let restored = Delta::Update {
+                        before: current.clone(),
+                        after: Self::freshen(Some(&current), before, now_ms),
+                    };
+                    doc.apply(&restored)?;
+                    self.outbox.push(restored);
+                }
+                Delta::Purge { .. } => {
+                    // A purge is only ever an inverse (undo of a creation); it
+                    // never sits on the undo stack as a forward delta.
+                    debug_assert!(false, "a purge cannot be undone");
+                    let inverse = tx.deltas[index].clone().invert();
                     doc.apply(&inverse)?;
                     self.outbox.push(inverse);
                 }
-                self.redo_stack.push(tx);
-                Ok(ids)
             }
         }
+        self.redo_stack.push(tx);
+        Ok(ids)
     }
 
     /// Redo the most recently undone transaction; returns the ids it touched.
-    pub fn redo(&mut self, doc: &mut Document) -> Result<Vec<ElementId>, EditError> {
-        match self.redo_stack.pop() {
-            None => Ok(Vec::new()),
-            Some(tx) => {
-                let ids: Vec<ElementId> = tx
-                    .deltas()
-                    .iter()
-                    .map(|delta| delta.element_id().clone())
-                    .collect();
-                for delta in tx.deltas() {
-                    doc.apply(delta)?;
-                    self.outbox.push(delta.clone());
+    /// Like undo, every replayed write is stamped fresh so it wins the merge.
+    pub fn redo(&mut self, doc: &mut Document, now_ms: u64) -> Result<Vec<ElementId>, EditError> {
+        let Some(tx) = self.redo_stack.pop() else {
+            return Ok(Vec::new());
+        };
+        let ids: Vec<ElementId> = tx
+            .deltas()
+            .iter()
+            .map(|delta| delta.element_id().clone())
+            .collect();
+        for delta in tx.deltas() {
+            let applied = match delta {
+                Delta::Add { element } => Delta::Add {
+                    element: Self::freshen(doc.element(&element.id), element.clone(), now_ms),
+                },
+                Delta::Update { after, .. } => {
+                    let current = doc
+                        .element(&after.id)
+                        .cloned()
+                        .ok_or_else(|| EditError::UnknownElement(after.id.clone()))?;
+                    Delta::Update {
+                        before: current.clone(),
+                        after: Self::freshen(Some(&current), after.clone(), now_ms),
+                    }
                 }
-                self.undo_stack.push(tx);
-                Ok(ids)
-            }
+                Delta::Remove { tombstoned, .. } => {
+                    let current = doc
+                        .element(&tombstoned.id)
+                        .cloned()
+                        .ok_or_else(|| EditError::UnknownElement(tombstoned.id.clone()))?;
+                    Delta::Remove {
+                        before: current.clone(),
+                        tombstoned: Self::freshen(Some(&current), tombstoned.clone(), now_ms),
+                    }
+                }
+                Delta::Purge { .. } => {
+                    // See undo: a purge is never a forward delta.
+                    debug_assert!(false, "a purge cannot be redone");
+                    delta.clone()
+                }
+            };
+            doc.apply(&applied)?;
+            self.outbox.push(applied);
         }
+        self.undo_stack.push(tx);
+        Ok(ids)
     }
 
     /// Take every delta applied since the last drain.
@@ -249,9 +333,9 @@ mod tests {
         tx.commit(&mut history);
 
         assert_eq!(doc.ordered_live().len(), 1);
-        assert!(!history.undo(&mut doc).unwrap().is_empty());
+        assert!(!history.undo(&mut doc, 9).unwrap().is_empty());
         assert_eq!(doc.ordered_live().len(), 0);
-        assert!(!history.redo(&mut doc).unwrap().is_empty());
+        assert!(!history.redo(&mut doc, 10).unwrap().is_empty());
         assert_eq!(doc.ordered_live().len(), 1);
         assert_eq!(doc.ordered_live()[0].id, id);
     }
@@ -271,7 +355,7 @@ mod tests {
         assert!(matches!(committed[0], Delta::Add { .. }));
         assert!(history.drain_outbox().is_empty(), "a drain empties the box");
 
-        history.undo(&mut doc).unwrap();
+        history.undo(&mut doc, 9).unwrap();
         let undone = history.drain_outbox();
         assert_eq!(undone.len(), 1);
         assert!(
@@ -279,7 +363,7 @@ mod tests {
             "undoing an add purges the element"
         );
 
-        history.redo(&mut doc).unwrap();
+        history.redo(&mut doc, 10).unwrap();
         let redone = history.drain_outbox();
         assert_eq!(redone.len(), 1);
         assert!(matches!(redone[0], Delta::Add { .. }));
@@ -297,8 +381,13 @@ mod tests {
         tx.commit(&mut history);
         assert!(doc.element(&id).unwrap().is_deleted);
 
-        assert!(!history.undo(&mut doc).unwrap().is_empty());
-        assert_eq!(doc.element(&id), Some(&before));
+        assert!(!history.undo(&mut doc, 9).unwrap().is_empty());
+        let restored = doc.element(&id).expect("undo brings the element back");
+        assert!(restored.content_eq(&before), "undo restores the content");
+        assert!(
+            restored.version > before.version,
+            "undo is a new edit: the version advances"
+        );
     }
 
     #[test]
@@ -335,9 +424,14 @@ mod tests {
         assert_eq!(tx.len(), 1, "updates on one element coalesce");
         tx.commit(&mut history);
 
-        assert!(!history.undo(&mut doc).unwrap().is_empty());
-        assert_eq!(doc.element(&id), Some(&before));
-        assert!(!history.redo(&mut doc).unwrap().is_empty());
+        assert!(!history.undo(&mut doc, 9).unwrap().is_empty());
+        let restored = doc.element(&id).expect("undo brings the element back");
+        assert!(restored.content_eq(&before), "undo restores the content");
+        assert!(
+            restored.version > before.version,
+            "undo is a new edit: the version advances"
+        );
+        assert!(!history.redo(&mut doc, 10).unwrap().is_empty());
         if let ElementKind::Shape { rect, .. } = &doc.element(&id).unwrap().kind {
             assert_eq!(rect.x, 25.0);
         } else {
@@ -362,7 +456,7 @@ mod tests {
         tx.add(&mut doc, Element::new(shape(0.0, 0.0), "a0".into(), 1))
             .unwrap();
         tx.commit(&mut history);
-        history.undo(&mut doc).unwrap();
+        history.undo(&mut doc, 9).unwrap();
         assert!(history.can_redo());
 
         let mut tx = Transaction::begin();
@@ -370,7 +464,19 @@ mod tests {
             .unwrap();
         tx.commit(&mut history);
         assert!(!history.can_redo());
-        assert!(!history.undo(&mut doc).unwrap().is_empty());
+        assert!(!history.undo(&mut doc, 9).unwrap().is_empty());
+    }
+
+    /// Undo and redo restamp merge metadata, so snapshots compare equal only
+    /// once the version stamps are stripped — content is what must round-trip.
+    fn normalized(doc: &Document) -> String {
+        let mut doc = doc.clone();
+        for element in doc.elements.values_mut() {
+            element.version = 0;
+            element.version_nonce = 0;
+            element.updated = 0;
+        }
+        to_json(&doc).unwrap()
     }
 
     #[test]
@@ -382,7 +488,7 @@ mod tests {
         }
 
         let mut rng = Lcg(42);
-        let mut snapshots = vec![to_json(&doc).unwrap()];
+        let mut snapshots = vec![normalized(&doc)];
 
         for step in 0..60u64 {
             let mut tx = Transaction::begin();
@@ -427,20 +533,135 @@ mod tests {
             let recorded = !tx.is_empty();
             tx.commit(&mut history);
             if recorded {
-                snapshots.push(to_json(&doc).unwrap());
+                snapshots.push(normalized(&doc));
             }
         }
 
         for (k, expected) in snapshots.iter().enumerate().rev().skip(1) {
-            assert!(!history.undo(&mut doc).unwrap().is_empty());
-            assert_eq!(&to_json(&doc).unwrap(), expected, "undo to step {k}");
+            assert!(!history.undo(&mut doc, 1000 + k as u64).unwrap().is_empty());
+            assert_eq!(&normalized(&doc), expected, "undo to step {k}");
         }
-        assert!(history.undo(&mut doc).unwrap().is_empty());
+        assert!(history.undo(&mut doc, 2000).unwrap().is_empty());
 
         for expected in snapshots.iter().skip(1) {
-            assert!(!history.redo(&mut doc).unwrap().is_empty());
-            assert_eq!(&to_json(&doc).unwrap(), expected);
+            assert!(!history.redo(&mut doc, 3000).unwrap().is_empty());
+            assert_eq!(&normalized(&doc), expected);
         }
-        assert!(history.redo(&mut doc).unwrap().is_empty());
+        assert!(history.redo(&mut doc, 4000).unwrap().is_empty());
+    }
+
+    /// The sync regression: an undone move must win the merge on a peer that
+    /// already holds the moved copy, or the peer "corrects" the page back.
+    #[test]
+    fn undo_of_update_wins_the_merge_on_a_synced_peer() {
+        use crate::patch::Patch;
+
+        let mut doc = Document::new();
+        let mut history = History::new();
+        let id = doc.add(shape(0.0, 0.0), 1);
+        let base = doc.element(&id).unwrap().clone();
+
+        let mut tx = Transaction::begin();
+        tx.update(&mut doc, &id, 2, |e| {
+            if let ElementKind::Shape { rect, .. } = &mut e.kind {
+                rect.x += 10.0;
+            }
+        })
+        .unwrap();
+        tx.commit(&mut history);
+        let moved_outbox = history.drain_outbox();
+        let moved = doc.element(&id).unwrap().clone();
+        assert!(moved.version > base.version);
+
+        history.undo(&mut doc, 3).unwrap();
+        let restored = doc.element(&id).unwrap().clone();
+        assert!(restored.content_eq(&base), "undo restores the content");
+        assert!(
+            restored.version > moved.version,
+            "undo is a new edit: the version advances past the move"
+        );
+        let undone_outbox = history.drain_outbox();
+
+        // The peer absorbed the move before the undo arrived.
+        let mut mirror = Document::new();
+        mirror.insert(base.clone());
+        Patch::from_deltas(&moved_outbox, 4).apply_to(&mut mirror);
+        assert!(mirror.element(&id).unwrap().content_eq(&moved));
+
+        Patch::from_deltas(&undone_outbox, 5).apply_to(&mut mirror);
+        assert!(
+            mirror.element(&id).unwrap().content_eq(&base),
+            "the undo patch wins the merge; the move does not resurrect"
+        );
+    }
+
+    /// Undoing a creation purges locally; the redo must beat the tombstone
+    /// the peer synthesized from the purge.
+    #[test]
+    fn redo_of_creation_wins_over_the_undo_tombstone() {
+        use crate::patch::Patch;
+
+        let mut doc = Document::new();
+        let mut history = History::new();
+        let mut tx = Transaction::begin();
+        tx.add(&mut doc, Element::new(shape(0.0, 0.0), "a0".into(), 1))
+            .unwrap();
+        tx.commit(&mut history);
+        let id = doc.ordered_live()[0].id.clone();
+        let created = history.drain_outbox();
+
+        history.undo(&mut doc, 2).unwrap();
+        assert!(doc.element(&id).is_none(), "undo purges the creation");
+        let undone = history.drain_outbox();
+
+        let mut mirror = Document::new();
+        Patch::from_deltas(&created, 3).apply_to(&mut mirror);
+        Patch::from_deltas(&undone, 4).apply_to(&mut mirror);
+        assert!(mirror.element(&id).unwrap().is_deleted);
+
+        history.redo(&mut doc, 5).unwrap();
+        let live = doc.element(&id).expect("redo brings the element back");
+        assert!(!live.is_deleted);
+        let redone = history.drain_outbox();
+
+        Patch::from_deltas(&redone, 6).apply_to(&mut mirror);
+        let back = mirror.element(&id).unwrap();
+        assert!(!back.is_deleted, "redo beats the undo tombstone");
+        assert!(back.content_eq(live));
+    }
+
+    /// Repeated undo/redo of one move: content alternates, versions rise
+    /// monotonically, so no cycle can tie and lose a merge.
+    #[test]
+    fn undo_redo_cycles_advance_versions_monotonically() {
+        let mut doc = Document::new();
+        let mut history = History::new();
+        let id = doc.add(shape(0.0, 0.0), 1);
+        let base = doc.element(&id).unwrap().clone();
+
+        let mut tx = Transaction::begin();
+        tx.update(&mut doc, &id, 2, |e| {
+            if let ElementKind::Shape { rect, .. } = &mut e.kind {
+                rect.x += 10.0;
+            }
+        })
+        .unwrap();
+        tx.commit(&mut history);
+        let moved = doc.element(&id).unwrap().clone();
+
+        let mut last_version = moved.version;
+        for round in 0..3u64 {
+            history.undo(&mut doc, 10 + round * 2).unwrap();
+            let restored = doc.element(&id).unwrap().clone();
+            assert!(restored.content_eq(&base), "round {round}: undo restores");
+            assert!(restored.version > last_version, "round {round}: version rises");
+            last_version = restored.version;
+
+            history.redo(&mut doc, 11 + round * 2).unwrap();
+            let again = doc.element(&id).unwrap().clone();
+            assert!(again.content_eq(&moved), "round {round}: redo re-applies");
+            assert!(again.version > last_version, "round {round}: version rises");
+            last_version = again.version;
+        }
     }
 }

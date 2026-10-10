@@ -1,12 +1,17 @@
-//! Shared server state: the document mirror, its on-disk home, and the
-//! connected pages.
+//! Shared server state: workspaces, their document mirrors and on-disk
+//! homes, and the connected pages.
 //!
-//! The page owns the interactive document; this mirror is what MCP tool calls
+//! A workspace is a named, isolated drawing context (ADR-0007): one document
+//! mirror, the pages viewing it and everything transient about them. The
+//! page owns the interactive document; the mirror is what MCP tool calls
 //! read and write. Both sides meet through the existing `canvas-core` merge
-//! rules, never through a bespoke protocol.
+//! rules, never through a bespoke protocol. Agent calls always act on the
+//! current workspace — the one the user's most recently active page is on.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use canvas_core::model::{Document, Element};
@@ -20,6 +25,21 @@ const CHANGE_LOG_LIMIT: usize = 200;
 
 /// How long a burst of edits coalesces before the mirror is written to disk.
 const PERSIST_DEBOUNCE: Duration = Duration::from_millis(500);
+
+/// The unnamed workspace: where `--doc` points and where agent calls land
+/// when no page is connected.
+pub const DEFAULT_WORKSPACE: &str = "default";
+
+/// Workspace names become file names, so keep them boring: lowercase ASCII
+/// letters, digits and dashes, starting with a letter or digit.
+pub fn valid_workspace_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 40
+        && !name.starts_with('-')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
 
 /// One broadcast frame plus the page that must not receive it (the origin of
 /// a patch never gets its own change echoed back).
@@ -176,22 +196,18 @@ impl AgentSettings {
     }
 }
 
-pub struct AppState {
-    /// When the server started; reported by `canvas_status`.
-    pub started: Instant,
+/// A named, isolated drawing context: one document mirror and the pages
+/// viewing it. Everything an agent call can touch — the document, its
+/// revision and change log, element handles, view hints, the page broadcast
+/// and pending present/screenshot requests — is scoped to one of these.
+pub struct Workspace {
+    pub name: String,
     /// The document mirror.
     pub doc: Mutex<Document>,
     /// Where the mirror is persisted; `None` keeps it in memory only.
     pub doc_path: Option<PathBuf>,
-    /// The served app directory (fonts for headless rendering live here).
-    pub web_dir: PathBuf,
-    /// Whether pages exchange documents with the mirror. Tests that only
-    /// serve the app turn this off; the agent always runs with it on.
-    pub sync: bool,
-    /// Connected pages.
+    /// Connected pages on this workspace.
     pub pages: AtomicUsize,
-    /// Connection ids, so a patch broadcast can skip its origin page.
-    next_page: AtomicU64,
     /// Server-to-page messages (JSON text over the WebSocket).
     pub to_pages: broadcast::Sender<PageMessage>,
     /// A persist is queued; bursts coalesce into one write.
@@ -218,28 +234,21 @@ pub struct AppState {
     pub view_hint: Mutex<Option<ViewHint>>,
     /// Short handles for element ids, as the agent sees them.
     pub aliases: Mutex<Aliases>,
-    /// The user's live agent preferences.
-    pub settings: Mutex<AgentSettings>,
-    /// Where settings persist; follows the document's directory.
-    settings_path: Option<PathBuf>,
+    /// Last time a page on this workspace said anything; drives
+    /// current-workspace resolution.
+    last_activity: AtomicU64,
 }
 
-impl AppState {
-    pub fn new(web_dir: PathBuf, doc_path: Option<PathBuf>, sync: bool) -> Self {
+impl Workspace {
+    fn new(name: &str, doc_path: Option<PathBuf>) -> Self {
         let (to_pages, _) = broadcast::channel(64);
         let (present_acks, _) = broadcast::channel(16);
         let (screenshot_replies, _) = broadcast::channel(16);
-        let settings_path = doc_path
-            .as_ref()
-            .map(|path| path.with_file_name("settings.json"));
         Self {
-            started: Instant::now(),
+            name: name.to_string(),
             doc: Mutex::new(Document::new()),
             doc_path,
-            web_dir,
-            sync,
             pages: AtomicUsize::new(0),
-            next_page: AtomicU64::new(0),
             to_pages,
             persist_pending: AtomicBool::new(false),
             persist_notify: Notify::new(),
@@ -253,12 +262,17 @@ impl AppState {
             change_log: Mutex::new(Vec::new()),
             view_hint: Mutex::new(None),
             aliases: Mutex::new(Aliases::default()),
-            settings: Mutex::new(AgentSettings::default()),
-            settings_path,
+            last_activity: AtomicU64::new(0),
         }
     }
 
-    /// Load the persisted mirror, if any. Called once at startup.
+    /// A page on this workspace did something; it may now be the current one.
+    pub fn note_page_activity(&self) {
+        self.last_activity.store(now_ms(), Ordering::SeqCst);
+    }
+
+    /// Load the persisted mirror, if any. Called once when the workspace is
+    /// created.
     pub async fn load_document(&self) {
         let Some(path) = &self.doc_path else {
             return;
@@ -270,7 +284,7 @@ impl AppState {
             Ok(doc) => {
                 let elements = doc.live_count();
                 *self.doc.lock().await = doc;
-                tracing::info!(elements, path = %path.display(), "restored document");
+                tracing::info!(elements, path = %path.display(), workspace = %self.name, "restored document");
             }
             Err(error) => {
                 tracing::warn!(%error, path = %path.display(), "ignoring unreadable document");
@@ -278,59 +292,10 @@ impl AppState {
         }
     }
 
-    /// Load persisted agent settings, if any. Called once at startup.
-    pub async fn load_settings(&self) {
-        let Some(path) = &self.settings_path else {
-            return;
-        };
-        let Ok(json) = tokio::fs::read_to_string(path).await else {
-            return;
-        };
-        match serde_json::from_str::<AgentSettings>(&json) {
-            Ok(settings) => *self.settings.lock().await = settings,
-            Err(error) => {
-                tracing::warn!(%error, path = %path.display(), "ignoring unreadable settings");
-            }
-        }
-    }
-
-    /// The user's current agent preferences.
-    pub async fn current_settings(&self) -> AgentSettings {
-        self.settings.lock().await.clone()
-    }
-
-    /// Apply a settings patch from the canvas, persist it and tell every page.
-    pub async fn apply_settings_patch(
-        &self,
-        patch: &serde_json::Value,
-    ) -> Result<AgentSettings, String> {
-        let settings = {
-            let mut settings = self.settings.lock().await;
-            settings.apply_patch(patch)?;
-            settings.clone()
-        };
-        if let Some(path) = &self.settings_path {
-            if let Ok(json) = serde_json::to_string_pretty(&settings) {
-                if let Err(error) = write_atomic(path, &json).await {
-                    tracing::warn!(%error, path = %path.display(), "could not persist settings");
-                }
-            }
-        }
-        let _ = self.to_pages.send(PageMessage::all(
-            serde_json::json!({ "type": "settings", "settings": settings }).to_string(),
-        ));
-        Ok(settings)
-    }
-
     /// The mirror as compact JSON.
     pub async fn document_json(&self) -> String {
         let doc = self.doc.lock().await;
         serialization::to_json(&doc).unwrap_or_default()
-    }
-
-    /// The next connection id.
-    pub fn new_page_id(&self) -> u64 {
-        self.next_page.fetch_add(1, Ordering::SeqCst) + 1
     }
 
     /// The element id behind a handle; unknown names pass through.
@@ -540,14 +505,14 @@ impl AppState {
     }
 
     /// Queue a persist; bursts within `PERSIST_DEBOUNCE` coalesce into one
-    /// write. The loop runs from `main` (and in tests that need it).
+    /// write. The loop is spawned when the workspace is created.
     pub async fn schedule_persist(&self) {
         self.persist_pending.store(true, Ordering::SeqCst);
         self.persist_notify.notify_one();
     }
 
-    /// The debounced persist loop. Call once at startup.
-    pub async fn persist_loop(self: std::sync::Arc<Self>) {
+    /// The debounced persist loop, spawned per workspace at creation.
+    pub async fn persist_loop(self: Arc<Self>) {
         loop {
             self.persist_notify.notified().await;
             tokio::time::sleep(PERSIST_DEBOUNCE).await;
@@ -563,7 +528,6 @@ impl AppState {
     pub async fn release_when_idle(&self, remaining_pages: usize) {
         if remaining_pages == 0 && self.doc_path.is_none() {
             *self.doc.lock().await = Document::new();
-            *self.settings.lock().await = AgentSettings::default();
         }
     }
 
@@ -598,6 +562,244 @@ impl AppState {
     }
 }
 
+/// One entry of the workspace listing that `canvas_status` and
+/// `/api/workspaces` report.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct WorkspaceInfo {
+    pub name: String,
+    pub pages: usize,
+    /// Live element count; absent for workspaces that exist only as a file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub elements: Option<usize>,
+    /// Whether the workspace has a backing file.
+    pub persisted: bool,
+}
+
+pub struct AppState {
+    /// When the server started; reported by `canvas_status`.
+    pub started: Instant,
+    /// The served app directory (fonts for headless rendering live here).
+    pub web_dir: PathBuf,
+    /// Whether pages exchange documents with the mirror. Tests that only
+    /// serve the app turn this off; the agent always runs with it on.
+    pub sync: bool,
+    /// Live workspaces by name. Entries are never removed; an in-memory
+    /// workspace's mirror is cleared when its last page leaves instead.
+    workspaces: std::sync::Mutex<HashMap<String, Arc<Workspace>>>,
+    /// Where the default workspace's mirror persists (the `--doc` argument).
+    default_doc_path: Option<PathBuf>,
+    /// Where other workspaces' mirrors persist, beside the default document.
+    workspaces_dir: Option<PathBuf>,
+    /// Connection ids, so a patch broadcast can skip its origin page.
+    next_page: AtomicU64,
+    /// The user's live agent preferences (global: they govern the agent,
+    /// not any one drawing).
+    pub settings: Mutex<AgentSettings>,
+    /// Where settings persist; follows the document's directory.
+    settings_path: Option<PathBuf>,
+}
+
+impl AppState {
+    pub fn new(web_dir: PathBuf, doc_path: Option<PathBuf>, sync: bool) -> Self {
+        let settings_path = doc_path
+            .as_ref()
+            .map(|path| path.with_file_name("settings.json"));
+        let workspaces_dir = doc_path
+            .as_ref()
+            .and_then(|path| path.parent().map(|dir| dir.join("workspaces")));
+        Self {
+            started: Instant::now(),
+            web_dir,
+            sync,
+            workspaces: std::sync::Mutex::new(HashMap::new()),
+            default_doc_path: doc_path,
+            workspaces_dir,
+            next_page: AtomicU64::new(0),
+            settings: Mutex::new(AgentSettings::default()),
+            settings_path,
+        }
+    }
+
+    fn build_workspace(&self, name: &str) -> Workspace {
+        let doc_path = if name == DEFAULT_WORKSPACE {
+            self.default_doc_path.clone()
+        } else {
+            self.workspaces_dir
+                .as_ref()
+                .map(|dir| dir.join(format!("{name}.json")))
+        };
+        Workspace::new(name, doc_path)
+    }
+
+    /// Get or create a workspace, loading its document on first creation.
+    pub async fn workspace(&self, name: &str) -> Arc<Workspace> {
+        if let Some(ws) = self.workspaces.lock().unwrap().get(name) {
+            return ws.clone();
+        }
+        let created = Arc::new(self.build_workspace(name));
+        created.load_document().await;
+        let mut map = self.workspaces.lock().unwrap();
+        // A concurrent creator may have won; either way the map holds one
+        // instance and only the winner spawns a persist loop.
+        map.entry(name.to_string())
+            .or_insert_with(|| {
+                let ws = created.clone();
+                tokio::spawn(ws.clone().persist_loop());
+                ws
+            })
+            .clone()
+    }
+
+    /// The workspace agent calls act on: the one the user's most recently
+    /// active page is viewing, or `default` when no page is connected.
+    pub async fn current_workspace(&self) -> Arc<Workspace> {
+        let current = {
+            let map = self.workspaces.lock().unwrap();
+            map.values()
+                .filter(|ws| ws.pages.load(Ordering::SeqCst) > 0)
+                .max_by_key(|ws| ws.last_activity.load(Ordering::SeqCst))
+                .cloned()
+        };
+        match current {
+            Some(ws) => ws,
+            None => self.workspace(DEFAULT_WORKSPACE).await,
+        }
+    }
+
+    /// Live workspaces plus persisted ones never opened this run. In-memory
+    /// husks (no file, no pages, no content) are indistinguishable from
+    /// never-created and left out.
+    pub async fn list_workspaces(&self) -> Vec<WorkspaceInfo> {
+        let workspaces: Vec<Arc<Workspace>> =
+            self.workspaces.lock().unwrap().values().cloned().collect();
+        let mut infos = Vec::new();
+        for ws in workspaces {
+            let elements = ws.doc.lock().await.live_count();
+            let pages = ws.pages.load(Ordering::SeqCst);
+            if ws.name != DEFAULT_WORKSPACE
+                && ws.doc_path.is_none()
+                && pages == 0
+                && elements == 0
+            {
+                continue;
+            }
+            infos.push(WorkspaceInfo {
+                name: ws.name.clone(),
+                pages,
+                elements: Some(elements),
+                persisted: ws.doc_path.is_some(),
+            });
+        }
+        let mut known: HashSet<String> = infos.iter().map(|info| info.name.clone()).collect();
+        if let Some(dir) = &self.workspaces_dir {
+            if let Ok(mut entries) = tokio::fs::read_dir(dir).await {
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    let path = entry.path();
+                    if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                        continue;
+                    }
+                    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                        continue;
+                    };
+                    if valid_workspace_name(stem) && known.insert(stem.to_string()) {
+                        infos.push(WorkspaceInfo {
+                            name: stem.to_string(),
+                            pages: 0,
+                            elements: None,
+                            persisted: true,
+                        });
+                    }
+                }
+            }
+        }
+        infos.sort_by(|a, b| a.name.cmp(&b.name));
+        infos
+    }
+
+    /// Pages across all workspaces.
+    pub fn total_pages(&self) -> usize {
+        self.workspaces
+            .lock()
+            .unwrap()
+            .values()
+            .map(|ws| ws.pages.load(Ordering::SeqCst))
+            .sum()
+    }
+
+    /// A page left `workspace`: drop its in-memory mirror when nothing is
+    /// watching, and reset ephemeral settings when the server goes idle.
+    pub async fn release_workspace(&self, workspace: &Workspace) {
+        workspace
+            .release_when_idle(workspace.pages.load(Ordering::SeqCst))
+            .await;
+        if self.total_pages() == 0 && self.settings_path.is_none() {
+            *self.settings.lock().await = AgentSettings::default();
+        }
+    }
+
+    /// Load persisted agent settings, if any. Called once at startup.
+    pub async fn load_settings(&self) {
+        let Some(path) = &self.settings_path else {
+            return;
+        };
+        let Ok(json) = tokio::fs::read_to_string(path).await else {
+            return;
+        };
+        match serde_json::from_str::<AgentSettings>(&json) {
+            Ok(settings) => *self.settings.lock().await = settings,
+            Err(error) => {
+                tracing::warn!(%error, path = %path.display(), "ignoring unreadable settings");
+            }
+        }
+    }
+
+    /// The user's current agent preferences.
+    pub async fn current_settings(&self) -> AgentSettings {
+        self.settings.lock().await.clone()
+    }
+
+    /// Apply a settings patch from the canvas, persist it and tell every page
+    /// on every workspace.
+    pub async fn apply_settings_patch(
+        &self,
+        patch: &serde_json::Value,
+    ) -> Result<AgentSettings, String> {
+        let settings = {
+            let mut settings = self.settings.lock().await;
+            settings.apply_patch(patch)?;
+            settings.clone()
+        };
+        if let Some(path) = &self.settings_path {
+            if let Ok(json) = serde_json::to_string_pretty(&settings) {
+                if let Err(error) = write_atomic(path, &json).await {
+                    tracing::warn!(%error, path = %path.display(), "could not persist settings");
+                }
+            }
+        }
+        let frame = serde_json::json!({ "type": "settings", "settings": settings }).to_string();
+        let workspaces: Vec<Arc<Workspace>> =
+            self.workspaces.lock().unwrap().values().cloned().collect();
+        for ws in workspaces {
+            let _ = ws.to_pages.send(PageMessage::all(frame.clone()));
+        }
+        Ok(settings)
+    }
+
+    /// The next connection id.
+    pub fn new_page_id(&self) -> u64 {
+        self.next_page.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Persist every workspace; called on graceful shutdown.
+    pub async fn persist_all(&self) {
+        let workspaces: Vec<Arc<Workspace>> =
+            self.workspaces.lock().unwrap().values().cloned().collect();
+        for ws in workspaces {
+            ws.persist_document().await;
+        }
+    }
+}
+
 async fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -611,28 +813,50 @@ async fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    fn shape_at(x: f64) -> canvas_core::model::ElementKind {
+        canvas_core::model::ElementKind::Shape {
+            shape: canvas_core::model::ShapeKind::Rectangle,
+            rect: canvas_core::geometry::Rect::new(x, 0.0, 10.0, 10.0),
+            style: canvas_core::model::Style::default(),
+            bound_text_id: None,
+        }
+    }
+
+    fn add_shape(doc: &mut Document, x: f64, version: u64) {
+        doc.add(shape_at(x), version);
+    }
+
+    #[test]
+    fn workspace_names_are_validated() {
+        for valid in ["default", "a", "vpc-redesign-2", "x".repeat(40).as_str()] {
+            assert!(valid_workspace_name(valid), "{valid} should be valid");
+        }
+        for invalid in [
+            "",
+            "-leading-dash",
+            "Uppercase",
+            "has space",
+            "has/slash",
+            "has_underscore",
+            "ümlaut",
+            "x".repeat(41).as_str(),
+        ] {
+            assert!(!valid_workspace_name(invalid), "{invalid} should be invalid");
+        }
+    }
+
     #[tokio::test]
     async fn persistence_round_trips_through_disk() {
         let dir = std::env::temp_dir().join(format!("rs-canvas-state-{}", std::process::id()));
         let path = dir.join("document.json");
         let state = AppState::new(PathBuf::from("."), Some(path.clone()), true);
-        {
-            let mut doc = state.doc.lock().await;
-            doc.add(
-                canvas_core::model::ElementKind::Shape {
-                    shape: canvas_core::model::ShapeKind::Rectangle,
-                    rect: canvas_core::geometry::Rect::new(10.0, 20.0, 30.0, 40.0),
-                    style: canvas_core::model::Style::default(),
-                    bound_text_id: None,
-                },
-                1,
-            );
-        }
-        state.persist_document().await;
+        let ws = state.workspace(DEFAULT_WORKSPACE).await;
+        add_shape(&mut ws.doc.lock().await, 10.0, 1);
+        ws.persist_document().await;
 
         let restored = AppState::new(PathBuf::from("."), Some(path), true);
-        restored.load_document().await;
-        assert_eq!(restored.doc.lock().await.live_count(), 1);
+        let restored_ws = restored.workspace(DEFAULT_WORKSPACE).await;
+        assert_eq!(restored_ws.doc.lock().await.live_count(), 1);
         let _ = tokio::fs::remove_dir_all(dir).await;
     }
 
@@ -644,92 +868,152 @@ mod tests {
         tokio::fs::write(&path, "{not json").await.unwrap();
 
         let state = AppState::new(PathBuf::from("."), Some(path), true);
-        state.load_document().await;
-        assert_eq!(state.doc.lock().await.live_count(), 0);
+        let ws = state.workspace(DEFAULT_WORKSPACE).await;
+        assert_eq!(ws.doc.lock().await.live_count(), 0);
         let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+
+    #[tokio::test]
+    async fn named_workspaces_persist_beside_the_default_document() {
+        let dir = std::env::temp_dir().join(format!("rs-canvas-ws-{}", std::process::id()));
+        let state = AppState::new(PathBuf::from("."), Some(dir.join("current.json")), true);
+        let alpha = state.workspace("alpha").await;
+        assert_eq!(
+            alpha.doc_path.as_deref(),
+            Some(dir.join("workspaces/alpha.json").as_path())
+        );
+        add_shape(&mut alpha.doc.lock().await, 5.0, 1);
+        alpha.persist_document().await;
+
+        let reopened = AppState::new(PathBuf::from("."), Some(dir.join("current.json")), true);
+        let alpha = reopened.workspace("alpha").await;
+        assert_eq!(alpha.doc.lock().await.live_count(), 1);
+        let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+
+    #[tokio::test]
+    async fn workspaces_are_isolated() {
+        let state = AppState::new(PathBuf::from("."), None, true);
+        let alpha = state.workspace("alpha").await;
+        let beta = state.workspace("beta").await;
+        let mut beta_pages = beta.to_pages.subscribe();
+
+        let element = Element::new(shape_at(0.0), "a0".into(), 1).with_id("one");
+        assert!(alpha.absorb_patch(vec![element], 7).await);
+
+        assert_eq!(alpha.doc.lock().await.live_count(), 1);
+        assert_eq!(beta.doc.lock().await.live_count(), 0);
+        assert_eq!(alpha.revision.load(Ordering::SeqCst), 1);
+        assert_eq!(beta.revision.load(Ordering::SeqCst), 0);
+        assert!(
+            beta_pages.try_recv().is_err(),
+            "alpha's patch must not leak into beta"
+        );
+    }
+
+    #[tokio::test]
+    async fn current_workspace_follows_the_active_page() {
+        let state = AppState::new(PathBuf::from("."), None, true);
+        // No pages anywhere: the default workspace, even though it has none.
+        let current = state.current_workspace().await;
+        assert_eq!(current.name, DEFAULT_WORKSPACE);
+
+        let alpha = state.workspace("alpha").await;
+        alpha.pages.store(1, Ordering::SeqCst);
+        alpha.last_activity.store(100, Ordering::SeqCst);
+        assert_eq!(state.current_workspace().await.name, "alpha");
+
+        let beta = state.workspace("beta").await;
+        beta.pages.store(1, Ordering::SeqCst);
+        beta.last_activity.store(200, Ordering::SeqCst);
+        assert_eq!(state.current_workspace().await.name, "beta");
+
+        // A workspace nobody is watching is never current.
+        beta.pages.store(0, Ordering::SeqCst);
+        assert_eq!(state.current_workspace().await.name, "alpha");
+    }
+
+    #[tokio::test]
+    async fn the_workspace_listing_skips_never_used_husks() {
+        let state = AppState::new(PathBuf::from("."), None, true);
+        state.workspace(DEFAULT_WORKSPACE).await;
+        state.workspace("touched").await;
+        let names: Vec<String> = state
+            .list_workspaces()
+            .await
+            .iter()
+            .map(|info| info.name.clone())
+            .collect();
+        assert_eq!(names, vec![DEFAULT_WORKSPACE]);
+
+        let alpha = state.workspace("alpha").await;
+        alpha.pages.store(1, Ordering::SeqCst);
+        let names: Vec<String> = state
+            .list_workspaces()
+            .await
+            .iter()
+            .map(|info| info.name.clone())
+            .collect();
+        assert!(names.contains(&"alpha".to_string()));
     }
 
     #[tokio::test]
     async fn in_memory_mirrors_clear_when_the_last_page_leaves() {
         let state = AppState::new(PathBuf::from("."), None, true);
-        state.doc.lock().await.add(
-            canvas_core::model::ElementKind::Shape {
-                shape: canvas_core::model::ShapeKind::Rectangle,
-                rect: canvas_core::geometry::Rect::new(0.0, 0.0, 10.0, 10.0),
-                style: canvas_core::model::Style::default(),
-                bound_text_id: None,
-            },
-            1,
-        );
+        let ws = state.workspace(DEFAULT_WORKSPACE).await;
+        add_shape(&mut ws.doc.lock().await, 0.0, 1);
 
-        state.release_when_idle(1).await;
-        assert_eq!(state.doc.lock().await.live_count(), 1, "a page is watching");
-        state.release_when_idle(0).await;
-        assert_eq!(state.doc.lock().await.live_count(), 0, "no page, no mirror");
+        ws.release_when_idle(1).await;
+        assert_eq!(ws.doc.lock().await.live_count(), 1, "a page is watching");
+        ws.release_when_idle(0).await;
+        assert_eq!(ws.doc.lock().await.live_count(), 0, "no page, no mirror");
     }
 
     #[tokio::test]
     async fn persisted_mirrors_survive_idle() {
         let dir = std::env::temp_dir().join(format!("rs-canvas-idle-{}", std::process::id()));
         let state = AppState::new(PathBuf::from("."), Some(dir.join("document.json")), true);
-        state.doc.lock().await.add(
-            canvas_core::model::ElementKind::Shape {
-                shape: canvas_core::model::ShapeKind::Rectangle,
-                rect: canvas_core::geometry::Rect::new(0.0, 0.0, 10.0, 10.0),
-                style: canvas_core::model::Style::default(),
-                bound_text_id: None,
-            },
-            1,
-        );
-        state.release_when_idle(0).await;
-        assert_eq!(state.doc.lock().await.live_count(), 1);
+        let ws = state.workspace(DEFAULT_WORKSPACE).await;
+        add_shape(&mut ws.doc.lock().await, 0.0, 1);
+        ws.release_when_idle(0).await;
+        assert_eq!(ws.doc.lock().await.live_count(), 1);
         let _ = tokio::fs::remove_dir_all(dir).await;
-    }
-
-    fn shape_at(x: f64) -> canvas_core::model::ElementKind {
-        canvas_core::model::ElementKind::Shape {
-            shape: canvas_core::model::ShapeKind::Rectangle,
-            rect: canvas_core::geometry::Rect::new(x, 0.0, 10.0, 10.0),
-            style: canvas_core::model::Style::default(),
-            bound_text_id: None,
-        }
     }
 
     #[tokio::test]
     async fn patches_merge_and_broadcast_to_everyone_but_the_origin() {
         let state = AppState::new(PathBuf::from("."), None, true);
-        let mut from_server = state.to_pages.subscribe();
+        let ws = state.workspace(DEFAULT_WORKSPACE).await;
+        let mut from_server = ws.to_pages.subscribe();
         let element = Element::new(shape_at(0.0), "a0".into(), 1).with_id("one");
 
-        assert!(state.absorb_patch(vec![element.clone()], 7).await);
+        assert!(ws.absorb_patch(vec![element.clone()], 7).await);
         let message = from_server.recv().await.unwrap();
         assert_eq!(message.except, Some(7), "the origin page is skipped");
         let frame: serde_json::Value = serde_json::from_str(&message.text).unwrap();
         assert_eq!(frame["type"], "patch");
         assert_eq!(frame["put"].as_array().unwrap().len(), 1);
-        assert_eq!(state.revision.load(Ordering::SeqCst), 1);
+        assert_eq!(ws.revision.load(Ordering::SeqCst), 1);
 
         assert!(
-            !state.absorb_patch(vec![element], 7).await,
+            !ws.absorb_patch(vec![element], 7).await,
             "replaying a patch is a no-op"
         );
-        assert_eq!(state.revision.load(Ordering::SeqCst), 1);
+        assert_eq!(ws.revision.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
     async fn a_stale_patch_cannot_clobber_a_newer_mirror() {
         let state = AppState::new(PathBuf::from("."), None, true);
+        let ws = state.workspace(DEFAULT_WORKSPACE).await;
         let mut newer = Element::new(shape_at(5.0), "a0".into(), 1).with_id("one");
         newer.version = 4;
-        state.absorb_patch(vec![newer], 1).await;
+        ws.absorb_patch(vec![newer], 1).await;
 
-        let mut from_server = state.to_pages.subscribe();
+        let mut from_server = ws.to_pages.subscribe();
         let older = Element::new(shape_at(0.0), "a0".into(), 1).with_id("one");
-        assert!(!state.absorb_patch(vec![older], 1).await);
-        assert_eq!(
-            state.doc.lock().await.element("one").unwrap().kind,
-            shape_at(5.0)
-        );
+        assert!(!ws.absorb_patch(vec![older], 1).await);
+        assert_eq!(ws.doc.lock().await.element("one").unwrap().kind, shape_at(5.0));
 
         // The page that sent the stale copy is corrected back to the winner.
         let frame: serde_json::Value =
@@ -743,8 +1027,9 @@ mod tests {
     #[tokio::test]
     async fn snapshot_frames_embed_the_document_as_an_object() {
         let state = AppState::new(PathBuf::from("."), None, true);
-        state.doc.lock().await.add(shape_at(0.0), 1);
-        let frame: serde_json::Value = serde_json::from_str(&state.snapshot_frame().await).unwrap();
+        let ws = state.workspace(DEFAULT_WORKSPACE).await;
+        add_shape(&mut ws.doc.lock().await, 0.0, 1);
+        let frame: serde_json::Value = serde_json::from_str(&ws.snapshot_frame().await).unwrap();
         assert_eq!(frame["type"], "snapshot");
         assert!(frame["doc"]["elements"].is_object());
         assert_eq!(frame["rev"], 0);

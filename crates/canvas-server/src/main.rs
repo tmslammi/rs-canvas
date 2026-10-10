@@ -16,16 +16,17 @@ mod ws;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use axum::extract::State;
 use axum::http::{header, HeaderValue};
 use axum::routing::get;
-use axum::Router;
+use axum::{Json, Router};
 use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
 use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 
-use crate::state::AppState;
+use crate::state::{AppState, DEFAULT_WORKSPACE};
 
 struct Args {
     web: PathBuf,
@@ -78,9 +79,10 @@ async fn main() {
 
     let args = parse_args();
     let state = Arc::new(AppState::new(args.web.clone(), args.doc.clone(), args.sync));
-    state.load_document().await;
+    // Create the default workspace up front so its document is loaded before
+    // anyone asks; every other workspace is born when a page names it.
+    state.workspace(DEFAULT_WORKSPACE).await;
     state.load_settings().await;
-    tokio::spawn(state.clone().persist_loop());
 
     // The page's document is authoritative; the factory runs per MCP session
     // and every instance shares the same process-wide state.
@@ -101,6 +103,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/ws", get(ws::handler))
+        .route("/api/workspaces", get(workspaces))
         .nest_service("/mcp", mcp_service)
         .fallback_service(ServeDir::new(&args.web))
         .layer(no_store)
@@ -116,8 +119,14 @@ async fn main() {
         .await
         .expect("canvas server failed");
 
-    // The debounced writer may still owe a write.
-    state.persist_document().await;
+    // The debounced writers may still owe a write.
+    state.persist_all().await;
+}
+
+/// The workspace listing the page's switcher shows: live workspaces plus
+/// persisted ones not opened this run.
+async fn workspaces(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "workspaces": state.list_workspaces().await }))
 }
 
 /// Ctrl-C or SIGTERM; either ends the process gracefully so the debounced

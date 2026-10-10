@@ -206,7 +206,7 @@ fn main() {
         |editor| {
             std::hint::black_box(editor.select_all());
             std::hint::black_box(editor.delete_selection(1));
-            std::hint::black_box(editor.undo());
+            std::hint::black_box(editor.undo(2));
         },
     );
 

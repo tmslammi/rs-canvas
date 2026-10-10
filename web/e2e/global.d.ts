@@ -36,6 +36,7 @@ declare global {
       set_snap_enabled(enabled: boolean): void;
       snap_enabled(): boolean;
       route_for(id: string): Float64Array;
+      wheel(x: number, y: number, dx: number, dy: number, ctrl: boolean): void;
       presentation_state(): string;
       presentation_outcomes(): string;
     };

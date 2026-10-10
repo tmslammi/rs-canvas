@@ -193,6 +193,21 @@ impl Renderer for Canvas2dRenderer {
         self.invalidate_state_cache();
     }
 
+    fn clip_rects(&mut self, rects: &[Rect]) {
+        if rects.is_empty() {
+            return;
+        }
+        let _ = self.ctx.set_transform(1.0, 0.0, 0.0, 1.0, 0.0, 0.0);
+        self.ctx.begin_path();
+        for rect in rects {
+            self.ctx
+                .rect(rect.x, rect.y, rect.w.max(1.0), rect.h.max(1.0));
+        }
+        self.ctx.clip();
+        // The caller sets the scene transform next and restores its saved
+        // state in `end_frame`, which also drops this clip.
+    }
+
     fn draw_path(&mut self, op: &canvas_core::PathOp) {
         if op.points.len() < 2 {
             return;
@@ -790,12 +805,12 @@ impl Editor {
     }
 
     pub fn undo(&mut self) {
-        let effects = self.core.undo();
+        let effects = self.core.undo(now_ms());
         self.apply(effects);
     }
 
     pub fn redo(&mut self) {
-        let effects = self.core.redo();
+        let effects = self.core.redo(now_ms());
         self.apply(effects);
     }
 
@@ -1536,6 +1551,9 @@ impl Editor {
         for strip in &strips {
             self.renderer.clear_rect(*strip, BACKGROUND);
         }
+        // Same rule as `paint_dirty`: layers paint in full, so confine them
+        // to the freshly exposed strips.
+        self.renderer.clip_rects(&strips);
         self.renderer
             .set_transform(camera.transform().then(Affine::scale(self.dpr)));
         for layer in self.core.scene.layers.iter() {
@@ -1631,6 +1649,7 @@ impl Editor {
             union = union.union(rect);
         }
         self.renderer.begin_frame();
+        let mut cleared: Vec<Rect> = Vec::with_capacity(merged.len());
         for rect in &merged {
             let top_left = self.core.camera.world_to_screen(Point::new(rect.x, rect.y));
             let bottom_right = self
@@ -1645,7 +1664,13 @@ impl Editor {
                 screen.h * self.dpr,
             );
             self.renderer.clear_rect(device, BACKGROUND);
+            cleared.push(device);
         }
+        // Clip the redraws to the cleared region: a layer that intersects a
+        // dirty rect repaints in full, so without the clip its parts outside
+        // the cleared rect would paint over untouched pixels — most visibly
+        // letting a lower layer cover the higher layers around it.
+        self.renderer.clip_rects(&cleared);
         self.renderer
             .set_transform(self.core.camera.transform().then(Affine::scale(self.dpr)));
         for layer in self.core.scene.layers.iter() {

@@ -403,3 +403,116 @@ test("dragging a bound connector keeps it attached to its shapes", async ({ page
   expect(bounds![1]).toBeCloseTo(250, -1);
   expect(bounds![3], "the connector stretched down with the shape").toBeGreaterThan(50);
 });
+
+// A partial repaint clears a dirty rectangle and redraws every layer whose
+// bounds intersect it. The redraw must be clipped to the cleared region:
+// redrawing a whole lower layer paints over higher layers that lie outside
+// the dirty rect, which made the higher elements vanish until the next full
+// render (reported as elements disappearing while drawing).
+const shapeStyle = (fillColor: string) => ({
+  strokeColor: "#ece4d6",
+  fillColor,
+  fillStyle: "solid",
+  strokeWidth: 2,
+  roughness: 0,
+  dash: "solid",
+  opacity: 1,
+  fontSize: 20,
+});
+
+const element = (
+  id: string,
+  index: string,
+  rect: { x: number; y: number; w: number; h: number },
+  fillColor: string,
+) => ({
+  id,
+  version: 1,
+  versionNonce: 1,
+  index,
+  isDeleted: false,
+  updated: 1,
+  type: "shape",
+  shape: "rectangle",
+  rect,
+  style: shapeStyle(fillColor),
+});
+
+const pixelAt = (
+  page: import("@playwright/test").Page,
+  x: number,
+  y: number,
+): Promise<number[]> =>
+  page.evaluate(
+    ([sx, sy]) => {
+      const canvas = document.getElementById("scene") as HTMLCanvasElement;
+      const data = canvas
+        .getContext("2d")!
+        .getImageData(Math.round(sx!), Math.round(sy!), 1, 1).data;
+      return [data[0], data[1], data[2], data[3]];
+    },
+    [x, y],
+  );
+
+const isGreen = (pixel: number[]) => pixel[1] > 120 && pixel[0] < 120 && pixel[2] < 120;
+const isBlue = (pixel: number[]) => pixel[2] > 120 && pixel[0] < 120;
+
+const stackedDocument = () => ({
+  schemaVersion: 1,
+  elements: {
+    // The blue rectangle sits under the green one and is far bigger, so it
+    // intersects both the freehand dirty band and the pan strips.
+    back: element("back", "a0", { x: 0, y: 0, w: 1500, h: 700 }, "#1f5fbf"),
+    front: element("front", "a1", { x: 100, y: 100, w: 200, h: 120 }, "#3cb44b"),
+  },
+});
+
+test("a partial repaint keeps a higher element on top of a redrawn lower one", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.waitForFunction(() => window.__rsReady === true);
+  await page.evaluate(() => window.__rsEditor!.new_document());
+  await page.evaluate(
+    (doc) => window.__rsEditor!.load_json(JSON.stringify(doc)),
+    stackedDocument(),
+  );
+
+  const frontCentre = await pixelAt(page, 200, 160);
+  expect(isGreen(frontCentre), "the green rectangle renders on top").toBe(true);
+
+  // Draw a freehand stroke across the blue rectangle, well below the green
+  // one: the stroke's dirty band intersects the blue layer only.
+  await page.keyboard.press("p");
+  await page.mouse.move(100, 560);
+  await page.mouse.down();
+  await page.mouse.move(1000, 560, { steps: 8 });
+
+  expect(
+    isGreen(await pixelAt(page, 200, 160)),
+    "green stays on top while the stroke repaints the blue rectangle",
+  ).toBe(true);
+  await page.mouse.up();
+});
+
+test("a pan strip repaint keeps a higher element on top of a redrawn lower one", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.waitForFunction(() => window.__rsReady === true);
+  await page.evaluate(() => window.__rsEditor!.new_document());
+  await page.evaluate(
+    (doc) => window.__rsEditor!.load_json(JSON.stringify(doc)),
+    stackedDocument(),
+  );
+  await page.evaluate(() => window.__rsEditor!.render());
+
+  // Pan 30px left; the exposed right strip intersects only the blue layer.
+  await page.evaluate(() => window.__rsEditor!.wheel(640, 400, 30, 0, false));
+
+  expect(
+    isGreen(await pixelAt(page, 170, 160)),
+    "green stays on top during a strip-repaint pan",
+  ).toBe(true);
+  expect(isBlue(await pixelAt(page, 1260, 400)), "the exposed strip shows blue").toBe(true);
+});

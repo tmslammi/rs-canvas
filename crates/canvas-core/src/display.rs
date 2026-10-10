@@ -122,6 +122,12 @@ pub trait Renderer {
     fn clear(&mut self, color: &str);
     /// Fill one device-space rectangle, ignoring the current transform.
     fn clear_rect(&mut self, rect: Rect, color: &str);
+    /// Intersect the clip region with the union of these device-space
+    /// rectangles, ignoring the current transform. Partial repaints draw
+    /// whole layers clipped to the repainted region so a layer can never
+    /// paint over untouched pixels (which would let a lower layer cover the
+    /// higher layers around it).
+    fn clip_rects(&mut self, rects: &[Rect]);
     fn draw_path(&mut self, op: &PathOp);
     fn draw_line_batch(&mut self, segments: &[[Point; 2]], stroke: &StrokeStyle);
     fn draw_text(&mut self, op: &TextOp);

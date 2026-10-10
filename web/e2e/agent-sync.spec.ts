@@ -27,6 +27,26 @@ async function drawRectangle(page: Page) {
   await page.mouse.up();
 }
 
+// Undo restamps merge metadata (undo is a new edit), so snapshots compare
+// equal only once the version stamps are stripped — same normalize as the
+// adversarial suite.
+const normalize = (json: string): string => {
+  const doc = JSON.parse(json) as {
+    elements: Record<string, Record<string, unknown>>;
+  };
+  for (const element of Object.values(doc.elements)) {
+    delete element.version;
+    delete element.versionNonce;
+    delete element.updated;
+  }
+  return JSON.stringify(doc);
+};
+
+const snapshot = (page: Page): Promise<string> =>
+  page
+    .evaluate(() => window.__rsEditor!.snapshot_json())
+    .then((json) => normalize(json));
+
 test("a human edit reaches the agent", async ({ page, request }) => {
   const mcp = mcpClient(request, BASE);
   const before = elementCount(await mcp.text("canvas_read", {}));
@@ -387,4 +407,27 @@ test("a server restart preserves the document", async ({ request }) => {
     if (server.exitCode === null) await waitForExit(server);
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("undoing a move survives the sync round trip", async ({ page }) => {
+  await openPage(page);
+  await drawRectangle(page);
+  // Let the creation patch reach the mirror before the move patch follows.
+  await page.waitForTimeout(500);
+  const before = await snapshot(page);
+
+  await page.keyboard.press("v");
+  await page.mouse.move(500, 350);
+  await page.mouse.down();
+  await page.mouse.move(560, 390, { steps: 5 });
+  await page.mouse.up();
+  const moved = await snapshot(page);
+  expect(moved, "drag moved the rectangle").not.toBe(before);
+  // Let the move patch land on the mirror: the undo patch must beat it there.
+  await page.waitForTimeout(500);
+
+  await page.keyboard.press("ControlOrMeta+z");
+  // Past the correction round trip: a stale undo would be reverted here.
+  await page.waitForTimeout(1_000);
+  expect(await snapshot(page), "undo restored the rectangle").toBe(before);
 });

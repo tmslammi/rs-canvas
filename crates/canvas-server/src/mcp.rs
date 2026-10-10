@@ -2,8 +2,9 @@
 //!
 //! View tools (camera, highlights) are transient; they never touch the
 //! document, history or storage. Drawing tools arrive with their tickets.
-//! The server is created per MCP session but shares `AppState`, so all
-//! sessions see the same document and page set.
+//! The server is created per MCP session but shares `AppState`. Every tool
+//! call acts on the current workspace — the one the user's most recently
+//! active page is viewing (ADR-0007) — never on an agent-owned one.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -19,7 +20,7 @@ use rmcp::{schemars, tool, tool_handler, tool_router, ErrorData as McpError, Ser
 use crate::doc_ops;
 use crate::render;
 use crate::script::{self, ScriptBeat};
-use crate::state::{AppState, PageMessage};
+use crate::state::{AppState, PageMessage, Workspace};
 use crate::verbs;
 
 const INSTRUCTIONS: &str =
@@ -29,7 +30,9 @@ canvas_read shows the current drawing as compact lines, each starting with a sho
 handle (e1, e2, ...); every tool accepts handles or raw ids. canvas_draw creates one \
 element and canvas_pen draws a freehand stroke with per-point pressure and ink style \
 (width, colour, roughness, dash, opacity, fill/shading). \
-Camera and presentation tools move the user's view; they never change the drawing.";
+Camera and presentation tools move the user's view; they never change the drawing. \
+The user may keep several workspaces (named, isolated canvases); every tool acts on \
+the one the user is currently viewing — canvas_status names it and lists the rest.";
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -250,10 +253,10 @@ struct ZoomArgs {
     mode: String,
 }
 
-/// Deliver a view command to every open page. View commands are transient:
-/// they never touch the document, history or storage. The user's camera
-/// settings are enforced here, so an agent that ignores `canvas_status` still
-/// cannot take over the view.
+/// Deliver a view command to the pages on the current workspace. View
+/// commands are transient: they never touch the document, history or
+/// storage. The user's camera settings are enforced here, so an agent that
+/// ignores `canvas_status` still cannot take over the view.
 async fn deliver_view(
     state: &AppState,
     mut message: serde_json::Value,
@@ -278,14 +281,15 @@ async fn deliver_view(
         }
         message["zoom_cap"] = settings.zoom_cap().into();
     }
-    let pages = state.pages.load(Ordering::SeqCst);
+    let workspace = state.current_workspace().await;
+    let pages = workspace.pages.load(Ordering::SeqCst);
     if pages == 0 {
         return Ok(CallToolResult::error(vec![ContentBlock::text(
             "No canvas page is connected. Ask the user to open http://localhost:5173 \
              (the dev server must be running).",
         )]));
     }
-    let _ = state.to_pages.send(PageMessage::all(message.to_string()));
+    let _ = workspace.to_pages.send(PageMessage::all(message.to_string()));
     Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::json!({ "ok": true, "delivered_to_pages": pages }).to_string(),
     )]))
@@ -400,35 +404,41 @@ pub struct CanvasServer {
 }
 
 impl CanvasServer {
-    /// Apply an edit to the mirror. On success the change is recorded and
-    /// broadcast as an element patch; on failure the document and the change
-    /// log stay untouched. Returns the edit's own result.
+    /// The workspace this call acts on: the one the user is looking at.
+    async fn current(&self) -> Arc<Workspace> {
+        self.state.current_workspace().await
+    }
+
+    /// Apply an edit to the workspace mirror. On success the change is
+    /// recorded and broadcast as an element patch; on failure the document
+    /// and the change log stay untouched. Returns the edit's own result.
     async fn apply_edit<T, E>(
         &self,
+        workspace: &Workspace,
         source: &str,
         run: impl FnOnce(&mut Document) -> Result<T, E>,
     ) -> Result<T, E> {
         let (result, change) = {
-            let mut doc = self.state.doc.lock().await;
+            let mut doc = workspace.doc.lock().await;
             let before = doc.clone();
             let result = run(&mut doc);
             let change = if result.is_ok() {
-                Some(self.state.record_change(&before, &doc, source).await)
+                Some(workspace.record_change(&before, &doc, source).await)
             } else {
                 None
             };
             (result, change)
         };
         if let Some((revision, put)) = change {
-            self.state.publish_patch(revision, put).await;
+            workspace.publish_patch(revision, put).await;
         }
         result
     }
 
     /// The agent-facing identity of one element: its handle and compact line.
-    async fn describe_one(&self, id: &str) -> serde_json::Value {
-        let doc = self.state.doc.lock().await;
-        let mut aliases = self.state.aliases.lock().await;
+    async fn describe_one(&self, workspace: &Workspace, id: &str) -> serde_json::Value {
+        let doc = workspace.doc.lock().await;
+        let mut aliases = workspace.aliases.lock().await;
         let handle = aliases.handle(id);
         let line = doc
             .element(id)
@@ -448,24 +458,29 @@ impl CanvasServer {
 
     #[tool(
         description = "Report canvas server status: whether the bridge is reachable, \
-                       how many browser pages are connected, and the mirrored document's \
-                       element count."
+                       which workspace is current (the one the user is viewing), how \
+                       many browser pages are connected to it, the mirrored document's \
+                       element count, and the other workspaces that exist."
     )]
     async fn canvas_status(&self) -> Result<CallToolResult, McpError> {
-        let doc = self.state.doc.lock().await;
-        let revision = self.state.revision.load(Ordering::SeqCst);
-        let hints = self.state.view_hint.lock().await.clone();
+        let workspace = self.current().await;
+        let doc = workspace.doc.lock().await;
+        let revision = workspace.revision.load(Ordering::SeqCst);
+        let hints = workspace.view_hint.lock().await.clone();
         let settings = self.state.current_settings().await;
+        let workspaces = self.state.list_workspaces().await;
         let body = serde_json::json!({
             "server": "rs-canvas",
             "version": env!("CARGO_PKG_VERSION"),
-            "pages_connected": self.state.pages.load(Ordering::SeqCst),
+            "workspace": workspace.name,
+            "pages_connected": workspace.pages.load(Ordering::SeqCst),
             "uptime_ms": self.state.started.elapsed().as_millis() as u64,
             "revision": revision,
             "document": {
                 "elements": doc.ordered_live().len(),
             },
             "settings": settings,
+            "workspaces": workspaces,
             "hints": hints.map(|hint| serde_json::json!({
                 "note": "transient view state from the most recent page; never persisted or merged",
                 "camera": hint.camera,
@@ -490,19 +505,20 @@ impl CanvasServer {
         &self,
         Parameters(args): Parameters<ReadArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let revision = self.state.revision.load(Ordering::SeqCst);
-        let doc = self.state.doc.lock().await;
+        let workspace = self.current().await;
+        let revision = workspace.revision.load(Ordering::SeqCst);
+        let doc = workspace.doc.lock().await;
         let text = match args.since {
             None => {
-                let mut aliases = self.state.aliases.lock().await;
+                let mut aliases = workspace.aliases.lock().await;
                 format!(
                     "revision {revision}\n{}",
                     canvas_core::describe::describe_with(&doc, &mut *aliases)
                 )
             }
             Some(since) => {
-                let records = self.state.changes_since(since).await;
-                let mut aliases = self.state.aliases.lock().await;
+                let records = workspace.changes_since(since).await;
+                let mut aliases = workspace.aliases.lock().await;
                 describe_changes(&doc, &records, since, revision, &mut *aliases)
             }
         };
@@ -521,8 +537,9 @@ impl CanvasServer {
         &self,
         Parameters(args): Parameters<DrawArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let workspace = self.current().await;
         let near = match args.near.as_deref() {
-            Some(near) => Some(self.state.resolve_id(near).await),
+            Some(near) => Some(workspace.resolve_id(near).await),
             None => None,
         };
         let request = doc_ops::DrawRequest {
@@ -538,12 +555,14 @@ impl CanvasServer {
             side: args.side,
         };
         let created = self
-            .apply_edit("agent", |doc| doc_ops::draw(doc, &request, now_ms()))
+            .apply_edit(&workspace, "agent", |doc| {
+                doc_ops::draw(doc, &request, now_ms())
+            })
             .await;
         match created {
             Ok(id) => {
-                let elements = self.state.doc.lock().await.live_count();
-                let mut body = self.describe_one(&id).await;
+                let elements = workspace.doc.lock().await.live_count();
+                let mut body = self.describe_one(&workspace, &id).await;
                 body["elements"] = serde_json::json!(elements);
                 Ok(CallToolResult::success(vec![ContentBlock::text(
                     body.to_string(),
@@ -585,13 +604,16 @@ impl CanvasServer {
             pressures,
             style: pen_style(&args),
         };
+        let workspace = self.current().await;
         let result = self
-            .apply_edit("agent", |doc| doc_ops::pen(doc, &request, now_ms()))
+            .apply_edit(&workspace, "agent", |doc| {
+                doc_ops::pen(doc, &request, now_ms())
+            })
             .await;
         match result {
             Ok(id) => {
-                let elements = self.state.doc.lock().await.live_count();
-                let mut body = self.describe_one(&id).await;
+                let elements = workspace.doc.lock().await.live_count();
+                let mut body = self.describe_one(&workspace, &id).await;
                 body["elements"] = serde_json::json!(elements);
                 Ok(CallToolResult::success(vec![ContentBlock::text(
                     body.to_string(),
@@ -617,42 +639,45 @@ impl CanvasServer {
         &self,
         Parameters(args): Parameters<ScriptArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let workspace = self.current().await;
         let beat_count = args.beats.len();
         let mut beats = args.beats;
         for beat in &mut beats {
             if let Some(draw) = &mut beat.draw {
                 if let Some(near) = draw.near.take() {
-                    draw.near = Some(self.state.resolve_id(&near).await);
+                    draw.near = Some(workspace.resolve_id(&near).await);
                 }
                 if let Some(around) = &mut draw.around {
-                    *around = self.state.resolve_ids(around).await;
+                    *around = workspace.resolve_ids(around).await;
                 }
             }
             if let Some(connect) = &mut beat.connect {
-                connect.from = self.state.resolve_id(&connect.from).await;
-                connect.to = self.state.resolve_id(&connect.to).await;
+                connect.from = workspace.resolve_id(&connect.from).await;
+                connect.to = workspace.resolve_id(&connect.to).await;
             }
             if let Some(annotate) = &mut beat.annotate {
-                annotate.target = self.state.resolve_id(&annotate.target).await;
+                annotate.target = workspace.resolve_id(&annotate.target).await;
             }
             if let Some(emphasis) = &mut beat.emphasis {
-                emphasis.targets = self.state.resolve_ids(&emphasis.targets).await;
+                emphasis.targets = workspace.resolve_ids(&emphasis.targets).await;
             }
             if let Some(tidy) = &mut beat.tidy {
-                *tidy = self.state.resolve_ids(tidy).await;
+                *tidy = workspace.resolve_ids(tidy).await;
             }
             if let Some(clear) = &mut beat.clear {
-                *clear = self.state.resolve_ids(clear).await;
+                *clear = workspace.resolve_ids(clear).await;
             }
             if let Some(focus) = beat.focus.take() {
-                beat.focus = Some(self.state.resolve_id(&focus).await);
+                beat.focus = Some(workspace.resolve_id(&focus).await);
             }
             if let Some(point) = beat.point.take() {
-                beat.point = Some(self.state.resolve_id(&point).await);
+                beat.point = Some(workspace.resolve_id(&point).await);
             }
         }
         let outcome = self
-            .apply_edit("agent", |doc| script::execute(doc, &beats, now_ms()))
+            .apply_edit(&workspace, "agent", |doc| {
+                script::execute(doc, &beats, now_ms())
+            })
             .await;
         let outcome = match outcome {
             Ok(outcome) => outcome,
@@ -660,7 +685,7 @@ impl CanvasServer {
         };
 
         let created: serde_json::Map<String, serde_json::Value> = {
-            let mut aliases = self.state.aliases.lock().await;
+            let mut aliases = workspace.aliases.lock().await;
             outcome
                 .created
                 .iter()
@@ -670,12 +695,12 @@ impl CanvasServer {
 
         let mut played = false;
         let mut cancelled = false;
-        let pages = self.state.pages.load(Ordering::SeqCst);
+        let pages = workspace.pages.load(Ordering::SeqCst);
         if outcome.presentation && pages > 0 {
             let settings = self.state.current_settings().await;
             let hold_scale = settings.hold_scale();
             let camera_moves = settings.camera_moves();
-            let presentation_id = self.state.present_counter.fetch_add(1, Ordering::SeqCst) + 1;
+            let presentation_id = workspace.present_counter.fetch_add(1, Ordering::SeqCst) + 1;
             let holds: Vec<u64> = outcome
                 .steps
                 .iter()
@@ -696,7 +721,7 @@ impl CanvasServer {
                     })
                 })
                 .collect();
-            let mut acks = self.state.present_acks.subscribe();
+            let mut acks = workspace.present_acks.subscribe();
             let frame = serde_json::json!({
                 "type": "present",
                 "id": presentation_id,
@@ -704,11 +729,11 @@ impl CanvasServer {
                 "zoom_cap": settings.zoom_cap(),
             })
             .to_string();
-            self.state.presentation_started();
-            let _ = self.state.to_pages.send(PageMessage::all(frame));
+            workspace.presentation_started();
+            let _ = workspace.to_pages.send(PageMessage::all(frame));
             played = true;
             cancelled = wait_for_present_ack(&mut acks, presentation_id, total_hold).await;
-            self.state.presentation_finished();
+            workspace.presentation_finished();
         }
 
         Ok(CallToolResult::success(vec![ContentBlock::text(
@@ -733,16 +758,17 @@ impl CanvasServer {
         &self,
         Parameters(args): Parameters<AnnotateArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let id = self.state.resolve_id(&args.id).await;
+        let workspace = self.current().await;
+        let id = workspace.resolve_id(&args.id).await;
         let result = self
-            .apply_edit("agent", |doc| {
+            .apply_edit(&workspace, "agent", |doc| {
                 verbs::annotate(doc, &id, &args.mark, now_ms())
             })
             .await;
         match result {
             Ok(ids) => {
-                let elements = self.state.doc.lock().await.live_count();
-                let mut aliases = self.state.aliases.lock().await;
+                let elements = workspace.doc.lock().await.live_count();
+                let mut aliases = workspace.aliases.lock().await;
                 let handles: Vec<String> = ids.iter().map(|id| aliases.handle(id)).collect();
                 Ok(CallToolResult::success(vec![ContentBlock::text(
                     serde_json::json!({ "ids": handles, "elements": elements }).to_string(),
@@ -761,15 +787,16 @@ impl CanvasServer {
         &self,
         Parameters(args): Parameters<EmphasisArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let ids = self.state.resolve_ids(&args.ids).await;
+        let workspace = self.current().await;
+        let ids = workspace.resolve_ids(&args.ids).await;
         let result = self
-            .apply_edit("agent", |doc| {
+            .apply_edit(&workspace, "agent", |doc| {
                 verbs::emphasis(doc, &ids, &args.mode, now_ms())
             })
             .await;
         match result {
             Ok(changed) => {
-                let elements = self.state.doc.lock().await.live_count();
+                let elements = workspace.doc.lock().await.live_count();
                 Ok(CallToolResult::success(vec![ContentBlock::text(
                     serde_json::json!({ "changed": changed, "elements": elements }).to_string(),
                 )]))
@@ -788,13 +815,16 @@ impl CanvasServer {
         &self,
         Parameters(args): Parameters<ElementIdsArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let ids = self.state.resolve_ids(&args.ids).await;
+        let workspace = self.current().await;
+        let ids = workspace.resolve_ids(&args.ids).await;
         let result = self
-            .apply_edit("agent", |doc| verbs::tidy(doc, &ids, now_ms()))
+            .apply_edit(&workspace, "agent", |doc| {
+                verbs::tidy(doc, &ids, now_ms())
+            })
             .await;
         match result {
             Ok(moved) => {
-                let elements = self.state.doc.lock().await.live_count();
+                let elements = workspace.doc.lock().await.live_count();
                 Ok(CallToolResult::success(vec![ContentBlock::text(
                     serde_json::json!({ "moved": moved, "elements": elements }).to_string(),
                 )]))
@@ -812,13 +842,16 @@ impl CanvasServer {
         &self,
         Parameters(args): Parameters<ElementIdsArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let ids = self.state.resolve_ids(&args.ids).await;
+        let workspace = self.current().await;
+        let ids = workspace.resolve_ids(&args.ids).await;
         let result = self
-            .apply_edit("agent", |doc| verbs::clear(doc, &ids, now_ms()))
+            .apply_edit(&workspace, "agent", |doc| {
+                verbs::clear(doc, &ids, now_ms())
+            })
             .await;
         match result {
             Ok(cleared) => {
-                let elements = self.state.doc.lock().await.live_count();
+                let elements = workspace.doc.lock().await.live_count();
                 Ok(CallToolResult::success(vec![ContentBlock::text(
                     serde_json::json!({ "cleared": cleared, "elements": elements }).to_string(),
                 )]))
@@ -837,13 +870,14 @@ impl CanvasServer {
         &self,
         Parameters(args): Parameters<ScreenshotArgs>,
     ) -> Result<CallToolResult, McpError> {
-        self.state
+        let workspace = self.current().await;
+        workspace
             .wait_for_presentation(Duration::from_secs(15))
             .await;
-        let pages = self.state.pages.load(Ordering::SeqCst);
+        let pages = workspace.pages.load(Ordering::SeqCst);
         if pages > 0 {
-            let id = self.state.screenshot_counter.fetch_add(1, Ordering::SeqCst) + 1;
-            let mut replies = self.state.screenshot_replies.subscribe();
+            let id = workspace.screenshot_counter.fetch_add(1, Ordering::SeqCst) + 1;
+            let mut replies = workspace.screenshot_replies.subscribe();
             let scale = args.scale.unwrap_or(1.0).clamp(0.1, 4.0);
             let frame = serde_json::json!({
                 "type": "screenshot",
@@ -851,7 +885,7 @@ impl CanvasServer {
                 "scale": scale,
             })
             .to_string();
-            let _ = self.state.to_pages.send(PageMessage::all(frame));
+            let _ = workspace.to_pages.send(PageMessage::all(frame));
             if let Ok(Some(data_url)) = tokio::time::timeout(
                 Duration::from_secs(8),
                 wait_for_screenshot(&mut replies, id),
@@ -862,7 +896,7 @@ impl CanvasServer {
             }
             // The page did not answer (busy or gone): show the mirror instead.
         }
-        let doc = self.state.doc.lock().await;
+        let doc = workspace.doc.lock().await;
         match render::render_png(&doc, &self.state.web_dir) {
             Ok(png) => Ok(CallToolResult::success(vec![ContentBlock::image(
                 base64::engine::general_purpose::STANDARD.encode(png),
@@ -884,7 +918,7 @@ impl CanvasServer {
     ) -> Result<CallToolResult, McpError> {
         let mut message = serde_json::json!({ "type": "view", "action": "focus" });
         if let Some(id) = args.id {
-            message["id"] = self.state.resolve_id(&id).await.into();
+            message["id"] = self.current().await.resolve_id(&id).await.into();
         }
         if let Some(pad) = args.pad {
             message["pad"] = pad.into();
@@ -903,7 +937,7 @@ impl CanvasServer {
         &self,
         Parameters(args): Parameters<PointArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let id = self.state.resolve_id(&args.id).await;
+        let id = self.current().await.resolve_id(&args.id).await;
         let message = serde_json::json!({
             "type": "view",
             "action": "point",

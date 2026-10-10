@@ -5,28 +5,56 @@
 //! `canvas-core`'s per-element LWW rules. Full snapshots remain for connect
 //! and for resync after a broadcast gap. View commands and presentation
 //! frames ride the same socket.
+//!
+//! A connection belongs to exactly one workspace, named by the `?ws=` query
+//! parameter (ADR-0007); without one it lands on `default`.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
-use axum::response::Response;
+use axum::extract::{Query, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use serde_json::Value;
 use tokio::sync::broadcast::error::RecvError;
 
 use canvas_core::model::Element;
 
-use crate::state::{now_ms, AppState};
+use crate::state::{now_ms, valid_workspace_name, AppState, Workspace, DEFAULT_WORKSPACE};
 
-pub async fn handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> Response {
-    ws.on_upgrade(move |socket| connected(socket, state))
+#[derive(serde::Deserialize)]
+pub struct WsQuery {
+    ws: Option<String>,
 }
 
-async fn connected(mut socket: WebSocket, state: Arc<AppState>) {
+pub async fn handler(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<WsQuery>,
+) -> Response {
+    let name = query
+        .ws
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| DEFAULT_WORKSPACE.to_string());
+    if !valid_workspace_name(&name) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "invalid workspace name {name:?}; use lowercase letters, digits and dashes"
+            ),
+        )
+            .into_response();
+    }
+    let workspace = state.workspace(&name).await;
+    ws.on_upgrade(move |socket| connected(socket, state, workspace))
+}
+
+async fn connected(mut socket: WebSocket, state: Arc<AppState>, workspace: Arc<Workspace>) {
     let id = state.new_page_id();
-    let pages = state.pages.fetch_add(1, Ordering::SeqCst) + 1;
-    tracing::info!(pages, "page connected");
+    let pages = workspace.pages.fetch_add(1, Ordering::SeqCst) + 1;
+    workspace.note_page_activity();
+    tracing::info!(pages, workspace = %workspace.name, "page connected");
 
     let settings = state.current_settings().await;
     let hello = serde_json::json!({
@@ -34,6 +62,7 @@ async fn connected(mut socket: WebSocket, state: Arc<AppState>) {
         "server": "rs-canvas",
         "version": env!("CARGO_PKG_VERSION"),
         "sync": state.sync,
+        "workspace": workspace.name,
         "settings": settings,
     })
     .to_string();
@@ -41,7 +70,7 @@ async fn connected(mut socket: WebSocket, state: Arc<AppState>) {
     // Hand the page the current mirror; it reconciles with its local
     // document, so an autosave and the server copy never clobber each other.
     let ready = if state.sync {
-        let snapshot = state.snapshot_frame().await;
+        let snapshot = workspace.snapshot_frame().await;
         socket.send(Message::Text(hello.into())).await.is_ok()
             && socket.send(Message::Text(snapshot.into())).await.is_ok()
     } else {
@@ -49,7 +78,7 @@ async fn connected(mut socket: WebSocket, state: Arc<AppState>) {
     };
 
     if ready {
-        let mut to_pages = state.to_pages.subscribe();
+        let mut to_pages = workspace.to_pages.subscribe();
         let mut page_sync = crate::state::PageSync::default();
         loop {
             tokio::select! {
@@ -66,7 +95,7 @@ async fn connected(mut socket: WebSocket, state: Arc<AppState>) {
                     Err(RecvError::Lagged(_)) => {
                         // Frames were dropped: only a full snapshot can repair
                         // the page, so send one now.
-                        let snapshot = state.snapshot_frame().await;
+                        let snapshot = workspace.snapshot_frame().await;
                         if socket.send(Message::Text(snapshot.into())).await.is_err() {
                             break;
                         }
@@ -80,7 +109,8 @@ async fn connected(mut socket: WebSocket, state: Arc<AppState>) {
                             continue;
                         }
                         if let Ok(frame) = serde_json::from_str::<Value>(&text) {
-                            handle_frame(&state, &mut page_sync, id, &frame).await;
+                            workspace.note_page_activity();
+                            handle_frame(&state, &workspace, &mut page_sync, id, &frame).await;
                         }
                     }
                     Some(Ok(_)) => {}
@@ -89,9 +119,10 @@ async fn connected(mut socket: WebSocket, state: Arc<AppState>) {
         }
     }
 
-    let remaining = state.pages.fetch_sub(1, Ordering::SeqCst) - 1;
-    state.release_when_idle(remaining).await;
-    tracing::info!(pages = remaining, "page disconnected");
+    workspace.pages.fetch_sub(1, Ordering::SeqCst);
+    state.release_workspace(&workspace).await;
+    let remaining = workspace.pages.load(Ordering::SeqCst);
+    tracing::info!(pages = remaining, workspace = %workspace.name, "page disconnected");
 }
 
 /// One incoming page frame. Patches merge per element; snapshots go through
@@ -99,6 +130,7 @@ async fn connected(mut socket: WebSocket, state: Arc<AppState>) {
 /// the page purged (undo of a creation).
 async fn handle_frame(
     state: &Arc<AppState>,
+    workspace: &Arc<Workspace>,
     page_sync: &mut crate::state::PageSync,
     id: u64,
     frame: &Value,
@@ -116,7 +148,7 @@ async fn handle_frame(
             // deletion expressible on the wire.
             let page_document = incoming.clone();
             page_sync.prepare(&mut incoming, now_ms());
-            state.absorb_document(&incoming).await;
+            workspace.absorb_document(&incoming).await;
             page_sync.commit(page_document);
         }
         Some("patch") => {
@@ -124,7 +156,7 @@ async fn handle_frame(
                 return;
             };
             if let Ok(elements) = serde_json::from_value::<Vec<Element>>(put.clone()) {
-                state.absorb_patch(elements, id).await;
+                workspace.absorb_patch(elements, id).await;
             }
         }
         Some("present_done") => {
@@ -133,7 +165,7 @@ async fn handle_frame(
                     .get("cancelled")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                let _ = state.present_acks.send((id, cancelled));
+                let _ = workspace.present_acks.send((id, cancelled));
             }
         }
         Some("screenshot_done") => {
@@ -142,12 +174,12 @@ async fn handle_frame(
                     .get("data_url")
                     .and_then(|v| v.as_str())
                     .map(str::to_string);
-                let _ = state.screenshot_replies.send((id, data_url));
+                let _ = workspace.screenshot_replies.send((id, data_url));
             }
         }
         Some("hint") => {
             if let Ok(hint) = serde_json::from_value::<crate::state::ViewHint>(frame.clone()) {
-                *state.view_hint.lock().await = Some(hint);
+                *workspace.view_hint.lock().await = Some(hint);
             }
         }
         Some("settings") => {

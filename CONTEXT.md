@@ -8,6 +8,10 @@ A browser drawing tool for freehand sketching and cloud-architecture diagrams, i
 One drawing: everything that sits on the canvas and gets saved to a file. The unit that autosaves locally, and that multiplayer will eventually sync.
 _Avoid_: Scene, board, drawing, canvas
 
+**Workspace**:
+A named, isolated drawing context: one document and the pages viewing it. The unit of isolation between concurrent users of the same server. The agent always works on the current workspace — the one the user's most recently active page is on, or `default`, the unnamed workspace, when no page is connected.
+_Avoid_: Board, room, project, canvas
+
 **Element**:
 A single object placed in a document: a shape, freehand stroke, text, arrow or frame.
 _Avoid_: Item, node, object
