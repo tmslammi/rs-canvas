@@ -259,6 +259,7 @@ struct ZoomArgs {
 /// ignores `canvas_status` still cannot take over the view.
 async fn deliver_view(
     state: &AppState,
+    workspace: &Workspace,
     mut message: serde_json::Value,
 ) -> Result<CallToolResult, McpError> {
     let action = message
@@ -281,7 +282,6 @@ async fn deliver_view(
         }
         message["zoom_cap"] = settings.zoom_cap().into();
     }
-    let workspace = state.current_workspace().await;
     let pages = workspace.pages.load(Ordering::SeqCst);
     if pages == 0 {
         return Ok(CallToolResult::error(vec![ContentBlock::text(
@@ -414,14 +414,17 @@ impl CanvasServer {
     /// Apply an edit to the workspace mirror. On success the change is
     /// recorded and broadcast as an element patch; on failure the document
     /// and the change log stay untouched. Returns the edit's own result.
-    async fn apply_edit<T, E>(
+    async fn apply_edit<T>(
         &self,
         workspace: &Workspace,
         source: &str,
-        run: impl FnOnce(&mut Document) -> Result<T, E>,
-    ) -> Result<T, E> {
+        run: impl FnOnce(&mut Document) -> Result<T, String>,
+    ) -> Result<T, String> {
         let (result, change) = {
             let mut doc = workspace.doc.lock().await;
+            if workspace.retired.load(Ordering::SeqCst) {
+                return Err("This workspace was renamed or deleted. Reconnect the page.".into());
+            }
             let before = doc.clone();
             let result = run(&mut doc);
             let change = if result.is_ok() {
@@ -915,9 +918,10 @@ impl CanvasServer {
         &self,
         Parameters(args): Parameters<FocusArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let workspace = self.current().await;
         let mut message = serde_json::json!({ "type": "view", "action": "focus" });
         if let Some(id) = args.id {
-            message["id"] = self.current().await.resolve_id(&id).await.into();
+            message["id"] = workspace.resolve_id(&id).await.into();
         }
         if let Some(pad) = args.pad {
             message["pad"] = pad.into();
@@ -925,7 +929,7 @@ impl CanvasServer {
         if let Some(animate) = args.animate {
             message["animate"] = animate.into();
         }
-        deliver_view(&self.state, message).await
+        deliver_view(&self.state, &workspace, message).await
     }
 
     #[tool(
@@ -936,13 +940,14 @@ impl CanvasServer {
         &self,
         Parameters(args): Parameters<PointArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let id = self.current().await.resolve_id(&args.id).await;
+        let workspace = self.current().await;
+        let id = workspace.resolve_id(&args.id).await;
         let message = serde_json::json!({
             "type": "view",
             "action": "point",
             "id": id,
         });
-        deliver_view(&self.state, message).await
+        deliver_view(&self.state, &workspace, message).await
     }
 
     #[tool(
@@ -959,12 +964,13 @@ impl CanvasServer {
                 args.mode
             ))]));
         }
+        let workspace = self.current().await;
         let message = serde_json::json!({
             "type": "view",
             "action": "zoom",
             "mode": args.mode,
         });
-        deliver_view(&self.state, message).await
+        deliver_view(&self.state, &workspace, message).await
     }
 }
 

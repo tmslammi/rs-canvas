@@ -50,10 +50,13 @@ pub async fn handler(
 
 async fn connected(mut socket: WebSocket, state: Arc<AppState>, workspace: Arc<Workspace>) {
     let id = state.new_page_id();
-    let pages = workspace.pages.fetch_add(1, Ordering::SeqCst) + 1;
-    workspace.note_page_activity();
+    if !state.register_page(&workspace).await {
+        return;
+    }
+    let pages = workspace.pages.load(Ordering::SeqCst);
     tracing::info!(pages, workspace = %workspace.name, "page connected");
 
+    let mut to_pages = workspace.to_pages.subscribe();
     let settings = state.current_settings().await;
     let hello = serde_json::json!({
         "type": "hello",
@@ -76,7 +79,6 @@ async fn connected(mut socket: WebSocket, state: Arc<AppState>, workspace: Arc<W
     };
 
     if ready {
-        let mut to_pages = workspace.to_pages.subscribe();
         let mut page_sync = crate::state::PageSync::default();
         loop {
             tokio::select! {
@@ -106,6 +108,7 @@ async fn connected(mut socket: WebSocket, state: Arc<AppState>, workspace: Arc<W
                         if !state.sync {
                             continue;
                         }
+                        if workspace.retired.load(Ordering::SeqCst) { break; }
                         if let Ok(frame) = serde_json::from_str::<Value>(&text) {
                             workspace.note_page_activity();
                             handle_frame(&state, &workspace, &mut page_sync, id, &frame).await;

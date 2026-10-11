@@ -82,6 +82,53 @@ pub async fn load_document(workspace: &str) -> Result<Option<String>, String> {
     Ok(json.as_string())
 }
 
+/// Discover autosaves written before the browser catalogue existed.
+pub async fn list_workspaces() -> Result<Vec<String>, String> {
+    let db = open().await?;
+    let transaction = db
+        .transaction(&[STORE], TransactionMode::ReadOnly)
+        .map_err(error_string)?;
+    let store = transaction.object_store(STORE).map_err(error_string)?;
+    let keys = store
+        .get_all_keys(None, None)
+        .map_err(error_string)?
+        .await
+        .map_err(error_string)?;
+    Ok(keys
+        .into_iter()
+        .filter_map(|key| key.as_string())
+        .filter_map(|key| workspace_from_key(&key))
+        .collect())
+}
+
+fn workspace_from_key(key: &str) -> Option<String> {
+    if key == KEY {
+        Some("default".into())
+    } else {
+        key.strip_prefix(&format!("{KEY}:workspace:"))
+            .map(str::to_string)
+    }
+}
+
+pub async fn delete_workspace(workspace: &str) -> Result<(), String> {
+    let db = open().await?;
+    let transaction = db
+        .transaction(&[STORE], TransactionMode::ReadWrite)
+        .map_err(error_string)?;
+    let store = transaction.object_store(STORE).map_err(error_string)?;
+    store
+        .delete(Query::Key(JsValue::from_str(&autosave_key(workspace))))
+        .map_err(error_string)?
+        .await
+        .map_err(error_string)?;
+    transaction
+        .commit()
+        .map_err(error_string)?
+        .await
+        .map_err(error_string)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

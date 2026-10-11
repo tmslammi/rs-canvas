@@ -11,6 +11,7 @@ mod render;
 mod script;
 mod state;
 mod verbs;
+mod workspace_api;
 mod ws;
 
 use std::path::PathBuf;
@@ -18,7 +19,7 @@ use std::sync::Arc;
 
 use axum::extract::State;
 use axum::http::{header, HeaderValue};
-use axum::routing::get;
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
@@ -104,6 +105,8 @@ async fn main() {
     let app = Router::new()
         .route("/ws", get(ws::handler))
         .route("/api/workspaces", get(workspaces))
+        .route("/api/workspaces/{name}/rename", post(workspace_api::rename))
+        .route("/api/workspaces/{name}", delete(workspace_api::delete))
         .nest_service("/mcp", mcp_service)
         .fallback_service(ServeDir::new(&args.web))
         .layer(no_store)

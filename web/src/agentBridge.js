@@ -16,6 +16,7 @@ export function connectAgentBridge(editor, hooks = {}) {
   let retry = RETRY_MIN_MS;
   let pumping = false;
   let socket = null;
+  let stopped = false;
   // Servers can disable document sync (plain static serving for tests); the
   // hello frame says so before any snapshot is sent.
   let syncEnabled = true;
@@ -83,6 +84,10 @@ export function connectAgentBridge(editor, hooks = {}) {
   };
 
   const handle = (message) => {
+    if (message.type === "workspace_changed") {
+      void hooks.onWorkspaceChange?.(message);
+      return;
+    }
     if (message.type === "hello") {
       syncEnabled = message.sync !== false;
       if (message.settings) {
@@ -153,6 +158,7 @@ export function connectAgentBridge(editor, hooks = {}) {
   };
 
   const connect = () => {
+    if (stopped) return;
     const scheme = location.protocol === "https:" ? "wss" : "ws";
     const workspace = hooks.workspace || "default";
     socket = new WebSocket(`${scheme}://${location.host}/ws?ws=${encodeURIComponent(workspace)}`);
@@ -176,7 +182,7 @@ export function connectAgentBridge(editor, hooks = {}) {
     // An error is always followed by a close, which drives the retry.
     socket.addEventListener("close", () => {
       window.__rsAgentConnected = false;
-      window.setTimeout(connect, retry);
+      if (!stopped) window.setTimeout(connect, retry);
       retry = Math.min(retry * 2, RETRY_MAX_MS);
     });
   };
@@ -201,5 +207,10 @@ export function connectAgentBridge(editor, hooks = {}) {
     }
   };
 
-  return { publishDocument, publishChanges, patchSettings };
+  const close = () => {
+    stopped = true;
+    window.__rsAgentConnected = false;
+    socket?.close();
+  };
+  return { publishDocument, publishChanges, patchSettings, close };
 }

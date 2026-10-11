@@ -24,6 +24,8 @@ use crate::aliases::Aliases;
 const CHANGE_LOG_LIMIT: usize = 200;
 
 /// How long a burst of edits coalesces before the mirror is written to disk.
+static PAGE_ACTIVITY: AtomicU64 = AtomicU64::new(0);
+
 const PERSIST_DEBOUNCE: Duration = Duration::from_millis(500);
 
 /// The unnamed workspace: where `--doc` points and where agent calls land
@@ -214,6 +216,8 @@ pub struct Workspace {
     pub to_pages: broadcast::Sender<PageMessage>,
     /// A persist is queued; bursts coalesce into one write.
     persist_pending: AtomicBool,
+    persist_write: Mutex<()>,
+    pub retired: AtomicBool,
     /// Wakes the persist loop.
     persist_notify: Notify,
     /// Page acknowledgements of a finished presentation: (id, cancelled).
@@ -236,8 +240,8 @@ pub struct Workspace {
     pub view_hint: Mutex<Option<ViewHint>>,
     /// Short handles for element ids, as the agent sees them.
     pub aliases: Mutex<Aliases>,
-    /// Last time a page on this workspace said anything; drives
-    /// current-workspace resolution.
+    /// Monotonic order of the most recent page activity; drives
+    /// current-workspace resolution without clock ties or clock changes.
     last_activity: AtomicU64,
 }
 
@@ -253,6 +257,8 @@ impl Workspace {
             pages: AtomicUsize::new(0),
             to_pages,
             persist_pending: AtomicBool::new(false),
+            persist_write: Mutex::new(()),
+            retired: AtomicBool::new(false),
             persist_notify: Notify::new(),
             present_acks,
             present_counter: AtomicU64::new(0),
@@ -270,7 +276,8 @@ impl Workspace {
 
     /// A page on this workspace did something; it may now be the current one.
     pub fn note_page_activity(&self) {
-        self.last_activity.store(now_ms(), Ordering::SeqCst);
+        let activity = PAGE_ACTIVITY.fetch_add(1, Ordering::SeqCst) + 1;
+        self.last_activity.fetch_max(activity, Ordering::SeqCst);
     }
 
     /// Load the persisted mirror, if any. Called once when the workspace is
@@ -517,6 +524,9 @@ impl Workspace {
     pub async fn persist_loop(self: Arc<Self>) {
         loop {
             self.persist_notify.notified().await;
+            if self.retired.load(Ordering::SeqCst) {
+                break;
+            }
             tokio::time::sleep(PERSIST_DEBOUNCE).await;
             if self.persist_pending.swap(false, Ordering::SeqCst) {
                 self.persist_document().await;
@@ -554,6 +564,10 @@ impl Workspace {
 
     /// Write the mirror to disk atomically; a no-op without a path.
     pub async fn persist_document(&self) {
+        let _write = self.persist_write.lock().await;
+        if self.retired.load(Ordering::SeqCst) {
+            return;
+        }
         let Some(path) = &self.doc_path else {
             return;
         };
@@ -577,6 +591,14 @@ pub struct WorkspaceInfo {
     pub persisted: bool,
 }
 
+#[derive(Debug)]
+pub enum WorkspaceManagementError {
+    Invalid(String),
+    Conflict(String),
+    NotFound,
+    Io(std::io::Error),
+}
+
 pub struct AppState {
     /// When the server started; reported by `canvas_status`.
     pub started: Instant,
@@ -585,8 +607,8 @@ pub struct AppState {
     /// Whether pages exchange documents with the mirror. Tests that only
     /// serve the app turn this off; the agent always runs with it on.
     pub sync: bool,
-    /// Live workspaces by name. Entries are never removed; an in-memory
-    /// workspace's mirror is cleared when its last page leaves instead.
+    /// Live workspaces by name. Idle in-memory entries retain their names;
+    /// rename and delete remove retired entries after notifying their pages.
     workspaces: std::sync::Mutex<HashMap<String, Arc<Workspace>>>,
     /// Where the default workspace's mirror persists (the `--doc` argument).
     default_doc_path: Option<PathBuf>,
@@ -594,6 +616,7 @@ pub struct AppState {
     workspaces_dir: Option<PathBuf>,
     /// Connection ids, so a patch broadcast can skip its origin page.
     next_page: AtomicU64,
+    workspace_management: Mutex<()>,
     /// The user's live agent preferences (global: they govern the agent,
     /// not any one drawing).
     pub settings: Mutex<AgentSettings>,
@@ -617,6 +640,7 @@ impl AppState {
             default_doc_path: doc_path,
             workspaces_dir,
             next_page: AtomicU64::new(0),
+            workspace_management: Mutex::new(()),
             settings: Mutex::new(AgentSettings::default()),
             settings_path,
         }
@@ -638,6 +662,14 @@ impl AppState {
         if let Some(ws) = self.workspaces.lock().unwrap().get(name) {
             return ws.clone();
         }
+        let _management = self.workspace_management.lock().await;
+        self.workspace_unlocked(name).await
+    }
+
+    async fn workspace_unlocked(&self, name: &str) -> Arc<Workspace> {
+        if let Some(ws) = self.workspaces.lock().unwrap().get(name) {
+            return ws.clone();
+        }
         let created = Arc::new(self.build_workspace(name));
         created.load_document().await;
         let mut map = self.workspaces.lock().unwrap();
@@ -650,6 +682,123 @@ impl AppState {
                 ws
             })
             .clone()
+    }
+
+    /// Serialize connection admission with workspace management so a tab
+    /// cannot join a document while it is being renamed or deleted.
+    pub async fn register_page(&self, workspace: &Workspace) -> bool {
+        let _management = self.workspace_management.lock().await;
+        if workspace.retired.load(Ordering::SeqCst) {
+            return false;
+        }
+        workspace.pages.fetch_add(1, Ordering::SeqCst);
+        workspace.note_page_activity();
+        true
+    }
+
+    pub async fn manage_workspace(
+        &self,
+        name: &str,
+        renamed: Option<&str>,
+        incoming: Option<Document>,
+    ) -> Result<(), WorkspaceManagementError> {
+        use WorkspaceManagementError::*;
+        if !valid_workspace_name(name) || renamed.is_some_and(|name| !valid_workspace_name(name)) {
+            return Err(Invalid(
+                "Use 1–40 lowercase letters, digits or dashes, starting with a letter or digit."
+                    .into(),
+            ));
+        }
+        if name == DEFAULT_WORKSPACE {
+            return Err(Invalid(
+                "The default workspace cannot be renamed or deleted.".into(),
+            ));
+        }
+        if renamed == Some(name) {
+            return Ok(());
+        }
+        if renamed == Some(DEFAULT_WORKSPACE) {
+            return Err(Conflict("The default workspace already exists.".into()));
+        }
+        let _management = self.workspace_management.lock().await;
+        if let Some(new_name) = renamed {
+            let destination = self.build_workspace(new_name);
+            if self.workspaces.lock().unwrap().contains_key(new_name)
+                || match &destination.doc_path {
+                    Some(path) => tokio::fs::try_exists(path).await.map_err(Io)?,
+                    None => false,
+                }
+            {
+                return Err(Conflict(
+                    "That workspace already exists. Choose another name.".into(),
+                ));
+            }
+        }
+        let stored = self.workspaces.lock().unwrap().contains_key(name);
+        let path = self.build_workspace(name).doc_path;
+        if !stored
+            && incoming.is_none()
+            && !match &path {
+                Some(path) => tokio::fs::try_exists(path).await.map_err(Io)?,
+                None => false,
+            }
+        {
+            return Err(NotFound);
+        }
+        let source = self.workspace_unlocked(name).await;
+        if source.pages.load(Ordering::SeqCst) > 1 {
+            return Err(Conflict(
+                "This workspace is open in another tab. Close or switch those tabs first.".into(),
+            ));
+        }
+        let _write = source.persist_write.lock().await;
+        let mut doc = source.doc.lock().await;
+        let merged = incoming
+            .as_ref()
+            .map(|incoming| canvas_core::merge::reconcile(&doc, incoming))
+            .unwrap_or_else(|| doc.clone());
+        if let Some(new_name) = renamed {
+            let destination = Arc::new(self.build_workspace(new_name));
+            if let Some(path) = &destination.doc_path {
+                let json =
+                    serialization::to_json(&merged).map_err(|error| Invalid(error.to_string()))?;
+                write_atomic(path, &json).await.map_err(Io)?;
+            }
+            // Remove the old file only once the new document is durable.
+            if let Some(path) = &source.doc_path {
+                match tokio::fs::remove_file(path).await {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        if let Some(path) = &destination.doc_path {
+                            let _ = tokio::fs::remove_file(path).await;
+                        }
+                        return Err(Io(error));
+                    }
+                }
+            }
+            *destination.doc.lock().await = merged;
+            self.workspaces
+                .lock()
+                .unwrap()
+                .insert(new_name.into(), destination.clone());
+            tokio::spawn(destination.persist_loop());
+        } else if let Some(path) = &source.doc_path {
+            match tokio::fs::remove_file(path).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(Io(error)),
+            }
+        }
+        source.retired.store(true, Ordering::SeqCst);
+        *doc = Document::new();
+        source.persist_notify.notify_one();
+        let _ = source.to_pages.send(PageMessage::all(serde_json::json!({
+            "type": "workspace_changed", "action": if renamed.is_some() { "rename" } else { "delete" },
+            "workspace": renamed.unwrap_or(DEFAULT_WORKSPACE),
+        }).to_string()));
+        self.workspaces.lock().unwrap().remove(name);
+        Ok(())
     }
 
     /// The workspace agent calls act on: the one the user's most recently
@@ -728,6 +877,8 @@ impl AppState {
     /// A page left `workspace`: drop its in-memory mirror when nothing is
     /// watching, and reset ephemeral settings when the server goes idle.
     pub async fn release_workspace(&self, workspace: &Workspace) {
+        // Admission must not race a queued cleanup using an old zero-page count.
+        let _management = self.workspace_management.lock().await;
         workspace
             .release_when_idle(workspace.pages.load(Ordering::SeqCst))
             .await;
@@ -925,6 +1076,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn renaming_preserves_the_document_and_retires_old_connections() {
+        let dir = std::env::temp_dir().join(format!(
+            "rs-workspace-rename-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let state = AppState::new(PathBuf::from("."), Some(dir.join("current.json")), true);
+        let old = state.workspace("alpha").await;
+        add_shape(&mut *old.doc.lock().await, 42.0, 1);
+        old.persist_document().await;
+        let before = old.doc.lock().await.clone();
+        let mut messages = old.to_pages.subscribe();
+        assert!(state.register_page(&old).await);
+        state
+            .manage_workspace("alpha", Some("beta"), None)
+            .await
+            .unwrap();
+        assert!(
+            !state.register_page(&old).await,
+            "retired connections cannot rejoin"
+        );
+        let frame: serde_json::Value =
+            serde_json::from_str(&messages.recv().await.unwrap().text).unwrap();
+        assert_eq!(frame["action"], "rename");
+        assert_eq!(frame["workspace"], "beta");
+        old.persist_document().await;
+        assert!(
+            !dir.join("workspaces/alpha.json").exists(),
+            "a late persist cannot recreate the old file"
+        );
+        let restarted = AppState::new(PathBuf::from("."), Some(dir.join("current.json")), true);
+        assert_eq!(*restarted.workspace("beta").await.doc.lock().await, before);
+        assert!(!restarted
+            .list_workspaces()
+            .await
+            .iter()
+            .any(|info| info.name == "alpha"));
+        let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+
+    #[tokio::test]
+    async fn workspace_management_preserves_existing_destinations_and_other_tabs() {
+        let state = AppState::new(PathBuf::from("."), None, true);
+        let alpha = state.workspace("alpha").await;
+        let beta = state.workspace("beta").await;
+        add_shape(&mut *alpha.doc.lock().await, 1.0, 1);
+        add_shape(&mut *beta.doc.lock().await, 2.0, 1);
+        let before_alpha = alpha.doc.lock().await.clone();
+        let before_beta = beta.doc.lock().await.clone();
+        assert!(matches!(
+            state.manage_workspace("alpha", Some("beta"), None).await,
+            Err(WorkspaceManagementError::Conflict(_))
+        ));
+        alpha.pages.store(2, Ordering::SeqCst);
+        for renamed in [None, Some("gamma")] {
+            assert!(matches!(
+                state.manage_workspace("alpha", renamed, None).await,
+                Err(WorkspaceManagementError::Conflict(_))
+            ));
+        }
+        assert_eq!(*alpha.doc.lock().await, before_alpha);
+        assert_eq!(*beta.doc.lock().await, before_beta);
+        assert!(!alpha.retired.load(Ordering::SeqCst));
+        assert!(matches!(
+            state.manage_workspace("default", None, None).await,
+            Err(WorkspaceManagementError::Invalid(_))
+        ));
+        assert!(matches!(
+            state.manage_workspace("alpha", Some("../oops"), None).await,
+            Err(WorkspaceManagementError::Invalid(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn deleting_a_persisted_only_workspace_survives_restart() {
+        let dir = std::env::temp_dir().join(format!(
+            "rs-workspace-delete-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let initial = AppState::new(PathBuf::from("."), Some(dir.join("current.json")), true);
+        let old = initial.workspace("alpha").await;
+        add_shape(&mut *old.doc.lock().await, 4.0, 1);
+        old.persist_document().await;
+        let state = AppState::new(PathBuf::from("."), Some(dir.join("current.json")), true);
+        assert!(state
+            .list_workspaces()
+            .await
+            .iter()
+            .any(|info| info.name == "alpha"));
+        state.manage_workspace("alpha", None, None).await.unwrap();
+        assert!(!dir.join("workspaces/alpha.json").exists());
+        assert!(!state
+            .list_workspaces()
+            .await
+            .iter()
+            .any(|info| info.name == "alpha"));
+        assert!(matches!(
+            state.manage_workspace("alpha", None, None).await,
+            Err(WorkspaceManagementError::NotFound)
+        ));
+        let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+
+    #[tokio::test]
+    async fn rapid_page_activity_has_a_strict_order() {
+        let state = AppState::new(PathBuf::from("."), None, true);
+        let alpha = state.workspace("alpha").await;
+        let beta = state.workspace("beta").await;
+        alpha.pages.store(1, Ordering::SeqCst);
+        beta.pages.store(1, Ordering::SeqCst);
+        for _ in 0..100 {
+            alpha.note_page_activity();
+            let first = alpha.last_activity.load(Ordering::SeqCst);
+            beta.note_page_activity();
+            assert!(
+                beta.last_activity.load(Ordering::SeqCst) > first,
+                "rapid activity must not tie at millisecond precision"
+            );
+            assert_eq!(state.current_workspace().await.name, "beta");
+            alpha.note_page_activity();
+            assert_eq!(state.current_workspace().await.name, "alpha");
+        }
+    }
+
+    #[tokio::test]
     async fn current_workspace_follows_the_active_page() {
         let state = AppState::new(PathBuf::from("."), None, true);
         // No pages anywhere: the default workspace, even though it has none.
@@ -968,6 +1245,30 @@ mod tests {
             .map(|info| info.name.clone())
             .collect();
         assert!(names.contains(&"alpha".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_new_page_cannot_join_halfway_through_idle_cleanup() {
+        let state = Arc::new(AppState::new(PathBuf::from("."), None, true));
+        let workspace = state.workspace(DEFAULT_WORKSPACE).await;
+        let mut doc = workspace.doc.lock().await;
+        add_shape(&mut doc, 1.0, 1);
+        let releasing = state.clone();
+        let old = workspace.clone();
+        let cleanup = tokio::spawn(async move {
+            releasing.release_workspace(&old).await;
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), state.register_page(&workspace))
+                .await
+                .is_err(),
+            "admission must wait for the old document cleanup to complete"
+        );
+        drop(doc);
+        cleanup.await.unwrap();
+        assert_eq!(workspace.doc.lock().await.live_count(), 0);
+        assert!(state.register_page(&workspace).await);
     }
 
     #[tokio::test]

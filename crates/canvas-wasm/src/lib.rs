@@ -1927,6 +1927,30 @@ pub async fn load_saved_json(workspace: Option<String>) -> Option<String> {
         .flatten()
 }
 
+/// Names of workspace autosaves in this browser.
+#[wasm_bindgen]
+pub async fn list_saved_workspaces() -> String {
+    serde_json::to_string(&storage::list_workspaces().await.unwrap_or_default())
+        .unwrap_or_else(|_| "[]".into())
+}
+
+/// Await a save before leaving or managing a workspace.
+#[wasm_bindgen]
+pub async fn save_workspace_json(workspace: String, json: String) -> Result<(), JsValue> {
+    canvas_core::serialization::from_json(&json)
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    storage::save_document(&json, &workspace)
+        .await
+        .map_err(|error| JsValue::from_str(&error))
+}
+
+#[wasm_bindgen]
+pub async fn delete_saved_workspace(workspace: String) -> Result<(), JsValue> {
+    storage::delete_workspace(&workspace)
+        .await
+        .map_err(|error| JsValue::from_str(&error))
+}
+
 /// The shape-library catalog (JSON) for the panel.
 #[wasm_bindgen]
 pub fn glyph_catalog() -> String {

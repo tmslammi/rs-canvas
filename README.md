@@ -31,6 +31,34 @@ agent's MCP endpoint at `http://127.0.0.1:5173/mcp`. The project's
 `opencode.jsonc` points opencode at that endpoint; start the dev command before
 using the canvas tools. The server binds to localhost only.
 
+## Workspaces
+
+The **Workspace: name** button at the bottom left identifies the document in
+this tab. Open it to create an empty workspace, switch to an existing one,
+or duplicate the current drawing. Workspaces listed there include this
+browser's saved drawings and the server's live and persisted documents.
+Named workspaces use `?ws=name`; the default workspace keeps the original
+URL and autosave. Names use 1–40 lowercase letters, digits or dashes,
+starting with a letter or digit.
+
+Switching commits text edits, cancels unfinished pointer gestures and waits
+for the outgoing drawing to save. Each workspace keeps a separate drawing
+and autosave; multiple tabs on the same workspace share document changes.
+The agent follows the most recently active tab, and falls back to default
+when no page is connected. Agent settings remain shared across workspaces.
+
+The picker also renames and permanently deletes named workspaces. Rename
+preserves the drawing and rejects existing names; delete requires typing the
+workspace name. Both require an available server and ask you to close or
+switch any other tabs viewing that workspace first. Default cannot be
+renamed or deleted. Creating, switching and reopening browser saves remain
+available without the server.
+
+With the development server, named documents persist under
+`.rs-canvas/workspaces/` beside `.rs-canvas/current.json`. When starting the
+server manually, pass `--doc /path/to/current.json` to enable server
+persistence; without it, browser autosaves provide persistence.
+
 ## Agent (MCP)
 
 With `npm run dev` running, opencode can draw, explain and look at the canvas:

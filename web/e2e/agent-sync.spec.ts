@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type BrowserContext, type Page } from "@playwright/test";
 import { elementCount, mcpClient, toolJson } from "./mcp-client";
 
 // Document sync: the page and the server keep one drawing through the
@@ -12,6 +12,31 @@ import { elementCount, mcpClient, toolJson } from "./mcp-client";
 test.describe.configure({ mode: "serial" });
 
 const BASE = "http://localhost:4175";
+const contextsWithPages = new WeakSet<BrowserContext>();
+
+test.beforeEach(async ({ context }) => {
+  if (context.pages().length) contextsWithPages.add(context);
+  context.on("page", () => contextsWithPages.add(context));
+});
+
+test.afterEach(async ({ context, request }) => {
+  // Browser fixture teardown is asynchronous with the server's WebSocket
+  // cleanup. Wait for every page to leave before the next exact-count test
+  // opens the same default workspace; overlapping real tabs must retain it.
+  await Promise.all(context.pages().map((page) => page.close()));
+  const mcp = mcpClient(request, BASE);
+  await expect.poll(async () => {
+    const status = JSON.parse(await mcp.text("canvas_status", {}));
+    const workspaces = status.workspaces as { pages: number; elements?: number }[];
+    return {
+      pages: workspaces.reduce((total, workspace) => total + workspace.pages, 0),
+      // A request-only test may deliberately leave a headless drawing. Tabs
+      // on this ephemeral server must finish clearing their mirrors instead.
+      elements: contextsWithPages.has(context)
+        ? workspaces.reduce((total, workspace) => total + (workspace.elements ?? 0), 0) : 0,
+    };
+  }).toEqual({ pages: 0, elements: 0 });
+});
 
 async function openPage(page: Page) {
   await page.goto(`${BASE}/`);

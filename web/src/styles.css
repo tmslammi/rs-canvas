@@ -288,3 +288,64 @@ body {
 #toast.error {
   border-color: var(--danger);
 }
+
+/* Workspace identity stays visible independently of the drawing toolbar. */
+#workspace-control {
+  position: absolute;
+  bottom: max(12px, env(safe-area-inset-bottom));
+  left: 12px;
+  z-index: 20;
+  max-width: calc(100vw - 24px);
+  font-size: 12px;
+}
+#workspace-control button,
+#workspace-control input {
+  box-sizing: border-box;
+  min-height: 40px;
+  border: 1px solid var(--chrome-border);
+  border-radius: 4px;
+  padding: 8px 10px;
+  background: var(--chrome-raised);
+  color: var(--chrome-text);
+  font: inherit;
+}
+#workspace-control button { cursor: pointer; }
+#workspace-control button:hover { border-color: var(--accent); }
+#workspace-control button:disabled { opacity: .5; cursor: default; }
+#workspace-control :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+#workspace-button {
+  max-width: min(360px, calc(100vw - 24px));
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+#workspace-picker {
+  box-sizing: border-box;
+  width: min(360px, calc(100vw - 24px));
+  max-height: calc(100dvh - 84px);
+  margin-bottom: 8px;
+  padding: 12px;
+  overflow-y: auto;
+  background: var(--chrome);
+  border: 1px solid var(--chrome-border);
+  border-radius: 6px;
+  box-shadow: 3px 3px 0 rgba(0,0,0,.5);
+}
+#workspace-picker[hidden], #workspace-picker [hidden] { display: none; }
+.workspace-header, .workspace-actions { display: flex; align-items: center; gap: 8px; }
+.workspace-header { justify-content: space-between; }
+.workspace-header h2 { margin: 0; font-size: 15px; }
+.workspace-list { display: grid; gap: 6px; margin: 12px 0; }
+.workspace-list button { text-align: left; overflow-wrap: anywhere; }
+.workspace-list button.current { border-color: var(--accent) !important; background: var(--accent-soft) !important; }
+#workspace-picker form { display: grid; gap: 8px; }
+#workspace-picker input { width: 100%; }
+#workspace-picker p { font-size: 11px; line-height: 1.5; color: var(--chrome-muted); }
+#workspace-picker #workspace-error { color: #ff8787; }
+#workspace-picker #workspace-error:empty { display: none; }
+.workspace-actions { flex-wrap: wrap; }
+.workspace-actions button { flex: 1; }
+.workspace-management { margin-top: 16px; border-top: 1px solid var(--chrome-border); padding-top: 8px; }
+.workspace-management h3 { font-size: 12px; overflow-wrap: anywhere; }
+.workspace-management > button { width: 100%; margin-top: 8px; }
+#workspace-control button.danger { border-color: var(--danger); color: #ff8787; }
