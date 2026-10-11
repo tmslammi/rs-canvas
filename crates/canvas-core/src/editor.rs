@@ -1210,13 +1210,17 @@ impl Editor {
                 let hits: Vec<ElementId> = elements_in_rect(&self.doc, rect)
                     .into_iter()
                     .map(|id| crate::hit::resolve_container(&self.doc, &id))
-                    // Frames are picked by their border or name, never by a
-                    // marquee: dragging inside a frame selects its contents.
+                    // A marquee inside a frame selects its contents; enclosing
+                    // the whole frame selects the container too.
                     .filter(|id| {
-                        !self
-                            .doc
-                            .element(id)
-                            .is_some_and(|element| element.is_frame())
+                        self.doc.element(id).is_none_or(|element| {
+                            if !element.is_frame() {
+                                return true;
+                            }
+                            let bounds = element.bounds();
+                            rect.contains(Point::new(bounds.min_x(), bounds.min_y()))
+                                && rect.contains(Point::new(bounds.max_x(), bounds.max_y()))
+                        })
                     })
                     .collect();
                 let mut hits = hits;
@@ -5692,6 +5696,31 @@ mod tests {
             (bounds.center().x - shape_bounds.center().x).abs() < 1.0,
             "the label is centred in the shape"
         );
+    }
+
+    #[test]
+    fn marquee_enclosing_an_empty_frame_selects_the_frame() {
+        for (start, end) in [
+            (Point::new(-20.0, -20.0), Point::new(420.0, 320.0)),
+            (Point::new(420.0, 320.0), Point::new(-20.0, -20.0)),
+        ] {
+            let mut e = editor();
+            let mods = Modifiers::default();
+            press(&mut e, "f", mods, 1);
+            e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
+            e.pointer_move(Point::new(400.0, 300.0), mods, 3);
+            e.pointer_up(Point::new(400.0, 300.0), mods, 4);
+            let frame_id = e.doc.ordered_live()[0].id.clone();
+            press(&mut e, "v", mods, 5);
+            e.clear_selection();
+            e.pointer_down(start, 0, mods, 6);
+            e.pointer_move(end, mods, 7);
+            e.pointer_up(end, mods, 8);
+            assert!(
+                e.selection.contains(&frame_id),
+                "a selection rectangle enclosing a frame must select it"
+            );
+        }
     }
 
     #[test]
