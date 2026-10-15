@@ -1,0 +1,10 @@
+# Project-scoped canvas integration; inherits the user's model and approval settings.
+[mcp_servers.canvas]
+url = "http://127.0.0.1:5173/mcp"
+startup_timeout_sec = 30
+tool_timeout_sec = 120
+enabled_tools = ["canvas_status", "canvas_read", "canvas_screenshot", "canvas_focus", "canvas_point", "canvas_zoom", "canvas_glyphs"]
+
+[agents.canvas]
+description = "Drawing hand for rs-canvas engineering discussions: creates, revises, arranges, reverts experiments and saves discussion notes. Delegate every document change to this agent."
+config_file = "agents/canvas.toml"

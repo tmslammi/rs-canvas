@@ -2,6 +2,7 @@ declare global {
   interface Window {
     __rsReady?: boolean;
     __rsAgentConnected?: boolean;
+    __rsWorkspace?: string;
     __rsEditor?: {
       scroll(): Float64Array;
       zoom(): number;

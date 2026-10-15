@@ -10,6 +10,7 @@ pub mod delta;
 pub mod demo;
 pub mod describe;
 pub mod display;
+pub mod edit;
 pub mod editor;
 pub mod geometry;
 pub mod glyphs;

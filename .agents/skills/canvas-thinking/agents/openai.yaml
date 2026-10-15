@@ -1,0 +1,5 @@
+interface:
+  display_name: "Canvas thinking partner"
+  short_description: "Explore engineering ideas on the shared canvas"
+policy:
+  allow_implicit_invocation: true

@@ -30,6 +30,9 @@ pub struct ScriptBeat {
     /// Connect two handles (or existing element ids).
     #[serde(default)]
     pub connect: Option<ConnectBeat>,
+    /// Revise an existing element without replacing its identity.
+    #[serde(default)]
+    pub update: Option<UpdateBeat>,
     /// Put a cross, check or question mark on a handle or id.
     #[serde(default)]
     pub annotate: Option<AnnotateBeat>,
@@ -100,6 +103,9 @@ pub struct DrawBeat {
     /// Draw this container around these handles or ids.
     #[serde(default)]
     pub around: Option<Vec<String>>,
+    /// Frame that owns the new element (handle or id).
+    #[serde(default)]
+    pub frame: Option<String>,
     #[serde(default)]
     pub x: Option<f64>,
     #[serde(default)]
@@ -108,6 +114,104 @@ pub struct DrawBeat {
     pub w: Option<f64>,
     #[serde(default)]
     pub h: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateBeat {
+    pub id: String,
+    /// New label, caption, connector label, frame name or text; empty clears it.
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub x: Option<f64>,
+    #[serde(default)]
+    pub y: Option<f64>,
+    /// Width/height >= 8 world px; frames resize without scaling children.
+    #[serde(default)]
+    pub w: Option<f64>,
+    #[serde(default)]
+    pub h: Option<f64>,
+    /// Assign to a frame; leaves world coordinates unchanged.
+    #[serde(default)]
+    pub frame: Option<String>,
+    /// Leave the current frame. Mutually exclusive with frame.
+    #[serde(default)]
+    pub detach: bool,
+    /// Rebind a connector's source/target to an element.
+    #[serde(default)]
+    pub from: Option<String>,
+    #[serde(default)]
+    pub to: Option<String>,
+    #[serde(default)]
+    pub style: Option<UpdateStyle>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateStyle {
+    #[serde(default)]
+    pub stroke_color: Option<String>,
+    #[serde(default)]
+    pub fill_color: Option<String>,
+    /// Clamped to 0.5..64, matching interactive editing.
+    #[serde(default)]
+    pub stroke_width: Option<f64>,
+    /// Clamped to 0..2.
+    #[serde(default)]
+    pub roughness: Option<u8>,
+    /// Clamped to 0.05..1.
+    #[serde(default)]
+    pub opacity: Option<f64>,
+    /// Clamped to 8..96; reflows owned text.
+    #[serde(default)]
+    pub font_size: Option<f64>,
+}
+
+impl UpdateBeat {
+    fn apply(
+        &self,
+        doc: &mut Document,
+        handles: &HashMap<String, ElementId>,
+        now: u64,
+    ) -> Result<(), String> {
+        if self.detach && self.frame.is_some() {
+            return Err("frame and detach are mutually exclusive".into());
+        }
+        let id = resolve(handles, doc, &self.id)?;
+        let reference = |value: &Option<String>| {
+            value
+                .as_deref()
+                .map(|id| resolve(handles, doc, id))
+                .transpose()
+        };
+        let frame = reference(&self.frame)?;
+        let update = canvas_core::edit::ElementUpdate {
+            x: self.x,
+            y: self.y,
+            w: self.w,
+            h: self.h,
+            text: self.text.clone(),
+            from: reference(&self.from)?,
+            to: reference(&self.to)?,
+            frame: if self.detach {
+                Some(None)
+            } else {
+                frame.map(Some)
+            },
+            style: self.style.as_ref().map(|style| canvas_core::StylePatch {
+                stroke_color: style.stroke_color.clone(),
+                fill_color: style.fill_color.clone(),
+                stroke_width: style.stroke_width,
+                roughness: style.roughness,
+                opacity: style.opacity,
+                font_size: style.font_size,
+                ..Default::default()
+            }),
+        };
+        canvas_core::edit::update_element(doc, &id, &update, now)?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
@@ -196,6 +300,7 @@ pub fn execute(
         let actions = [
             beat.draw.is_some(),
             beat.connect.is_some(),
+            beat.update.is_some(),
             beat.annotate.is_some(),
             beat.emphasis.is_some(),
             beat.tidy.is_some(),
@@ -208,7 +313,9 @@ pub fn execute(
             return Err(fail("one action per beat".into()));
         }
 
-        if let Some(connect) = &beat.connect {
+        if let Some(update) = &beat.update {
+            update.apply(&mut working, &handles, now_ms).map_err(fail)?;
+        } else if let Some(connect) = &beat.connect {
             let (id, label_id) =
                 run_connect(&mut working, &handles, connect, now_ms).map_err(fail)?;
             created.push((format!("connect{position}"), id.clone()));
@@ -247,6 +354,14 @@ pub fn execute(
             crate::verbs::clear(&mut working, &targets, now_ms).map_err(fail)?;
         } else if let Some(draw) = &beat.draw {
             if let Some(handle) = &draw.handle {
+                if handle.strip_prefix('e').is_some_and(|digits| {
+                    !digits.is_empty() && digits.bytes().all(|c| c.is_ascii_digit())
+                }) {
+                    return Err(fail(
+                        "e<number> is reserved for document handles; use a descriptive batch alias"
+                            .into(),
+                    ));
+                }
                 if handles.contains_key(handle) {
                     return Err(fail(format!("duplicate handle {handle:?}")));
                 }
@@ -277,6 +392,37 @@ pub fn execute(
                 request.h = Some(rect.h);
             }
             let id = doc_ops::draw(&mut working, &request, now_ms).map_err(fail)?;
+            if let Some(frame) = &draw.frame {
+                let frame = resolve(&handles, &working, frame).map_err(&fail)?;
+                canvas_core::edit::update_element(
+                    &mut working,
+                    &id,
+                    &canvas_core::edit::ElementUpdate {
+                        frame: Some(Some(frame)),
+                        ..Default::default()
+                    },
+                    now_ms,
+                )
+                .map_err(&fail)?;
+            }
+            // A frame drawn around elements owns them, not just their coordinates.
+            if draw.kind == "frame" {
+                if let Some(around) = &draw.around {
+                    for child in around {
+                        let child = resolve(&handles, &working, child).map_err(&fail)?;
+                        canvas_core::edit::update_element(
+                            &mut working,
+                            &child,
+                            &canvas_core::edit::ElementUpdate {
+                                frame: Some(Some(id.clone())),
+                                ..Default::default()
+                            },
+                            now_ms,
+                        )
+                        .map_err(&fail)?;
+                    }
+                }
+            }
             if let Some(handle) = &draw.handle {
                 handles.insert(handle.clone(), id.clone());
                 created.push((handle.clone(), id.clone()));
@@ -501,6 +647,9 @@ fn polyline_midpoint(points: &[Point]) -> Option<Point> {
 }
 
 fn beat_label(beat: &ScriptBeat) -> String {
+    if let Some(update) = &beat.update {
+        return format!("update {}", update.id);
+    }
     if let Some(connect) = &beat.connect {
         return format!("connect {} -> {}", connect.from, connect.to);
     }

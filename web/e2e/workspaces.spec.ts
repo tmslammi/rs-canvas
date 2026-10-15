@@ -7,7 +7,7 @@ import { mcpClient } from "./mcp-client";
 
 // Workspace management gets its own persisted server. Its focus changes and
 // destructive operations must not affect the existing agent specs' documents.
-test.describe.configure({ mode: "default" });
+test.describe.configure({ mode: "serial" });
 const BASE = "http://localhost:4177";
 let server: ChildProcess;
 let directory: string;
@@ -209,7 +209,7 @@ test("picker lists server workspaces safely and remains usable on a narrow scree
   await page.getByRole("button", { name: "Close workspaces", exact: true }).click();
 });
 
-test("tab focus selects the agent workspace without another drawing gesture", async ({ context, request }) => {
+test("agent edits follow the focused workspace and stay isolated", async ({ context, request }) => {
   const first = await context.newPage();
   const second = await context.newPage();
   await first.goto(`${BASE}/?ws=ui-focus-first`);
@@ -219,10 +219,18 @@ test("tab focus selects the agent workspace without another drawing gesture", as
   await ready(second);
   await second.waitForFunction(() => window.__rsAgentConnected === true);
   const mcp = mcpClient(request, BASE);
-  await expect.poll(async () => JSON.parse(await mcp.text("canvas_status", {})).workspace).toBe("ui-focus-second");
+  const current = async () => JSON.parse(await mcp.text("canvas_status", {})).workspace;
+  await expect.poll(current).toBe("ui-focus-second");
+  await mcp.call("canvas_draw", { kind: "sticky", text: "second workspace" });
+  await expect.poll(() => documentJson(second)).toContain("second workspace");
+  expect(await documentJson(first)).not.toContain("second workspace");
+
   await first.bringToFront();
   await first.evaluate(() => window.dispatchEvent(new Event("focus")));
-  await expect.poll(async () => JSON.parse(await mcp.text("canvas_status", {})).workspace).toBe("ui-focus-first");
+  await expect.poll(current).toBe("ui-focus-first");
+  await mcp.call("canvas_draw", { kind: "sticky", text: "first workspace" });
+  await expect.poll(() => documentJson(first)).toContain("first workspace");
+  expect(await documentJson(second)).not.toContain("first workspace");
 });
 
 test("duplicate copies the current drawing and rename preserves it under the new name", async ({ page }) => {

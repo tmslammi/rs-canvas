@@ -55,8 +55,10 @@ async fn connected(mut socket: WebSocket, state: Arc<AppState>, workspace: Arc<W
     }
     let pages = workspace.pages.load(Ordering::SeqCst);
     tracing::info!(pages, workspace = %workspace.name, "page connected");
-
+    // Subscribe before capturing initial state; concurrent edits/notes can then
+    // be replayed rather than disappearing between hello and subscription.
     let mut to_pages = workspace.to_pages.subscribe();
+
     let settings = state.current_settings().await;
     let hello = serde_json::json!({
         "type": "hello",
@@ -65,6 +67,8 @@ async fn connected(mut socket: WebSocket, state: Arc<AppState>, workspace: Arc<W
         "sync": state.sync,
         "workspace": workspace.name,
         "settings": settings,
+        "discussion": workspace.discussion.lock().await.clone(),
+        "discussion_persisted": workspace.doc_path.is_some(),
     })
     .to_string();
 
@@ -97,6 +101,13 @@ async fn connected(mut socket: WebSocket, state: Arc<AppState>, workspace: Arc<W
                         // the page, so send one now.
                         let snapshot = workspace.snapshot_frame().await;
                         if socket.send(Message::Text(snapshot.into())).await.is_err() {
+                            break;
+                        }
+                        let discussion = serde_json::json!({
+                            "type": "discussion", "discussion": workspace.discussion.lock().await.clone(),
+                            "discussion_persisted": workspace.doc_path.is_some(),
+                        }).to_string();
+                        if socket.send(Message::Text(discussion.into())).await.is_err() {
                             break;
                         }
                     }

@@ -1918,7 +1918,8 @@ impl Editor {
     }
 }
 
-/// Load the autosaved document, if any (the shell calls this at boot).
+/// Load the workspace's autosaved document, if any (the shell calls this at
+/// boot).
 #[wasm_bindgen]
 pub async fn load_saved_json(workspace: Option<String>) -> Option<String> {
     storage::load_document(workspace.as_deref().unwrap_or("default"))

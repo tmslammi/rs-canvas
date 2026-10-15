@@ -337,7 +337,12 @@ pub fn add_text(
     let layout = layout_text(text, style.font_size, None, &ApproxMeasurer);
     doc.add(
         ElementKind::Text {
-            rect: Rect::new(0.0, 0.0, layout.width.max(20.0), layout.height),
+            rect: Rect::new(
+                0.0,
+                0.0,
+                (layout.width + 2.0 * LABEL_PADDING).max(20.0),
+                layout.height,
+            ),
             text: text.to_string(),
             align,
             fixed_width: false,

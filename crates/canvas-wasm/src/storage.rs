@@ -8,13 +8,16 @@ const DB_NAME: &str = "rs-canvas";
 const STORE: &str = "documents";
 /// v2: the handmade-dark theme flipped the default ink to light, so old
 /// autosaves are ignored rather than loaded invisible.
-const KEY: &str = "current-v2";
+///
+/// Each workspace autosaves under its own key: `current-v2` for the default
+/// workspace and `current-v2:workspace:<name>` for a named one.
+pub const DEFAULT_KEY: &str = "current-v2";
 
 fn autosave_key(workspace: &str) -> String {
     if workspace.is_empty() || workspace == "default" {
-        KEY.to_string()
+        DEFAULT_KEY.to_string()
     } else {
-        format!("{KEY}:workspace:{workspace}")
+        format!("{DEFAULT_KEY}:workspace:{workspace}")
     }
 }
 
@@ -102,10 +105,10 @@ pub async fn list_workspaces() -> Result<Vec<String>, String> {
 }
 
 fn workspace_from_key(key: &str) -> Option<String> {
-    if key == KEY {
+    if key == DEFAULT_KEY {
         Some("default".into())
     } else {
-        key.strip_prefix(&format!("{KEY}:workspace:"))
+        key.strip_prefix(&format!("{DEFAULT_KEY}:workspace:"))
             .map(str::to_string)
     }
 }
@@ -135,8 +138,8 @@ mod tests {
 
     #[test]
     fn workspace_keys_are_isolated_and_preserve_default_autosaves() {
-        assert_eq!(autosave_key(""), KEY);
-        assert_eq!(autosave_key("default"), KEY);
+        assert_eq!(autosave_key(""), DEFAULT_KEY);
+        assert_eq!(autosave_key("default"), DEFAULT_KEY);
         assert_ne!(autosave_key("alpha"), autosave_key("beta"));
         assert_ne!(autosave_key("alpha"), autosave_key("default"));
     }

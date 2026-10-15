@@ -1,3 +1,4 @@
+import { testBase } from "./server-address";
 import { expect, test } from "@playwright/test";
 import { mcpClient, toolJson } from "./mcp-client";
 
@@ -10,7 +11,7 @@ import { mcpClient, toolJson } from "./mcp-client";
 
 test.describe.configure({ mode: "serial" });
 
-const BASE = "http://localhost:4174";
+const BASE = testBase(1);
 
 const camera = (page: import("@playwright/test").Page) =>
   page.evaluate(() => ({

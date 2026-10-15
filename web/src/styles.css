@@ -106,6 +106,27 @@ body {
   background: var(--chrome-border);
 }
 
+#workspace-switcher {
+  height: 30px;
+  max-width: 150px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  font-size: 13px;
+  color: var(--chrome-text);
+  cursor: pointer;
+}
+
+#workspace-switcher:hover {
+  background: var(--chrome-raised);
+  border-color: var(--chrome-border);
+}
+
+#workspace-switcher option {
+  background: var(--chrome);
+  color: var(--chrome-text);
+}
+
 /* -- panels ------------------------------------------------------------- */
 
 #style-panel {
@@ -125,17 +146,39 @@ body {
   position: absolute;
   bottom: 12px;
   right: 12px;
-  width: 176px;
+  width: min(320px, calc(100vw - 50px));
   padding: 10px 12px;
   background: var(--chrome);
   border: 1px solid var(--chrome-border);
   border-radius: 6px;
   box-shadow: 3px 3px 0 rgba(0, 0, 0, 0.5);
-  user-select: none;
+  user-select: text;
 }
 
 #agent-panel.hidden {
   display: none;
+}
+
+#agent-panel {
+  max-height: calc(100vh - 100px);
+  overflow-y: auto;
+}
+#agent-panel .agent-discussion {
+  border-top: 1px solid var(--chrome-border);
+  margin-top: 12px;
+  padding-top: 8px;
+  max-width: 320px;
+  overflow-wrap: anywhere;
+}
+#agent-panel .agent-discussion h3,
+#agent-panel .agent-discussion h4 {
+  font-size: 14px;
+  margin: 8px 0;
+}
+#agent-panel .agent-discussion ul {
+  margin: 4px 0 12px;
+  padding-left: 20px;
+  font-size: 13px;
 }
 
 #agent-panel .agent-title {

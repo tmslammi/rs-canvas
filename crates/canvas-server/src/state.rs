@@ -19,6 +19,34 @@ use canvas_core::serialization;
 use tokio::sync::{broadcast, Mutex, Notify};
 
 use crate::aliases::Aliases;
+use rmcp::schemars;
+
+/// Small, user-inspectable engineering context, separate from document/view state.
+#[derive(
+    Clone, Debug, Default, serde::Serialize, serde::Deserialize, rmcp::schemars::JsonSchema,
+)]
+#[serde(deny_unknown_fields)]
+pub struct Discussion {
+    #[serde(default)]
+    pub constraints: Vec<String>,
+    /// Agreed decisions, including their reasons. Hypotheses belong in questions.
+    #[serde(default)]
+    pub decisions: Vec<String>,
+    #[serde(default)]
+    pub questions: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct DiscussionRecord {
+    pub revision: u64,
+    pub notes: Discussion,
+}
+
+#[derive(Clone)]
+pub struct AgentTransaction {
+    pub id: String,
+    pub changes: Vec<(Option<Element>, Element)>,
+}
 
 /// How many recent changes `canvas_read(since)` can recall.
 const CHANGE_LOG_LIMIT: usize = 200;
@@ -206,6 +234,11 @@ impl AgentSettings {
 /// and pending present/screenshot requests — is scoped to one of these.
 pub struct Workspace {
     pub name: String,
+    /// Identity of this in-memory document lifetime; handles never cross it.
+    pub epoch: String,
+    generation: AtomicU64,
+    pub transactions: Mutex<Vec<AgentTransaction>>,
+    pub discussion: Mutex<DiscussionRecord>,
     /// The document mirror.
     pub doc: Mutex<Document>,
     /// Where the mirror is persisted; `None` keeps it in memory only.
@@ -252,6 +285,10 @@ impl Workspace {
         let (screenshot_replies, _) = broadcast::channel(16);
         Self {
             name: name.to_string(),
+            epoch: canvas_core::id::new_element_id(),
+            generation: AtomicU64::new(0),
+            transactions: Mutex::new(Vec::new()),
+            discussion: Mutex::new(DiscussionRecord::default()),
             doc: Mutex::new(Document::new()),
             doc_path,
             pages: AtomicUsize::new(0),
@@ -280,12 +317,21 @@ impl Workspace {
         self.last_activity.fetch_max(activity, Ordering::SeqCst);
     }
 
+    pub fn context(&self) -> String {
+        format!("{}:{}", self.epoch, self.generation.load(Ordering::SeqCst))
+    }
+
     /// Load the persisted mirror, if any. Called once when the workspace is
     /// created.
     pub async fn load_document(&self) {
         let Some(path) = &self.doc_path else {
             return;
         };
+        if let Ok(json) = tokio::fs::read_to_string(path.with_extension("discussion.json")).await {
+            if let Ok(notes) = serde_json::from_str(&json) {
+                *self.discussion.lock().await = notes;
+            }
+        }
         let Ok(json) = tokio::fs::read_to_string(path).await else {
             return;
         };
@@ -364,17 +410,13 @@ impl Workspace {
     /// the mirror changed. Connect-time path: the merged result is broadcast
     /// as a full snapshot, because the page may be missing server-side edits.
     pub async fn absorb_document(&self, remote: &Document) -> bool {
-        let before = {
-            let mut doc = self.doc.lock().await;
-            let before = doc.clone();
-            let merged = canvas_core::merge::reconcile(&doc, remote);
-            if merged == *doc {
-                return false;
-            }
-            *doc = merged;
-            before
-        };
-        let doc = self.doc.lock().await;
+        let mut doc = self.doc.lock().await;
+        let before = doc.clone();
+        let merged = canvas_core::merge::reconcile(&doc, remote);
+        if merged == *doc {
+            return false;
+        }
+        *doc = merged;
         let (revision, _) = self.record_change(&before, &doc, "page").await;
         drop(doc);
         self.broadcast_snapshot(revision).await;
@@ -482,6 +524,9 @@ impl Workspace {
             .iter()
             .filter_map(|id| after.element(id).cloned())
             .collect();
+        if changed.is_empty() {
+            return (self.revision.load(Ordering::SeqCst), put);
+        }
         let revision = self.record_ids(changed, source).await;
         (revision, put)
     }
@@ -513,6 +558,60 @@ impl Workspace {
             .collect()
     }
 
+    /// Cursor coverage, checked while the caller holds the document lock.
+    pub async fn cursor_valid(&self, since: u64) -> bool {
+        let revision = self.revision.load(Ordering::SeqCst);
+        let log = self.change_log.lock().await;
+        since <= revision
+            && log.first().map_or(since == revision, |first| {
+                since >= first.revision.saturating_sub(1)
+            })
+    }
+
+    /// Replace context only against the version the caller actually read.
+    /// Persist before updating memory so a failed write never reports success.
+    pub async fn remember(
+        &self,
+        notes: Discussion,
+        expected: u64,
+    ) -> Result<DiscussionRecord, String> {
+        if notes
+            .constraints
+            .iter()
+            .chain(&notes.decisions)
+            .chain(&notes.questions)
+            .count()
+            > 100
+            || notes
+                .constraints
+                .iter()
+                .chain(&notes.decisions)
+                .chain(&notes.questions)
+                .any(|s| s.len() > 2000)
+        {
+            return Err("discussion supports up to 100 entries of at most 2000 bytes each".into());
+        }
+        let mut current = self.discussion.lock().await;
+        if current.revision != expected {
+            return Err(
+                "discussion changed; read canvas_status and merge the latest notes before retrying"
+                    .into(),
+            );
+        }
+        let updated = DiscussionRecord {
+            revision: expected + 1,
+            notes,
+        };
+        if let Some(path) = &self.doc_path {
+            let json = serde_json::to_string_pretty(&updated).map_err(|e| e.to_string())?;
+            write_atomic(&path.with_extension("discussion.json"), &json)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        *current = updated.clone();
+        Ok(updated)
+    }
+
     /// Queue a persist; bursts within `PERSIST_DEBOUNCE` coalesce into one
     /// write. The loop is spawned when the workspace is created.
     pub async fn schedule_persist(&self) {
@@ -539,7 +638,10 @@ impl Workspace {
     /// page sessions — the page's own autosave is the source of truth.
     pub async fn release_when_idle(&self, remaining_pages: usize) {
         if remaining_pages == 0 && self.doc_path.is_none() {
-            *self.doc.lock().await = Document::new();
+            let mut doc = self.doc.lock().await;
+            *doc = Document::new();
+            self.generation.fetch_add(1, Ordering::SeqCst);
+            self.transactions.lock().await.clear();
         }
     }
 

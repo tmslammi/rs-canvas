@@ -90,11 +90,16 @@ export function connectAgentBridge(editor, hooks = {}) {
     }
     if (message.type === "hello") {
       syncEnabled = message.sync !== false;
+      hooks.onDiscussionChange?.(message.discussion, message.discussion_persisted);
       if (message.settings) {
         settings = message.settings;
         hooks.onSettingsChange?.(settings);
       }
       publishHint(true);
+      return;
+    }
+    if (message.type === "discussion") {
+      hooks.onDiscussionChange?.(message.discussion, message.discussion_persisted);
       return;
     }
     if (message.type === "settings" && message.settings) {

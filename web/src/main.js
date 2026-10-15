@@ -187,6 +187,63 @@ async function boot() {
 
   // -- toolbar ------------------------------------------------------------
 
+  // The workspace switcher: switching is just navigating to the workspace's
+  // URL, so every tab stays pinned to exactly one workspace.
+  const NEW_WORKSPACE = "__new__";
+  const workspaceSelect = document.createElement("select");
+  workspaceSelect.id = "workspace-switcher";
+  workspaceSelect.title = "Workspace — each tab shows one";
+  const fillWorkspaces = (names) => {
+    workspaceSelect.replaceChildren();
+    const all = names.includes(workspace) ? names : [workspace, ...names];
+    for (const name of all) {
+      const option = document.createElement("option");
+      option.value = name;
+      option.textContent = name;
+      workspaceSelect.appendChild(option);
+    }
+    const create = document.createElement("option");
+    create.value = NEW_WORKSPACE;
+    create.textContent = "＋ new…";
+    workspaceSelect.appendChild(create);
+    workspaceSelect.value = workspace;
+  };
+  fillWorkspaces([]);
+  workspaceSelect.addEventListener("change", () => {
+    let name = workspaceSelect.value;
+    if (name === NEW_WORKSPACE) {
+      name = (
+        window.prompt("Workspace name (lowercase letters, digits, dashes):") ??
+        ""
+      )
+        .trim()
+        .toLowerCase();
+      if (!/^[a-z0-9][a-z0-9-]{0,39}$/.test(name)) {
+        workspaceSelect.value = workspace;
+        if (name) showToast(`Invalid workspace name "${name}"`, true);
+        return;
+      }
+    }
+    if (name === workspace) {
+      workspaceSelect.value = workspace;
+      return;
+    }
+    location.assign(
+      name === "default" ? "/" : `/?ws=${encodeURIComponent(name)}`,
+    );
+  });
+  toolbar.appendChild(workspaceSelect);
+  // The server lists live and persisted workspaces; without it (static
+  // serving) the switcher just shows the current one.
+  fetch("/api/workspaces")
+    .then((response) => (response.ok ? response.json() : null))
+    .then((body) => {
+      if (body?.workspaces) {
+        fillWorkspaces(body.workspaces.map((info) => info.name));
+      }
+    })
+    .catch(() => {});
+
   const toolButtons = new Map();
   for (const tool of TOOLS) {
     const button = document.createElement("button");
@@ -748,6 +805,7 @@ async function boot() {
       updateCursor();
     },
     onSettingsChange: (settings) => agentPanel.setSettings(settings),
+    onDiscussionChange: (notes, persisted) => agentPanel.setDiscussion(notes, persisted),
     onWorkspaceChange: async (change) => {
       if (workspaceLeaving || !validWorkspaceName(change.workspace)) return;
       workspaceLeaving = true;
@@ -767,6 +825,7 @@ async function boot() {
     },
   });
 
+  window.__rsWorkspace = workspace;
   if (workspace !== requestedWorkspace) showToast("Invalid workspace name. Opened default instead.", true);
   try {
     const message = sessionStorage.getItem("rs-canvas-workspace-message");

@@ -7,7 +7,9 @@
     { "action": "canvas_canvas_clear", "resource": "*", "effect": "deny" },
     { "action": "canvas_canvas_annotate", "resource": "*", "effect": "deny" },
     { "action": "canvas_canvas_emphasis", "resource": "*", "effect": "deny" },
-    { "action": "canvas_canvas_tidy", "resource": "*", "effect": "deny" }
+    { "action": "canvas_canvas_tidy", "resource": "*", "effect": "deny" },
+    { "action": "canvas_canvas_revert", "resource": "*", "effect": "deny" },
+    { "action": "canvas_canvas_remember", "resource": "*", "effect": "deny" }
   ],
   "mcp": {
     "servers": {

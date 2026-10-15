@@ -1,3 +1,4 @@
+import { testBase, testPort } from "./server-address";
 import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -11,7 +12,7 @@ import { elementCount, mcpClient, toolJson } from "./mcp-client";
 
 test.describe.configure({ mode: "serial" });
 
-const BASE = "http://localhost:4175";
+const BASE = testBase(2);
 const contextsWithPages = new WeakSet<BrowserContext>();
 
 test.beforeEach(async ({ context }) => {
@@ -369,6 +370,13 @@ test("an autosave and the server mirror merge on reconnect", async ({
     .toBe(base + 1);
   await first.close();
 
+  // An in-memory document ends when its last page leaves. Observe the new
+  // headless context before writing, rather than reusing handles from that lifetime.
+  await expect.poll(async () => {
+    const status = toolJson(await mcp.call("canvas_status", {}));
+    return (status.document as { elements: number }).elements;
+  }).toBe(0);
+
   // The agent draws while the page is closed; the server keeps it.
   await mcp.call("canvas_draw", { kind: "sticky", text: "Cache" });
 
@@ -392,7 +400,7 @@ test("a server restart preserves the document", async ({ request }) => {
   const binary = path.resolve(process.cwd(), "..", "target", "debug", "canvas-server");
 
   const start = () =>
-    spawn(binary, ["--web", ".", "--port", "4176", "--doc", docPath], {
+    spawn(binary, ["--web", ".", "--port", String(testPort(3)), "--doc", docPath], {
       cwd: process.cwd(),
       stdio: "ignore",
     });
@@ -412,8 +420,8 @@ test("a server restart preserves the document", async ({ request }) => {
 
   let server = start();
   try {
-    await waitForServer("http://localhost:4176");
-    const first = mcpClient(request, "http://localhost:4176");
+    await waitForServer(testBase(3));
+    const first = mcpClient(request, testBase(3));
     const created = toolJson(
       await first.call("canvas_draw", { kind: "diamond", text: "Decision" }),
     );
@@ -421,9 +429,9 @@ test("a server restart preserves the document", async ({ request }) => {
     server.kill();
     await waitForExit(server);
     server = start();
-    await waitForServer("http://localhost:4176");
+    await waitForServer(testBase(3));
 
-    const second = mcpClient(request, "http://localhost:4176");
+    const second = mcpClient(request, testBase(3));
     const described = await second.text("canvas_read", {});
     expect(described).toContain(created.id as string);
     expect(described).toContain("Decision");

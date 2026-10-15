@@ -1,0 +1,26 @@
+# Agent interface sources
+
+Checked 2026-10-10 against official MCP sources. These are protocol facts and design recommendations, not an implementation specification. Existing transport research remains in `protocol-sources.md`.
+
+## Verified protocol facts
+
+- The official [latest specification](https://modelcontextprotocol.io/specification/latest) currently resolves to revision **2026-07-28**. Its [changelog](https://modelcontextprotocol.io/specification/2026-07-28/changelog) removes protocol sessions and initialization, introduces per-request discovery/metadata and required result discriminators. Choosing a revision is therefore a compatibility decision, not just updating result fields.
+- Tools expose JSON input schemas and optional output schemas. Declared output schemas require conforming structured results. Current `structuredContent` accepts any JSON value; serialized JSON text is also recommended for backward compatibility. Ordinary tool failures use `isError: true`, with feedback for recovery; malformed protocol requests and unknown tools use JSON-RPC errors. Tool-list ordering should be deterministic. Stateful-tool guidance recommends explicit handles with documented lifetime and recovery for expiry. [Official tools specification](https://modelcontextprotocol.io/specification/2026-07-28/server/tools).
+- Tool arguments are objects; JSON Schema supports composition, references and constraints. `readOnlyHint`, `destructiveHint`, `idempotentHint` and `openWorldHint` describe behavior, but are hints rather than authorization. Read-only defaults false; destructive defaults true; idempotent defaults false; open-world defaults true. [Official schema reference](https://modelcontextprotocol.io/specification/2026-07-28/schema).
+- Resources support discovery, reads and parameterized URI templates, with pagination. Their annotations supply audience, priority and modification time. Custom URI schemes are allowed. Resource changes can be observed through subscriptions in the current revision. [Official resources specification](https://modelcontextprotocol.io/specification/2026-07-28/server/resources).
+- Revision 2025-11-25 restricts `structuredContent` to a JSON object. Object envelopes retain compatibility across these revisions. [Earlier tools specification](https://modelcontextprotocol.io/specification/2025-11-25/server/tools).
+
+## Recommendations for rs-canvas
+
+These are our design judgments, informed by the facts above and `crates/canvas-server/src/mcp.rs`.
+
+1. **Make the observed workspace explicit across a workflow.** Return workspace identity, document epoch and revision from the first read; validate them on subsequent edits. These are preconditions, not routing overrides: ADR-0007 requires edits to follow the user's current workspace. Fail with actionable feedback if that workspace changes. Element-version preconditions can detect relevant changes without rejecting edits because an unrelated element changed.
+2. **Publish the contract the server actually validates.** Prefer enums for element kinds and positioning sides, bounds for numeric fields, and operation-specific schemas for scripts. Encode mutually exclusive placement modes where clients support them. Defaults and units must be in descriptions as well as validation. Reject unsupported options instead of silently accepting typos.
+3. **Return both human-readable summaries and machine-readable results.** An object envelope can carry workspace, revision, changed ids, bounds, warnings and error details. Use `outputSchema` for predictable parsing and validation. Preserve the existing compact drawing read as an intentionally readable representation; compare real host rendering before replacing it.
+4. **Make recovery specific.** For invalid ids, stale revisions, unknown glyphs or unavailable browser state, return an error code, explanation and the next useful read/action. Report whether the document committed; a failed atomic batch must commit nothing. Distinguish committed drawing changes from failed delivery or cancelled presentation. Avoid an undifferentiated transport error for a fixable drawing request.
+5. **Expose reference material on demand.** Canvas coordinate conventions, operation examples, glyph catalogs and schema documentation fit resources or resource templates. Keep startup instructions short and tools deterministically ordered. Resource support should be tested with the actual host before relying on it for critical instructions.
+6. **Annotate behavior honestly.** Status/read/screenshot can be read-only. Camera tools change the environment even though they do not persist document changes. Creation is generally not idempotent; an operation id plus server deduplication would make safe retry possible. An annotation alone does not create that guarantee.
+
+## Claims to avoid
+
+`structuredContent` does not inherently guarantee fewer tokens: compatibility text may duplicate the same payload and hosts differ in how results reach the model. Measure bytes, actual rendered context, round trips, successful edits and recovery effort separately. Resource annotations do not guarantee exclusion from model context. “Latest MCP” does not guarantee compatibility with the installed Rust SDK or agent host.

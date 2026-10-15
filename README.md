@@ -28,8 +28,9 @@ npm run test:e2e   # build wasm + run Playwright against the source files
 The dev command runs the Rust server in `crates/canvas-server`: it serves the
 plain files, hosts the WebSocket bridge for the open page, and exposes the
 agent's MCP endpoint at `http://127.0.0.1:5173/mcp`. The project's
-`opencode.jsonc` points opencode at that endpoint; start the dev command before
-using the canvas tools. The server binds to localhost only.
+`opencode.jsonc` and `.codex/config.toml` point their agents at that endpoint;
+start the dev command before using the canvas tools. The server binds to
+localhost only.
 
 ## Workspaces
 
@@ -73,10 +74,59 @@ camera focus — presented beat by beat on the user's canvas),
 share one document through the merge-ready model, and the mirror persists to
 `.rs-canvas/current.json`.
 
+A tab can instead be pinned to a named workspace with `?ws=<name>` (or the
+toolbar's workspace switcher): each workspace is an isolated drawing with its
+own autosave, and agent calls always act on the workspace the user is
+currently viewing. Named workspaces persist to
+`.rs-canvas/workspaces/<name>.json`.
+
 The toolbar's ◎ button opens live agent preferences the server enforces:
 camera moves (off / gentle / full — focus skips targets that are already
 visible and never zooms past 2× on gentle) and presentation pacing, persisted
 to `.rs-canvas/settings.json`. Everything is local-only.
+
+For engineering discussions, `canvas_read` can inspect the selection, specific
+handles, a frame or matching labels instead of the whole document. Reads are
+paginated (100 elements by default) and return workspace context and revision;
+pass those to `canvas_script` when revising a design. Update beats rename,
+move, resize, restyle, reparent and reconnect existing elements while preserving
+their IDs, owned labels and frame children. Drawing a frame `around` elements
+establishes ownership. A script's `edit` receipt lists what changed and provides
+a transaction for `canvas_revert`; revert refuses to overwrite later edits and
+is retained for the last 50 agent edits during this document lifetime.
+
+`canvas_glyphs` discovers valid glyph IDs. `canvas_remember` saves constraints,
+agreed decisions with reasons, and open questions using the discussion revision
+from `canvas_status`. The ◎ panel shows these notes, which persist beside the
+workspace document as `<name>.discussion.json`. Notes are separate from document
+exports; without a server backing file they last only for the server session.
+The primary agent discusses the design; the canvas subagent makes small,
+verified revisions and records useful context.
+
+Codex loads the project MCP connection and the `canvas` drawing agent from
+`.codex/config.toml`. The `canvas-thinking` skill in
+`.agents/skills/canvas-thinking/` is available by default and can be picked up
+from an ordinary engineering discussion; the primary agent has read-only canvas
+tools and delegates document changes to the drawing agent. Trust this project
+in Codex and open a fresh session after changing its MCP configuration. Run
+`npm run dev` in `web/` so the local server is available.
+
+Example script revision (tool arguments):
+
+```json
+{
+  "context": "<context from canvas_read or canvas_status>",
+  "revision": 12,
+  "beats": [
+    {"update": {"id": "e3", "text": "Ack after processing"}},
+    {"update": {"id": "e7", "to": "e3"}}
+  ]
+}
+```
+
+After changing server code, restart the dev server to load the new tools and
+reload the page. For concurrent test runs, choose a separate port range, e.g.
+`RS_CANVAS_TEST_PORT=4273 npm run test:e2e` from `web/`.
 
 The app is served as-is: `index.html` loads `/src/main.js` as an ES module, the wasm-bindgen `--target web` output is imported directly, and CSS/fonts are plain files. There is no Vite, no TypeScript and no bundler in the app — `npm run dev` also watches Rust sources and rebuilds the wasm for you (reload the page after a rebuild).
 

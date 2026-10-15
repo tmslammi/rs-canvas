@@ -63,6 +63,40 @@ export function createAgentPanel(host, { onChange }) {
   note.textContent = "Live preferences; the agent reads them.";
   panel.appendChild(note);
 
+  const discussion = document.createElement("section");
+  discussion.className = "agent-discussion";
+  discussion.setAttribute("aria-label", "Workspace discussion");
+  panel.appendChild(discussion);
+
+  const setDiscussion = (record, persisted = false) => {
+    discussion.replaceChildren();
+    const heading = document.createElement("h3");
+    heading.textContent = "Workspace discussion";
+    discussion.appendChild(heading);
+    let count = 0;
+    for (const [key, title] of [["constraints", "Constraints"], ["decisions", "Decisions and reasons"], ["questions", "Open questions"]]) {
+      const entries = record?.notes?.[key] ?? [];
+      if (!entries.length) continue;
+      const label = document.createElement("h4");
+      label.textContent = title;
+      const list = document.createElement("ul");
+      for (const text of entries) {
+        const entry = document.createElement("li");
+        entry.textContent = text;
+        list.appendChild(entry);
+        count++;
+      }
+      discussion.append(label, list);
+    }
+    const hint = document.createElement("p");
+    hint.className = "agent-note";
+    hint.textContent = count
+      ? (persisted ? "Saved with this workspace. Ask the agent to revise these notes." : "Kept for this server session. Ask the agent to revise these notes.")
+      : "Ask the agent to remember constraints, decisions or open questions here.";
+    discussion.appendChild(hint);
+  };
+  setDiscussion(null);
+
   const render = () => {
     for (const [value, button] of cameraRow.buttons) {
       button.classList.toggle("active", value === settings.camera);
@@ -75,6 +109,7 @@ export function createAgentPanel(host, { onChange }) {
 
   host.appendChild(panel);
   return {
+    setDiscussion,
     toggle: () => panel.classList.toggle("hidden"),
     setSettings: (next) => {
       settings = {
