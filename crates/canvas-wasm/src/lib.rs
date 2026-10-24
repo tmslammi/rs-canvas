@@ -1123,7 +1123,7 @@ impl Editor {
         }
         self.cancel_camera_transition();
         self.cancel_presentation();
-        self.core.camera().zoom_at(Point::new(x, y), factor);
+        self.core.camera_mut().zoom_at(Point::new(x, y), factor);
         self.render();
     }
 
@@ -1218,7 +1218,7 @@ impl Editor {
     pub fn zoom_to_fit(&mut self) {
         self.cancel_camera_transition();
         if let Some(bounds) = self.core.scene_bounds() {
-            self.core.camera().zoom_to_fit(
+            self.core.camera_mut().zoom_to_fit(
                 bounds,
                 (
                     self.scene_canvas.client_width() as f64,
@@ -1238,7 +1238,7 @@ impl Editor {
             self.scene_canvas.client_width() as f64 / 2.0,
             self.scene_canvas.client_height() as f64 / 2.0,
         );
-        self.core.camera().set_zoom_at(center, 1.0);
+        self.core.camera_mut().set_zoom_at(center, 1.0);
         self.render();
     }
 
