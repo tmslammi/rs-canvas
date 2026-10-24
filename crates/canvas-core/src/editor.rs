@@ -11,16 +11,16 @@ use crate::connector;
 use crate::delta::Delta;
 use crate::geometry::{Point, Rect};
 use crate::history::{History, Transaction};
-use crate::hit::{elements_in_rect_indexed, hit_test_indexed, hit_test_raw_indexed};
 use crate::id::{new_element_id, new_version_nonce};
 use crate::model::{
     Binding, Document, Element, ElementId, ElementKind, Endpoint, Routing, ShapeKind, Style,
     StylePatch, TextAlign,
 };
 use crate::nav::NavigationState;
-use crate::scene::Scene;
-use crate::spatial::{HitIndex, ObstacleIndex};
-use crate::text::{layout_text, ApproxMeasurer, TextMeasurer};
+use crate::projection::Projection;
+use crate::scene::SceneLayer;
+use crate::spatial::ObstacleIndex;
+use crate::text::{layout_text, TextMeasurer};
 use crate::tool::Tool;
 use crate::view::ViewState;
 
@@ -268,15 +268,11 @@ enum Interaction {
 /// The editable session.
 pub struct Editor {
     pub doc: Document,
-    pub scene: Scene,
-    /// Spatial index of routing obstacles, kept in sync with `doc`.
-    pub obstacles: ObstacleIndex,
-    /// Packed hit-test index over all live elements: hover, click and marquee
-    /// must never scan the document per pointer event.
-    pub hit: HitIndex,
     pub history: History,
     /// Camera, navigation, tool, style defaults, grid, viewport and selection.
     pub(crate) view: ViewState,
+    /// Scene cache, routing obstacles and hit index (derived state).
+    pub(crate) projection: Projection,
     /// Total snapped drag delta already previewed (see `Interaction::Moving`):
     /// preview moves translate incrementally, clone-free. Reset whenever a
     /// move gesture starts.
@@ -304,7 +300,6 @@ pub struct Editor {
     /// further from the source so copies never stack invisibly.
     paste_serial: u32,
     last_pressure: f64,
-    measurer: Box<dyn TextMeasurer>,
     hover_anchors: Option<(ElementId, Vec<Point>)>,
     /// The sticky stack under the pointer, if its pull zone is hovered.
     hover_stack: Option<ElementId>,
@@ -314,11 +309,9 @@ impl Editor {
     pub fn new(doc: Document) -> Self {
         let mut editor = Self {
             doc,
-            scene: Scene::new(),
-            obstacles: ObstacleIndex::new(),
-            hit: HitIndex::new(),
             history: History::new(),
             view: ViewState::new(),
+            projection: Projection::new(),
             drag_applied: Point::ZERO,
             drag_slots: Vec::new(),
             drag_working: Vec::new(),
@@ -330,7 +323,6 @@ impl Editor {
             clipboard: Vec::new(),
             paste_serial: 0,
             last_pressure: 0.5,
-            measurer: Box::new(ApproxMeasurer),
             hover_anchors: None,
             hover_stack: None,
         };
@@ -527,34 +519,26 @@ impl Editor {
 
     /// Install a real text measurer (the wasm façade does this).
     pub fn set_measurer(&mut self, measurer: Box<dyn TextMeasurer>) {
-        self.measurer = measurer;
+        self.projection.set_measurer(measurer);
         self.refresh_scene();
     }
 
     /// Rebuild the whole scene cache.
     pub fn refresh_scene(&mut self) -> Vec<Rect> {
-        // Loading skips the obstacle build (tens of ms plus megabytes on huge
-        // documents); the first edit or route that needs it builds once.
-        self.obstacles.invalidate();
-        self.hit.rebuild(&self.doc);
         self.view.invalidate_selection_bounds();
-        self.scene
-            .rebuild_all(&self.doc, self.measurer.as_ref(), &self.obstacles)
+        self.projection.refresh(&self.doc)
     }
 
     /// Rebuild the changed elements' layers, returning dirty world rects.
     pub fn rebuild_changed(&mut self, changed: &BTreeSet<ElementId>) -> Vec<Rect> {
-        self.obstacles.apply(&self.doc, changed);
-        self.hit.apply(&self.doc, changed);
         self.view.invalidate_selection_bounds();
-        self.scene
-            .update(&self.doc, changed, self.measurer.as_ref(), &self.obstacles)
+        self.projection.rebuild_changed(&self.doc, changed)
     }
 
     /// Dirty regions for a preview move: caches already shifted in place, so
     /// this repaints without rebuilding layers or touching indexes.
     pub fn preview_dirty(&mut self) -> Vec<Rect> {
-        self.scene.preview_dirty()
+        self.projection.preview_dirty()
     }
 
     /// Build draw ops for unbuilt layers touching `area` (and obstacles on
@@ -562,19 +546,12 @@ impl Editor {
     /// drawing ops; the LOD overview never does, so huge boards open without
     /// ever paying the rough-geometry pass for off-screen detail.
     pub fn ensure_area(&mut self, area: Rect) {
-        if self.scene.unbuilt_count() == 0 {
-            return;
-        }
-        self.obstacles.ensure(&self.doc);
-        self.scene
-            .ensure_area(&self.doc, area, self.measurer.as_ref(), &self.obstacles);
+        self.projection.ensure_area(&self.doc, area);
     }
 
     /// Scene-layer slots for a set of ids, resolved once per gesture.
     fn scene_slot_subset(&self, ids: &BTreeSet<ElementId>) -> Vec<u32> {
-        ids.iter()
-            .filter_map(|id| self.scene.slot_for(id))
-            .collect()
+        self.projection.slot_subset(ids)
     }
 
     /// Rigid bulk translation for the all-elements-moving benchmark: shift
@@ -594,14 +571,57 @@ impl Editor {
             }
             translate_element(element, dx, dy);
         }
-        self.scene.shift_all(dx, dy);
-        self.obstacles.shift_all(dx, dy);
-        self.hit.shift_all(dx, dy);
+        self.projection.shift_all(dx, dy);
     }
 
     /// The text measurer in use (for SVG export).
     pub fn measurer(&self) -> &dyn TextMeasurer {
-        self.measurer.as_ref()
+        self.projection.measurer()
+    }
+
+    // -- projection queries (read-only) ------------------------------------
+
+    /// Cached scene layers in z-order, for export and dirty repaint loops.
+    pub fn scene_layers(&self) -> &[SceneLayer] {
+        self.projection.layers()
+    }
+
+    pub fn visible_layers(&self, viewport: Rect) -> impl Iterator<Item = &SceneLayer> {
+        self.projection.visible_layers(viewport)
+    }
+
+    pub fn all_layers(&self) -> impl Iterator<Item = &SceneLayer> {
+        self.projection.all_layers()
+    }
+
+    pub fn scene_palette(&self) -> &[String] {
+        self.projection.palette()
+    }
+
+    pub fn cached_scene_bounds(&self) -> Option<Rect> {
+        self.projection.cached_bounds()
+    }
+
+    pub fn scene_bounds(&self) -> Option<Rect> {
+        self.projection.bounds()
+    }
+
+    /// Flush the deferred rigid-drift shift into cached draw ops.
+    pub fn flush_pending_ops(&mut self) {
+        self.projection.flush_pending_ops();
+    }
+
+    pub fn flush_preview_stale(&mut self, area: Rect) {
+        self.projection.flush_preview_stale(area);
+    }
+
+    pub fn flush_all_preview_stale(&mut self) {
+        self.projection.flush_all_preview_stale();
+    }
+
+    /// Read-only routing index for connector geometry queries.
+    pub fn obstacles(&self) -> &ObstacleIndex {
+        self.projection.obstacles()
     }
 
     /// The shell reports pointer pressure for freehand capture.
@@ -948,19 +968,19 @@ impl Editor {
                     let width = meta.style.stroke_width;
                     let bounds = crate::rough::rubber_band_bounds(meta.a, meta.b, width);
                     if meta.built {
-                        self.scene
+                        self.projection
                             .refresh_preview_ops(&meta.id, meta.a, meta.b, width, bounds);
                     } else {
                         let style = meta.style.clone();
                         let (ops, _) = crate::rough::rubber_band_ops(meta.a, meta.b, &style);
-                        self.scene.set_preview_ops(&meta.id, ops, bounds);
+                        self.projection.set_preview_ops(&meta.id, ops, bounds);
                         meta.built = true;
                     }
                 }
                 // Scene: rigid-shift the selection by gesture-stable slots.
                 // The changed set stays empty: preview paints from the drained
                 // dirty rects, and release recomputes the full set for settle.
-                self.scene.shift_slots(&self.drag_slots, inc_x, inc_y);
+                self.projection.shift_slots(&self.drag_slots, inc_x, inc_y);
                 self.view.shift_selection_bounds(inc_x, inc_y);
                 Effects {
                     preview: true,
@@ -1335,7 +1355,9 @@ impl Editor {
                 // orange rectangle stays painted until some later event
                 // happens to invalidate the overlay.
                 effects.overlay_changed = true;
-                let hits: Vec<ElementId> = elements_in_rect_indexed(&self.doc, &self.hit, rect)
+                let hits: Vec<ElementId> = self
+                    .projection
+                    .elements_in_rect(&self.doc, rect)
                     .into_iter()
                     .map(|id| crate::hit::resolve_container(&self.doc, &id))
                     // A marquee inside a frame selects its contents; enclosing
@@ -1429,7 +1451,7 @@ impl Editor {
                     // Reflowed labels changed geometry after the rigid shift:
                     // rebuild them exactly instead of skipping as previewed.
                     for (text_id, _) in &reflows {
-                        self.scene.unmark_preview(text_id);
+                        self.projection.unmark_preview(text_id);
                     }
                 }
                 if let Some(mut tx) = self.tx.take() {
@@ -1742,7 +1764,7 @@ impl Editor {
             };
         }
         let tolerance = self.tolerance();
-        let Some(id) = hit_test_raw_indexed(&self.doc, &self.hit, world, tolerance) else {
+        let Some(id) = self.projection.hit_test_raw(&self.doc, world, tolerance) else {
             return Effects::default();
         };
         enum Target {
@@ -1841,7 +1863,7 @@ impl Editor {
     /// starts a new point-text element.
     fn begin_text_tool(&mut self, world: Point, now: u64) -> Effects {
         let tolerance = self.tolerance();
-        if let Some(id) = hit_test_raw_indexed(&self.doc, &self.hit, world, tolerance) {
+        if let Some(id) = self.projection.hit_test_raw(&self.doc, world, tolerance) {
             match self.doc.element(&id).map(|e| &e.kind) {
                 Some(ElementKind::Text { .. }) => {
                     return self.begin_text_edit(self.doc.element(&id).cloned(), now);
@@ -1901,7 +1923,10 @@ impl Editor {
             return Effects::default();
         }
         let mut tx = Transaction::begin();
-        let line_height = self.measurer.line_height(self.view.style.font_size);
+        let line_height = self
+            .projection
+            .measurer()
+            .line_height(self.view.style.font_size);
         let element = Element::new(
             ElementKind::Text {
                 rect: Rect::new(
@@ -1982,7 +2007,7 @@ impl Editor {
         );
         let mut tx = Transaction::begin();
         let font_size = self.view.style.font_size;
-        let line_height = self.measurer.line_height(font_size);
+        let line_height = self.projection.measurer().line_height(font_size);
         // Sticky text sits inside the note, inked in the note's own (dark)
         // outline colour so it reads on the pastel fill.
         let padding = if is_sticky { 14.0 } else { 10.0 };
@@ -2223,7 +2248,7 @@ impl Editor {
             } => (*rect, *fixed_width, container_id.clone(), style.font_size),
             _ => return None,
         };
-        let measurer = self.measurer.as_ref();
+        let measurer = self.projection.measurer();
         let Some(container_id) = container_id else {
             let layout = if fixed_width {
                 layout_text(text, font_size, Some(rect.w), measurer)
@@ -2262,7 +2287,7 @@ impl Editor {
                     *routing,
                     waypoints,
                     &self.doc,
-                    &self.obstacles,
+                    self.projection.obstacles(),
                 );
                 let mid = connector::point_at(&points, 0.5);
                 let width = if rect.w > 1.0 { rect.w } else { 100.0 };
@@ -2429,7 +2454,7 @@ impl Editor {
                 self.drag_applied = Point::ZERO;
                 if total.x.abs() > 1e-9 || total.y.abs() > 1e-9 {
                     let slots = std::mem::take(&mut self.drag_slots);
-                    self.scene.shift_slots(&slots, -total.x, -total.y);
+                    self.projection.shift_slots(&slots, -total.x, -total.y);
                 } else {
                     self.drag_slots.clear();
                 }
@@ -2445,7 +2470,7 @@ impl Editor {
                 self.hover_anchors = None;
                 // Drop gesture-preview caches (rigid shifts, rubber bands):
                 // the changed set below rebuilds everything exactly.
-                self.scene.discard_preview();
+                self.projection.discard_preview();
                 if let Some(tx) = self.tx.take() {
                     for delta in tx.deltas().iter().rev() {
                         let _ = self.doc.apply(&delta.invert());
@@ -2775,7 +2800,7 @@ impl Editor {
             }
         }
         let tolerance = self.tolerance();
-        match hit_test_indexed(&self.doc, &self.hit, world, tolerance) {
+        match self.projection.hit_test(&self.doc, world, tolerance) {
             Some(id) => {
                 if mods.shift {
                     if self.view.selection.contains(&id) {
@@ -2919,8 +2944,8 @@ impl Editor {
         let pad = reach + crate::spatial::hit_pad();
         let area = crate::geometry::Rect::new(world.x - pad, world.y - pad, pad * 2.0, pad * 2.0);
         let mut best: Option<ElementId> = None;
-        for row in self.hit.query(area) {
-            let Some((id, _, _)) = self.hit.row(row) else {
+        for row in self.projection.hit_query(area) {
+            let Some((id, _, _)) = self.projection.hit_row(row) else {
                 continue;
             };
             if exclude == Some(id) {
@@ -2990,7 +3015,9 @@ impl Editor {
                 return effects;
             }
         }
-        let next = hit_test_indexed(&self.doc, &self.hit, world, self.tolerance())
+        let next = self
+            .projection
+            .hit_test(&self.doc, world, self.tolerance())
             .and_then(|id| self.doc.element(&id).cloned())
             .filter(Self::is_connectable)
             .map(|element| {
@@ -3026,7 +3053,9 @@ impl Editor {
     /// The sticky stack whose pull zone (everything but the border ring) is
     /// under `world`, if any.
     fn stack_pull_at(&self, world: Point) -> Option<ElementId> {
-        let id = hit_test_indexed(&self.doc, &self.hit, world, self.tolerance())?;
+        let id = self
+            .projection
+            .hit_test(&self.doc, world, self.tolerance())?;
         let element = self.doc.element(&id)?;
         if !element.is_sticky_stack() {
             return None;
@@ -3064,8 +3093,14 @@ impl Editor {
         else {
             return Vec::new();
         };
-        let route =
-            connector::route_avoiding(start, end, *routing, waypoints, &self.doc, &self.obstacles);
+        let route = connector::route_avoiding(
+            start,
+            end,
+            *routing,
+            waypoints,
+            &self.doc,
+            self.projection.obstacles(),
+        );
         let mut handles: Vec<ArrowHandle> = waypoints
             .iter()
             .enumerate()
@@ -3250,7 +3285,7 @@ impl Editor {
             definition.name,
             self.view.style.font_size,
             Some(wrap),
-            self.measurer.as_ref(),
+            self.projection.measurer(),
         );
         let caption_rect = Rect::new(
             center.x - wrap / 2.0,
@@ -3301,7 +3336,7 @@ impl Editor {
     /// start a new note (click for the default size, drag to size it).
     fn begin_sticky(&mut self, world: Point, now: u64) -> Effects {
         let tolerance = self.tolerance();
-        if let Some(id) = hit_test_indexed(&self.doc, &self.hit, world, tolerance) {
+        if let Some(id) = self.projection.hit_test(&self.doc, world, tolerance) {
             if self.doc.element(&id).is_some_and(|e| e.is_sticky_stack()) {
                 return self.begin_pull_from_stack(&id, world, now);
             }
@@ -3806,7 +3841,7 @@ impl Editor {
         now: u64,
     ) {
         let tolerance = self.tolerance();
-        if let Some(id) = hit_test_indexed(&self.doc, &self.hit, world, tolerance) {
+        if let Some(id) = self.projection.hit_test(&self.doc, world, tolerance) {
             let targets: Vec<ElementId> = std::iter::once(id.clone())
                 .chain(self.followers(&id))
                 .collect();

@@ -651,8 +651,7 @@ impl Editor {
         }
         let bounds = self
             .core
-            .scene
-            .bounds()
+            .scene_bounds()
             .unwrap_or(Rect::new(0.0, 0.0, 100.0, 100.0))
             .expand(16.0);
         let scale = scale.clamp(0.25, 4.0);
@@ -677,12 +676,12 @@ impl Editor {
         let mut renderer = Canvas2dRenderer::new(ctx);
         renderer.clear(BACKGROUND);
         renderer.set_transform(Affine::translate(-bounds.x, -bounds.y).then(Affine::scale(scale)));
-        self.core.scene.flush_pending_ops();
-        if let Some(all) = self.core.scene.cached_bounds() {
+        self.core.flush_pending_ops();
+        if let Some(all) = self.core.cached_scene_bounds() {
             self.core.ensure_area(all);
         }
-        self.core.scene.flush_all_preview_stale();
-        for layer in &self.core.scene.layers {
+        self.core.flush_all_preview_stale();
+        for layer in self.core.scene_layers() {
             renderer.draw_ops(&layer.ops);
         }
         canvas.to_data_url_with_type("image/png")
@@ -726,10 +725,10 @@ impl Editor {
         renderer.clear(BACKGROUND);
         renderer.set_transform(self.core.camera().transform().then(Affine::scale(scale)));
         let viewport = self.core.camera().viewport(css_w, css_h);
-        self.core.scene.flush_pending_ops();
+        self.core.flush_pending_ops();
         self.core.ensure_area(viewport);
-        self.core.scene.flush_preview_stale(viewport);
-        for layer in self.core.scene.visible(viewport) {
+        self.core.flush_preview_stale(viewport);
+        for layer in self.core.visible_layers(viewport) {
             if skip(&layer.element_id) {
                 continue;
             }
@@ -900,11 +899,11 @@ impl Editor {
         // Bulk drift defers cached-point shifts (bounds move eagerly); the
         // first full-detail frame after a drift pays one flush. LOD frames
         // never touch ops, so drift loops at overview zoom skip it entirely.
-        self.core.scene.flush_pending_ops();
+        self.core.flush_pending_ops();
         let (w, h) = self.core.viewport_size();
         let viewport = self.core.camera().viewport(w, h);
         self.core.ensure_area(viewport);
-        self.core.scene.flush_preview_stale(viewport);
+        self.core.flush_preview_stale(viewport);
         // During playback, unrevealed elements stay off the canvas. The
         // document is final the whole time; this is view state only.
         // Borrowed, never cloned: the old per-frame BTreeSet clone cost
@@ -916,25 +915,25 @@ impl Editor {
         let skip = |id: &str| editing == Some(id) || hidden.is_some_and(|set| set.contains(id));
         let transform = self.core.camera().transform().then(Affine::scale(self.dpr));
         {
-            let scene = &self.core.scene;
+            // Contains-all fast path: the cached union makes the check O(1);
+            // overviews skip 100k per-layer intersection tests.
+            let all_visible = self
+                .core
+                .cached_scene_bounds()
+                .is_some_and(|b| viewport_contains(&viewport, &b));
             let renderer = &mut self.renderer;
             renderer.begin_frame();
             renderer.clear(BACKGROUND);
             renderer.set_transform(transform);
-            // Contains-all fast path: the cached union makes the check O(1);
-            // overviews skip 100k per-layer intersection tests.
-            let all_visible = scene
-                .cached_bounds()
-                .is_some_and(|b| viewport_contains(&viewport, &b));
             if all_visible {
-                for layer in scene.all_layers() {
+                for layer in self.core.all_layers() {
                     if skip(&layer.element_id) {
                         continue;
                     }
                     renderer.draw_ops(&layer.ops);
                 }
             } else {
-                for layer in scene.visible(viewport) {
+                for layer in self.core.visible_layers(viewport) {
                     if skip(&layer.element_id) {
                         continue;
                     }
@@ -968,13 +967,12 @@ impl Editor {
         // zero per-rect allocation.
         let all_visible = self
             .core
-            .scene
-            .cached_bounds()
+            .cached_scene_bounds()
             .is_some_and(|b| viewport_contains(&viewport, &b));
         // Pass 1: distinct palette indices, in first-seen (z) order.
         let mut lod_present: Vec<u32> = Vec::new();
         if all_visible {
-            for layer in self.core.scene.all_layers() {
+            for layer in self.core.all_layers() {
                 let Some(idx) = layer.lod else {
                     continue;
                 };
@@ -989,7 +987,7 @@ impl Editor {
                 }
             }
         } else {
-            for layer in self.core.scene.visible(viewport) {
+            for layer in self.core.visible_layers(viewport) {
                 let Some(idx) = layer.lod else {
                     continue;
                 };
@@ -1009,14 +1007,14 @@ impl Editor {
         // a hairline so dense overviews read solid instead of sparkling.
         // Palette strings are cloned once per color per frame (a handful of
         // small allocs); rects stream with no allocation.
-        let palette: Vec<String> = self.core.scene.palette().to_vec();
+        let palette: Vec<String> = self.core.scene_palette().to_vec();
         for idx in &lod_present {
             let Some(color) = palette.get(*idx as usize) else {
                 continue;
             };
             renderer.ctx.begin_path();
             if all_visible {
-                for layer in self.core.scene.all_layers() {
+                for layer in self.core.all_layers() {
                     if layer.lod != Some(*idx) {
                         continue;
                     }
@@ -1027,7 +1025,7 @@ impl Editor {
                     renderer.ctx.rect(b.x, b.y, b.w.max(0.5), b.h.max(0.5));
                 }
             } else {
-                for layer in self.core.scene.visible(viewport) {
+                for layer in self.core.visible_layers(viewport) {
                     if layer.lod != Some(*idx) {
                         continue;
                     }
@@ -1219,7 +1217,7 @@ impl Editor {
 
     pub fn zoom_to_fit(&mut self) {
         self.cancel_camera_transition();
-        if let Some(bounds) = self.core.scene.bounds() {
+        if let Some(bounds) = self.core.scene_bounds() {
             self.core.camera().zoom_to_fit(
                 bounds,
                 (
@@ -1489,7 +1487,7 @@ impl Editor {
             *routing,
             waypoints,
             self.core.document(),
-            &self.core.obstacles,
+            self.core.obstacles(),
         )
         .into_iter()
         .flat_map(|p| [p.x, p.y])
@@ -1805,12 +1803,12 @@ impl Editor {
             .set_transform(camera.transform().then(Affine::scale(self.dpr)));
         // Non-LOD only (LOD pans fall back to render before reaching here):
         // deferred drift points must be flushed so strips paint new positions.
-        self.core.scene.flush_pending_ops();
+        self.core.flush_pending_ops();
         for strip in world.iter().copied() {
             self.core.ensure_area(strip);
-            self.core.scene.flush_preview_stale(strip);
+            self.core.flush_preview_stale(strip);
         }
-        for layer in self.core.scene.layers.iter() {
+        for layer in self.core.scene_layers().iter() {
             if world.iter().any(|rect| layer.bounds.intersects(rect)) {
                 self.renderer.draw_ops(&layer.ops);
             }
@@ -1956,11 +1954,11 @@ impl Editor {
             .set_transform(self.core.camera().transform().then(Affine::scale(self.dpr)));
         // Non-LOD only (LOD edits full-render before reaching here): flush
         // deferred drift so repainted layers draw at new positions.
-        self.core.scene.flush_pending_ops();
+        self.core.flush_pending_ops();
         self.core.ensure_area(union);
-        self.core.scene.flush_preview_stale(union);
+        self.core.flush_preview_stale(union);
         let editing = self.core.editing_text_id();
-        for layer in self.core.scene.layers.iter() {
+        for layer in self.core.scene_layers().iter() {
             if !layer.bounds.intersects(&union) {
                 continue;
             }

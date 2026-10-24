@@ -26,6 +26,7 @@ pub mod merge;
 pub mod model;
 pub mod nav;
 pub mod patch;
+mod projection;
 pub mod relations;
 pub mod rough;
 pub mod scene;
