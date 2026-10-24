@@ -18,11 +18,10 @@ existing drawing, selection or named workspace — work on the one the user is
 pointing at.
 
 For drawing, editing, arranging, reverting or saving discussion notes, delegate
-to the canvas agent. In Codex, spawn the custom agent type canvas; include the
+to the canvas agent. In OpenCode, spawn the `canvas` subagent; include the
 workspace context, observed revision, relevant handles, desired change and
-constraints. Codex's allowlist excludes mutations; in OpenCode the mutating
-tools ask for approval. Keep discussion, read tools and gentle presentation on
-the primary agent.
+constraints. The mutating canvas tools ask for approval. Keep discussion, read
+tools and gentle presentation on the primary agent.
 
 Preserve alternatives while exploring. Verify the canvas agent's returned changed
 lines and transaction with a scoped `canvas_read`; ask for `canvas_screenshot`

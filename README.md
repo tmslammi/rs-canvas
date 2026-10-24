@@ -27,7 +27,7 @@ The app serves MCP at <http://127.0.0.1:5173/mcp>, with a WebSocket to the open 
 
 The page owns the live document. The agent works on a mirrored copy and its edits cross over through the same deltas the browser uses, so there is no second document to reconcile. Camera moves are transient; any user input takes the view back. The server binds to localhost only.
 
-`opencode.jsonc` and `.codex/config.toml` already point opencode and Codex at the endpoint; other MCP clients can use the URL above. The design is in [`docs/adr/0005-agent-drives-canvas.md`](docs/adr/0005-agent-drives-canvas.md).
+Point any MCP client at the URL above; the checked-in `opencode.jsonc` wires up opencode. The design is in [`docs/adr/0005-agent-drives-canvas.md`](docs/adr/0005-agent-drives-canvas.md).
 
 ## Build from source
 
