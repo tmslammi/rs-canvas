@@ -25,9 +25,15 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
+      - name: Read the Rust toolchain
+        id: toolchain
+        run: |
+          version=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
+          [ -n "$version" ] || { echo "::error::rust-toolchain.toml has no channel"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.94.0"
+          toolchain: ${{ steps.toolchain.outputs.version }}
           components: rustfmt, clippy
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -39,9 +45,15 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
+      - name: Read the Rust toolchain
+        id: toolchain
+        run: |
+          version=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
+          [ -n "$version" ] || { echo "::error::rust-toolchain.toml has no channel"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.94.0"
+          toolchain: ${{ steps.toolchain.outputs.version }}
           targets: wasm32-unknown-unknown
       - name: Read the wasm-bindgen version
         id: wasm-bindgen

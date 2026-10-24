@@ -1,0 +1,8 @@
+2.63ms uuid::v4::<impl uuid::Uuid>::new_v4:
+1.42ms <uuid::fmt::Hyphenated as core::fmt::LowerHex>::fmt:
+1.28ms canvas_core::model::Element::new:
+0.95ms __wbg_getRandomValues_a678b7300e8ed57f
+0.32ms canvas_core::model::Element::new:
+0.32ms uuid::v4::<impl uuid::Uuid>::new_v4:
+0.32ms canvas_core::model::Element::new:
+total 7.24ms

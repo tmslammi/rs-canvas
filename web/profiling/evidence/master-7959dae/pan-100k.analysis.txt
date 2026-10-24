@@ -1,0 +1,44 @@
+
+=== evidence/master-7959dae/pan-100k.cpuprofile — total 1346ms of samples ===
+
+top functions by self time:
+    1210.8ms  90.0%  [other] (idle) @ (native):0
+      85.5ms   6.4%  [other] (program) @ (native):0
+      16.2ms   1.2%  [wasm] canvas_wasm::Editor::try_paint_pan_current::he15c5e95baea5a5f @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+      14.5ms   1.1%  [wasm] canvas_core::geometry::Rect::intersects::h61a05adbb3cebd16 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       9.1ms   0.7%  [wasm] canvas_core::scene::Scene::ensure_area::hae2388be74950c3c @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       1.0ms   0.1%  [other] fill @ (native):0
+       0.9ms   0.1%  [other] (garbage collector) @ (native):0
+       0.6ms   0.0%  [js] settleView @ http://localhost:4180/src/main.js:694
+       0.6ms   0.0%  [wasm] canvas_core::editor::Editor::ensure_area::hef37ebb0a56d5549 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.6ms   0.0%  [other] clearRect @ (native):0
+       0.4ms   0.0%  [wasm] <dlmalloc::sys::System as dlmalloc::Allocator>::alloc::h5e0d28c009e5d62c @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.3ms   0.0%  [other] strokeRect @ (native):0
+       0.3ms   0.0%  [js] (anonymous) @ http://localhost:4180/src/wasm/canvas_wasm.js:1161
+       0.3ms   0.0%  [other] (anonymous) @ (native):1
+       0.3ms   0.0%  [other] wasm-to-js @ (native):0
+       0.3ms   0.0%  [wasm] canvas_wasm::Editor::draw_overlay::hf4f78a9b37f54aaa @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.3ms   0.0%  [js] decodeText @ http://localhost:4180/src/wasm/canvas_wasm.js:1562
+       0.3ms   0.0%  [other] drawImage @ (native):0
+       0.3ms   0.0%  [wasm] alloc::vec::Vec<T,A>::extend_trusted::h6e47a793e9e992a8 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.3ms   0.0%  [js] cursor @ http://localhost:4180/src/wasm/canvas_wasm.js:120
+
+totals: wasm 42.5ms (3.2%), js 2.2ms (0.2%)
+
+top wasm functions by self time:
+      16.2ms   1.2%  canvas_wasm::Editor::try_paint_pan_current::he15c5e95baea5a5f @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+      14.5ms   1.1%  canvas_core::geometry::Rect::intersects::h61a05adbb3cebd16 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       9.1ms   0.7%  canvas_core::scene::Scene::ensure_area::hae2388be74950c3c @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.6ms   0.0%  canvas_core::editor::Editor::ensure_area::hef37ebb0a56d5549 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.4ms   0.0%  <dlmalloc::sys::System as dlmalloc::Allocator>::alloc::h5e0d28c009e5d62c @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.3ms   0.0%  canvas_wasm::Editor::draw_overlay::hf4f78a9b37f54aaa @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.3ms   0.0%  alloc::vec::Vec<T,A>::extend_trusted::h6e47a793e9e992a8 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.3ms   0.0%  web_sys::features::gen_CanvasRenderingContext2d::CanvasRenderingContext2d::line_to::__wbg_lineTo_63fac7d60279d95e::hfdad0a2034c47a41 externref shim @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.3ms   0.0%  dlmalloc::dlmalloc::Dlmalloc<A>::malloc::h56d0ddc1cdd2a835 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.3ms   0.0%  js-to-wasm:: @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+
+top scripts by self time:
+    1301.3ms  96.7%  (native)
+      42.5ms   3.2%  http://localhost:4180/src/wasm/canvas_wasm_bg.wasm
+       1.6ms   0.1%  http://localhost:4180/src/wasm/canvas_wasm.js
+       0.6ms   0.0%  http://localhost:4180/src/main.js

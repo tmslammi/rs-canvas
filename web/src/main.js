@@ -823,6 +823,18 @@ async function boot() {
     onDiscussionChange: (notes, persisted) => agentPanel.setDiscussion(notes, persisted),
     onWorkspaceChange: async (change) => {
       if (workspaceLeaving || !validWorkspaceName(change.workspace)) return;
+      if (change.action === "switch") {
+        // The agent created and opened another workspace. Keep this browser's
+        // autosave for the outgoing one, then follow the server's navigation.
+        workspaceLeaving = true;
+        try {
+          await storeOutgoingWorkspace();
+        } catch {
+          // The server mirror still holds the outgoing document.
+        }
+        navigateWorkspace(change.workspace, `Opened workspace ${change.workspace}`);
+        return;
+      }
       workspaceLeaving = true;
       pauseWorkspaceSave();
       bridge?.close();

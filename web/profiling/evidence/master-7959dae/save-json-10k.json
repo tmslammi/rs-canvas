@@ -1,0 +1,34 @@
+{
+  "name": "save-json-10k",
+  "actionError": null,
+  "result": {
+    "saveMs": 20.6,
+    "bytes": 6452079
+  },
+  "durationMs": 25.2,
+  "metrics": {
+    "LayoutCount": 0,
+    "RecalcStyleCount": 0,
+    "LayoutDuration": 0,
+    "RecalcStyleDuration": 0,
+    "ScriptDuration": 0,
+    "TaskDuration": 0.025285,
+    "JSHeapUsedSize": 1741612,
+    "JSHeapTotalSize": 4259840,
+    "Nodes": 262,
+    "Documents": 1,
+    "Frames": 1,
+    "JSEventListeners": 117
+  },
+  "wasm": {
+    "bytes": 29949952,
+    "memories": 1,
+    "grows": 0,
+    "growBytes": 29949952
+  },
+  "longTasks": {
+    "count": 0,
+    "totalMs": 0,
+    "maxMs": 0
+  }
+}

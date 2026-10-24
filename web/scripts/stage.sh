@@ -7,4 +7,3 @@ rm -rf dist
 mkdir -p dist
 cp index.html dist/
 cp -R src fonts dist/
-rm -f dist/src/*.md

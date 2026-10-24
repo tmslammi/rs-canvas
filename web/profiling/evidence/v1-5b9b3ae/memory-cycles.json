@@ -1,0 +1,52 @@
+[
+  {
+    "name": "booted",
+    "jsHeapUsedMB": 1.5,
+    "jsHeapTotalMB": 2.3,
+    "nodes": 191,
+    "listeners": 101,
+    "wasmMB": 1.1,
+    "wasmGrows": 0,
+    "count": 0
+  },
+  {
+    "name": "load-10k",
+    "jsHeapUsedMB": 1.5,
+    "jsHeapTotalMB": 2.1,
+    "nodes": 191,
+    "listeners": 101,
+    "wasmMB": 34.4,
+    "wasmGrows": 0,
+    "count": 10000
+  },
+  {
+    "name": "cleared",
+    "jsHeapUsedMB": 1.5,
+    "jsHeapTotalMB": 2.1,
+    "nodes": 191,
+    "listeners": 101,
+    "wasmMB": 34.4,
+    "wasmGrows": 0,
+    "count": 0
+  },
+  {
+    "name": "load-10k-again",
+    "jsHeapUsedMB": 1.5,
+    "jsHeapTotalMB": 2.1,
+    "nodes": 191,
+    "listeners": 101,
+    "wasmMB": 34.7,
+    "wasmGrows": 0,
+    "count": 10000
+  },
+  {
+    "name": "reloaded-page",
+    "jsHeapUsedMB": 1.5,
+    "jsHeapTotalMB": 2.1,
+    "nodes": 191,
+    "listeners": 101,
+    "wasmMB": 34.7,
+    "wasmGrows": 0,
+    "count": 10000
+  }
+]

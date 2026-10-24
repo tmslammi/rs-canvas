@@ -12,17 +12,23 @@ smallest useful sketch or revision, preserving existing work and element identit
    camera preferences. Read only relevant handles, the selection or a frame with
    canvas_read; use detail when exact geometry or bindings matter. A read is complete
    when the targets and their ownership are clear. Discover unfamiliar glyphs with
-   canvas_glyphs. After a stale-context error, reread before acting.
+   canvas_glyphs. After a stale-context error, reread before acting. At the start of
+   a session that has no existing drawing to work on, create a session workspace
+   with canvas_workspace_create using a short topic name, then read canvas_status
+   there before drawing. When the brief points at an existing drawing or workspace,
+   work on that one instead.
 2. Prefer one canvas_script batch, passing context and revision from the read.
    Use update beats to rename, move, resize, restyle or reconnect existing elements.
    Draw alternative designs beside the original when asked to compare them. Use
    descriptive local aliases (e<number> is reserved), frame for ownership, and around
    to draw a frame that owns existing elements. Include captions/focus/point only
    when a paced explanation helps; otherwise let the batch land immediately.
-3. Inspect the returned changed lines and removed handles. Use a scoped read or
-   screenshot to verify relationships, labels and spacing. Revise until the brief's
-   intended flow is represented and unintended edits are absent. Playback cancellation
-   means the user took over; the committed drawing still exists.
+3. Inspect the returned changed lines and removed handles. Use a scoped read to
+   verify relationships, labels and spacing; reach for canvas_screenshot only when
+   the rendered result itself matters (text wrapping, ink, exact camera framing) or
+   the user asks to see it. Revise until the brief's intended flow is represented
+   and unintended edits are absent. Playback cancellation means the user took
+   over; the committed drawing still exists.
 4. Report relevant handles, the transaction ID and any unresolved tradeoff briefly.
    Use canvas_revert when asked to back out of an experiment; a conflict means later
    work must be preserved and revised explicitly. Revert is available for the last
@@ -38,4 +44,4 @@ The Agent panel shows the note; persistence requires a workspace backed by a fil
 url = "http://127.0.0.1:5173/mcp"
 startup_timeout_sec = 30
 tool_timeout_sec = 120
-enabled_tools = ["canvas_status", "canvas_read", "canvas_screenshot", "canvas_focus", "canvas_point", "canvas_zoom", "canvas_glyphs", "canvas_draw", "canvas_pen", "canvas_script", "canvas_bulk", "canvas_clear", "canvas_annotate", "canvas_emphasis", "canvas_tidy", "canvas_revert", "canvas_remember"]
+enabled_tools = ["canvas_status", "canvas_read", "canvas_screenshot", "canvas_focus", "canvas_point", "canvas_zoom", "canvas_glyphs", "canvas_draw", "canvas_pen", "canvas_script", "canvas_bulk", "canvas_clear", "canvas_annotate", "canvas_emphasis", "canvas_tidy", "canvas_revert", "canvas_remember", "canvas_workspace_create"]

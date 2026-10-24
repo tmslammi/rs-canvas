@@ -1,0 +1,22 @@
+
+=== out/load-10k.heapsnapshot — heap 45.9MB across 53,673 nodes ===
+
+      41.6MB  x      1  native:system / JSArrayBufferData
+       1.8MB  x      1  native:system / CppGCManaged (WasmNativeModule)
+       0.3MB  x      1  string:
+        (() => {
+
+        const module = {};
+   ...
+       0.2MB  x    222  native:system / ExternalStringData
+       0.2MB  x   3055  native:system / FunctionTemplateInfo
+       0.2MB  x   1244  array:(unnamed)
+       0.1MB  x    658  object shape:system / DescriptorArray
+       0.1MB  x     56  array:(object properties)
+       0.1MB  x   1373  object shape:system / Map
+       0.1MB  x      8  native:blink::HeapHashTableBacking<blink::HashTable<std::pair<bl...
+       0.1MB  x    449  native:blink::ImmutableCSSPropertyValueSet
+       0.0MB  x   2496  native:system / PropertyCell
+       0.0MB  x     10  code:(script line ends)
+       0.0MB  x     89  native:system / ArrayList
+       0.0MB  x    458  native:blink::StyleRule

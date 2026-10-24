@@ -132,6 +132,46 @@ pub fn describe_element_with(doc: &Document, element: &Element, ids: &mut dyn Id
     line
 }
 
+/// One element as the structured read projection (schema version 1).
+///
+/// Carries the same identity and geometry as the compact line: handle, raw
+/// id, kind, `[x, y, w, h]`, label and owning frame handle. Fields that do not
+/// apply are `null`; the caller attaches the exact element JSON for detail
+/// reads.
+pub fn structured_element(
+    doc: &Document,
+    element: &Element,
+    ids: &mut dyn IdMap,
+) -> serde_json::Value {
+    let bounds = element.bounds();
+    let handle = ids.map(&element.id);
+    let frame = element.frame_id.as_deref().map(|id| ids.map(id));
+    serde_json::json!({
+        "handle": handle,
+        "id": element.id,
+        "kind": kind_name(element),
+        "bounds": [bounds.x, bounds.y, bounds.w, bounds.h],
+        "label": label_of(doc, element),
+        "frame": frame,
+    })
+}
+
+/// The agent-facing label/name/text of an element, if it has one.
+pub fn label_of(doc: &Document, element: &Element) -> Option<String> {
+    match &element.kind {
+        ElementKind::Shape { bound_text_id, .. } => {
+            bound_text_id.as_ref().and_then(|id| text_of(doc, id))
+        }
+        ElementKind::Glyph { caption_id, .. } => {
+            caption_id.as_ref().and_then(|id| text_of(doc, id))
+        }
+        ElementKind::Text { text, .. } => Some(text.clone()),
+        ElementKind::Frame { name, .. } => (!name.is_empty()).then(|| name.clone()),
+        ElementKind::Arrow { label_id, .. } => label_id.as_ref().and_then(|id| text_of(doc, id)),
+        ElementKind::Freehand { .. } | ElementKind::StickyStack { .. } => None,
+    }
+}
+
 /// The text of a text element, if `id` names one.
 pub fn text_of(doc: &Document, id: &str) -> Option<String> {
     match &doc.element(id)?.kind {

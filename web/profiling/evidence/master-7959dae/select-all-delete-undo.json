@@ -1,0 +1,38 @@
+{
+  "name": "select-all-delete-undo",
+  "actionError": null,
+  "result": {
+    "selectMs": 2.799999952316284,
+    "deleteMs": 1805.9000000953674,
+    "undoMs": 79.20000004768372,
+    "afterSelect": 10000,
+    "afterDelete": 0,
+    "count": 10000
+  },
+  "durationMs": 1905.9,
+  "metrics": {
+    "LayoutCount": 1,
+    "RecalcStyleCount": 2,
+    "LayoutDuration": 0.000105,
+    "RecalcStyleDuration": 0.000081,
+    "ScriptDuration": 0.00021,
+    "TaskDuration": 1.90848,
+    "JSHeapUsedSize": 1771708,
+    "JSHeapTotalSize": 5046272,
+    "Nodes": 262,
+    "Documents": 1,
+    "Frames": 1,
+    "JSEventListeners": 117
+  },
+  "wasm": {
+    "bytes": 63176704,
+    "memories": 1,
+    "grows": 0,
+    "growBytes": 63176704
+  },
+  "longTasks": {
+    "count": 1,
+    "totalMs": 1889,
+    "maxMs": 1889
+  }
+}

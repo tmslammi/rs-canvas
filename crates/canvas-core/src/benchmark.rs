@@ -98,7 +98,7 @@ pub fn benchmark_fixture(count: usize) -> Document {
                 bound_text_id: None,
             },
         };
-        let element = Element::new(kind, index, i as u64).with_id(format!("bench-{i:05}"));
+        let element = Element::new_with_id(kind, index, i as u64, format!("bench-{i:05}"));
         if !matches!(element.kind, ElementKind::Arrow { .. }) {
             shapes.push(element.id.clone());
         }
@@ -155,7 +155,7 @@ pub fn connected_fixture(nodes: usize, arrows_per_node: usize) -> Document {
             style,
             bound_text_id: None,
         };
-        let element = Element::new(kind, index, i as u64).with_id(format!("perf-{i:06}"));
+        let element = Element::new_with_id(kind, index, i as u64, format!("perf-{i:06}"));
         node_ids.push(element.id.clone());
         doc.insert(element);
     }
@@ -179,7 +179,7 @@ pub fn connected_fixture(nodes: usize, arrows_per_node: usize) -> Document {
                 .map(|e| e.bounds())
                 .unwrap_or(Rect::ZERO);
             let index = next_index(&mut last_index);
-            let connector = Element::new(
+            let connector = Element::new_with_id(
                 ElementKind::Arrow {
                     start: crate::model::Endpoint {
                         x: from_rect.center().x,
@@ -206,8 +206,8 @@ pub fn connected_fixture(nodes: usize, arrows_per_node: usize) -> Document {
                 },
                 index,
                 arrow_index as u64,
-            )
-            .with_id(format!("perf-arrow-{arrow_index:06}"));
+                format!("perf-arrow-{arrow_index:06}"),
+            );
             arrow_index += 1;
             doc.insert(connector);
         }
@@ -224,6 +224,18 @@ mod tests {
     fn fixture_has_the_requested_size() {
         let doc = benchmark_fixture(500);
         assert_eq!(doc.ordered_live().len(), 500);
+    }
+
+    #[test]
+    fn fixtures_never_generate_element_ids() {
+        let before = crate::id::element_id_generations();
+        let _ = benchmark_fixture(200);
+        let _ = connected_fixture(100, 2);
+        assert_eq!(
+            crate::id::element_id_generations(),
+            before,
+            "fixtures supply their own ids and must stay off the id RNG"
+        );
     }
 
     #[test]

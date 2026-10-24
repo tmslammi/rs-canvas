@@ -189,7 +189,7 @@ fn insert_element(
     } else {
         stats.bounds = Some(kind_bounds(&kind));
     }
-    let element = Element::new(kind, index, now_ms).with_id(id.clone());
+    let element = Element::new_with_id(kind, index, now_ms, id.clone());
     doc.insert(element);
     stats.new_ids.push(id.clone());
     Ok(id)
@@ -593,6 +593,7 @@ mod tests {
 
     #[test]
     fn bulk_shapes_and_connects_link_up() {
+        let before = crate::id::element_id_generations();
         let mut doc = doc();
         let mut chain = KeyChain::new(&doc);
         let mut stats = BulkStats::default();
@@ -628,6 +629,11 @@ mod tests {
         assert_eq!(stats.connects, 2);
         assert_eq!(doc.live_count(), 4 + 1 + 2);
         assert!(stats.bounds.is_some());
+        assert_eq!(
+            crate::id::element_id_generations() - before,
+            stats.new_ids.len(),
+            "bulk draws exactly one id per element, never one it discards"
+        );
     }
 
     #[test]

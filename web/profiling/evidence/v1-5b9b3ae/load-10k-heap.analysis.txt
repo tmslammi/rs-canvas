@@ -1,0 +1,22 @@
+
+=== /Users/tms/Documents/projects/rs-canvas-perf/web/profiling/out/load-10k.heapsnapshot — heap 68.8MB across 56,018 nodes ===
+
+      63.3MB  x      1  native:system / JSArrayBufferData
+       1.7MB  x      1  native:system / CppGCManaged (WasmNativeModule)
+       1.2MB  x   1006  native:blink::PlainTextNode
+       0.3MB  x      1  string:
+        (() => {
+
+        const module = {};
+   ...
+       0.2MB  x   3000  native:system / FunctionTemplateInfo
+       0.2MB  x    146  native:system / ExternalStringData
+       0.2MB  x   1217  array:(unnamed)
+       0.1MB  x    654  object shape:system / DescriptorArray
+       0.1MB  x     53  array:(object properties)
+       0.1MB  x      5  native:blink::HeapHashTableBacking<blink::HashTable<std::pair<bl...
+       0.1MB  x   1052  native:blink::ShapeResult
+       0.1MB  x   1052  native:blink::ShapeResultRun
+       0.1MB  x   1350  object shape:system / Map
+       0.0MB  x    440  native:blink::ImmutableCSSPropertyValueSet
+       0.0MB  x   2496  native:system / PropertyCell

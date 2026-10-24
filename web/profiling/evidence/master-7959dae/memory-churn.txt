@@ -1,0 +1,11 @@
+loaded: 12.3MB
+delete/undo 1: wasm 60.3MB, jsHeap 1.57MB, count 10000
+delete/undo 2: wasm 97.7MB, jsHeap 1.58MB, count 10000
+delete/undo 3: wasm 138.6MB, jsHeap 1.58MB, count 10000
+delete/undo 4: wasm 138.6MB, jsHeap 1.59MB, count 10000
+delete/undo 5: wasm 220.4MB, jsHeap 1.60MB, count 10000
+stroke 1: wasm 220.4MB
+stroke 2: wasm 220.4MB
+stroke 3: wasm 220.4MB
+stroke 4: wasm 220.4MB
+stroke 5: wasm 220.4MB

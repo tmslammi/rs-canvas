@@ -1,0 +1,41 @@
+
+=== evidence/master-7959dae/zoom-100k.cpuprofile — total 1025ms of samples ===
+
+top functions by self time:
+     943.8ms  92.0%  [other] (idle) @ (native):0
+      48.9ms   4.8%  [other] (program) @ (native):0
+      11.1ms   1.1%  [wasm] canvas_wasm::Editor::render::h3ccf2ff838da24d8 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       8.3ms   0.8%  [wasm] canvas_core::geometry::Rect::intersects::h61a05adbb3cebd16 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       6.0ms   0.6%  [wasm] canvas_core::scene::Scene::ensure_area::hae2388be74950c3c @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       1.1ms   0.1%  [other] (garbage collector) @ (native):0
+       0.9ms   0.1%  [other] wasm-to-js @ (native):1
+       0.9ms   0.1%  [other] fill @ (native):0
+       0.3ms   0.0%  [other] clearRect @ (native):0
+       0.3ms   0.0%  [other] save @ (native):0
+       0.3ms   0.0%  [other] wasm-to-js @ (native):0
+       0.3ms   0.0%  [js] __wbg_beginPath_8598d895c13f1c86 @ http://localhost:4180/src/wasm/canvas_wasm.js:813
+       0.3ms   0.0%  [wasm] <js_sys::Array as core::default::Default>::default::he7c4368f02e86980 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.3ms   0.0%  [wasm] __externref_table_alloc @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.3ms   0.0%  [js] refreshToolbar @ http://localhost:4180/src/main.js:310
+       0.3ms   0.0%  [other] decode @ (native):0
+       0.3ms   0.0%  [js] __wbg_lineTo_63fac7d60279d95e @ http://localhost:4180/src/wasm/canvas_wasm.js:1058
+       0.3ms   0.0%  [js] __wbg_set_fillStyle_a2961b4d44e572af @ http://localhost:4180/src/wasm/canvas_wasm.js:1171
+       0.3ms   0.0%  [other] fillRect @ (native):0
+       0.3ms   0.0%  [wasm] <canvas_wasm::Canvas2dRenderer as canvas_core::display::Renderer>::draw_path::h7ccae1e55c08d974 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+
+totals: wasm 26.7ms (2.6%), js 1.6ms (0.2%)
+
+top wasm functions by self time:
+      11.1ms   1.1%  canvas_wasm::Editor::render::h3ccf2ff838da24d8 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       8.3ms   0.8%  canvas_core::geometry::Rect::intersects::h61a05adbb3cebd16 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       6.0ms   0.6%  canvas_core::scene::Scene::ensure_area::hae2388be74950c3c @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.3ms   0.0%  <js_sys::Array as core::default::Default>::default::he7c4368f02e86980 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.3ms   0.0%  __externref_table_alloc @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.3ms   0.0%  <canvas_wasm::Canvas2dRenderer as canvas_core::display::Renderer>::draw_path::h7ccae1e55c08d974 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.3ms   0.0%  canvas_wasm::Editor::draw_grid::hdde1e7916c88bbab @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+
+top scripts by self time:
+     997.2ms  97.2%  (native)
+      26.7ms   2.6%  http://localhost:4180/src/wasm/canvas_wasm_bg.wasm
+       1.3ms   0.1%  http://localhost:4180/src/wasm/canvas_wasm.js
+       0.3ms   0.0%  http://localhost:4180/src/main.js

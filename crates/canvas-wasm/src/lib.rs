@@ -409,6 +409,9 @@ impl Editor {
         grid_canvas: HtmlCanvasElement,
     ) -> Result<Editor, JsValue> {
         console_error_panic_hook::set_once();
+        // The only platform-entropy crossing: seed ids and nonces at boot so
+        // fixture loads and first edits never enter JS for randomness.
+        canvas_core::id::seed_process_rng();
         let ctx = scene_canvas
             .get_context("2d")?
             .ok_or_else(|| JsValue::from_str("scene canvas has no 2d context"))?
@@ -620,6 +623,12 @@ impl Editor {
             return Vec::new();
         };
         wire::encode_patch(self.wire_revision, &patch.put).unwrap_or_default()
+    }
+
+    /// Drop pending deltas without projecting them; the reconnect snapshot
+    /// carries the document instead.
+    pub fn discard_outbound(&mut self) {
+        self.core.history.discard_outbox();
     }
 
     /// Merge a server patch — a JSON array of full elements, tombstones

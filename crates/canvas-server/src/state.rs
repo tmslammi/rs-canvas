@@ -7,6 +7,8 @@
 //! read and write. Both sides meet through the existing `canvas-core` merge
 //! rules, never through a bespoke protocol. Agent calls always act on the
 //! current workspace — the one the user's most recently active page is on.
+//! Creating a workspace is the one routing action: it navigates the user's
+//! page to the new workspace (ADR-0008).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -14,7 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use canvas_core::model::{Document, Element};
+use canvas_core::model::{Document, Element, ElementKind, Style};
 use canvas_core::serialization;
 use tokio::sync::{broadcast, Mutex, Notify};
 
@@ -116,12 +118,250 @@ impl Drop for BinaryPageGuard<'_> {
     }
 }
 
+/// What kind of change one element underwent, as far as a before/after
+/// comparison can tell. One element may carry several kinds (a move that
+/// also resizes and relabels, for example).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ChangeKind {
+    Added,
+    Removed,
+    Moved,
+    Resized,
+    Relabelled,
+    Restyled,
+    Reparented,
+    Reordered,
+    Other,
+}
+
+impl ChangeKind {
+    /// Reporting order for revision summaries and per-element lists.
+    pub const ALL: [ChangeKind; 9] = [
+        ChangeKind::Added,
+        ChangeKind::Removed,
+        ChangeKind::Moved,
+        ChangeKind::Resized,
+        ChangeKind::Relabelled,
+        ChangeKind::Restyled,
+        ChangeKind::Reparented,
+        ChangeKind::Reordered,
+        ChangeKind::Other,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ChangeKind::Added => "added",
+            ChangeKind::Removed => "removed",
+            ChangeKind::Moved => "moved",
+            ChangeKind::Resized => "resized",
+            ChangeKind::Relabelled => "relabelled",
+            ChangeKind::Restyled => "restyled",
+            ChangeKind::Reparented => "reparented",
+            ChangeKind::Reordered => "reordered",
+            ChangeKind::Other => "other",
+        }
+    }
+}
+
+/// One element in a change record: its id and every kind detected.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChangedElement {
+    pub id: String,
+    pub kinds: Vec<ChangeKind>,
+}
+
 /// One recorded document change, for `canvas_read(since)`.
 #[derive(Clone, Debug)]
 pub struct ChangeRecord {
     pub revision: u64,
     pub source: String,
-    pub changed: Vec<String>,
+    pub changed: Vec<ChangedElement>,
+}
+
+impl ChangeRecord {
+    /// Per-kind element counts for this revision, in reporting order.
+    pub fn kind_counts(&self) -> Vec<(ChangeKind, usize)> {
+        ChangeKind::ALL
+            .iter()
+            .filter_map(|kind| {
+                let count = self
+                    .changed
+                    .iter()
+                    .filter(|change| change.kinds.contains(kind))
+                    .count();
+                (count > 0).then_some((*kind, count))
+            })
+            .collect()
+    }
+}
+
+/// Classify one element from its before/after copies. Every changed id gets
+/// at least one kind, so a change can never be silently dropped.
+fn classify_change(before: Option<&Element>, after: Option<&Element>) -> Vec<ChangeKind> {
+    let Some(after) = after else {
+        return vec![ChangeKind::Removed];
+    };
+    let Some(before) = before else {
+        return if after.is_deleted {
+            vec![ChangeKind::Removed]
+        } else {
+            vec![ChangeKind::Added]
+        };
+    };
+    if after.is_deleted {
+        return if before.is_deleted {
+            vec![ChangeKind::Other]
+        } else {
+            vec![ChangeKind::Removed]
+        };
+    }
+    if before.is_deleted {
+        return vec![ChangeKind::Added];
+    }
+
+    let mut kinds = Vec::new();
+    let before_bounds = before.bounds();
+    let after_bounds = after.bounds();
+    if before_bounds.x != after_bounds.x || before_bounds.y != after_bounds.y {
+        kinds.push(ChangeKind::Moved);
+    }
+    if before_bounds.w != after_bounds.w || before_bounds.h != after_bounds.h {
+        kinds.push(ChangeKind::Resized);
+    }
+    if label_changed(before, after) {
+        kinds.push(ChangeKind::Relabelled);
+    }
+    if style_of(before) != style_of(after) {
+        kinds.push(ChangeKind::Restyled);
+    }
+    if parent_of(before) != parent_of(after) {
+        kinds.push(ChangeKind::Reparented);
+    }
+    if before.index != after.index {
+        kinds.push(ChangeKind::Reordered);
+    }
+    if other_change(before, after) {
+        kinds.push(ChangeKind::Other);
+    }
+    if kinds.is_empty() {
+        // Only merge metadata changed (version, nonce, timestamp).
+        kinds.push(ChangeKind::Other);
+    }
+    kinds
+}
+
+fn label_changed(before: &Element, after: &Element) -> bool {
+    match (&before.kind, &after.kind) {
+        (ElementKind::Text { text: before, .. }, ElementKind::Text { text: after, .. })
+        | (ElementKind::Frame { name: before, .. }, ElementKind::Frame { name: after, .. }) => {
+            before != after
+        }
+        _ => false,
+    }
+}
+
+fn style_of(element: &Element) -> Option<&Style> {
+    match &element.kind {
+        ElementKind::Shape { style, .. }
+        | ElementKind::Freehand { style, .. }
+        | ElementKind::Glyph { style, .. }
+        | ElementKind::Arrow { style, .. }
+        | ElementKind::Text { style, .. }
+        | ElementKind::StickyStack { style, .. } => Some(style),
+        ElementKind::Frame { .. } => None,
+    }
+}
+
+/// Parent/owner membership: a frame, plus the container of a bound label.
+fn parent_of(element: &Element) -> (Option<&str>, Option<&str>) {
+    let container = match &element.kind {
+        ElementKind::Text { container_id, .. } => container_id.as_deref(),
+        _ => None,
+    };
+    (element.frame_id.as_deref(), container)
+}
+
+/// Properties outside bounds, label, style, membership and order. Geometry is
+/// deliberately excluded here (endpoint positions move with an arrow, freehand
+/// samples move with a stroke), so a plain move is not also reported as
+/// `other`.
+fn other_change(before: &Element, after: &Element) -> bool {
+    match (&before.kind, &after.kind) {
+        (
+            ElementKind::Shape {
+                shape: before_shape,
+                bound_text_id: before_label,
+                ..
+            },
+            ElementKind::Shape {
+                shape: after_shape,
+                bound_text_id: after_label,
+                ..
+            },
+        ) => before_shape != after_shape || before_label != after_label,
+        (
+            ElementKind::Freehand {
+                pressures: before, ..
+            },
+            ElementKind::Freehand {
+                pressures: after, ..
+            },
+        ) => before != after,
+        (
+            ElementKind::Glyph {
+                glyph: before_glyph,
+                caption_id: before_caption,
+                ..
+            },
+            ElementKind::Glyph {
+                glyph: after_glyph,
+                caption_id: after_caption,
+                ..
+            },
+        ) => before_glyph != after_glyph || before_caption != after_caption,
+        (
+            ElementKind::Arrow {
+                start: before_start,
+                end: before_end,
+                routing: before_routing,
+                start_arrowhead: before_start_head,
+                end_arrowhead: before_end_head,
+                label_id: before_label,
+                ..
+            },
+            ElementKind::Arrow {
+                start: after_start,
+                end: after_end,
+                routing: after_routing,
+                start_arrowhead: after_start_head,
+                end_arrowhead: after_end_head,
+                label_id: after_label,
+                ..
+            },
+        ) => {
+            before_routing != after_routing
+                || before_start_head != after_start_head
+                || before_end_head != after_end_head
+                || before_label != after_label
+                || before_start.binding != after_start.binding
+                || before_end.binding != after_end.binding
+        }
+        (
+            ElementKind::Text {
+                align: before_align,
+                fixed_width: before_fixed,
+                ..
+            },
+            ElementKind::Text {
+                align: after_align,
+                fixed_width: after_fixed,
+                ..
+            },
+        ) => before_align != after_align || before_fixed != after_fixed,
+        (ElementKind::StickyStack { .. }, ElementKind::StickyStack { .. }) => false,
+        (ElementKind::Frame { .. }, ElementKind::Frame { .. }) => false,
+        _ => true,
+    }
 }
 
 /// The most recent page's transient view state, for `canvas_status`.
@@ -282,6 +522,10 @@ pub struct Workspace {
     persist_pending: AtomicBool,
     persist_write: Mutex<()>,
     pub retired: AtomicBool,
+    /// Created explicitly by an agent (or any future create RPC) rather than
+    /// lazily by a page naming the workspace. Keeps an empty workspace in the
+    /// listing even before its first page or element exists.
+    created: AtomicBool,
     /// Wakes the persist loop.
     persist_notify: Notify,
     /// Page acknowledgements of a finished presentation: (id, cancelled).
@@ -329,6 +573,7 @@ impl Workspace {
             persist_pending: AtomicBool::new(false),
             persist_write: Mutex::new(()),
             retired: AtomicBool::new(false),
+            created: AtomicBool::new(false),
             persist_notify: Notify::new(),
             present_acks,
             present_counter: AtomicU64::new(0),
@@ -503,13 +748,19 @@ impl Workspace {
     /// back to the origin as corrections, so a concurrent agent edit cannot
     /// leave the page stale. Returns whether the mirror changed.
     pub async fn absorb_patch(&self, put: Vec<Element>, origin: u64) -> bool {
-        let mut changed_ids: Vec<String> = Vec::new();
+        let mut changes: Vec<ChangedElement> = Vec::new();
         let mut corrections: Vec<Element> = Vec::new();
         {
             let mut doc = self.doc.lock().await;
             for element in &put {
+                // Capture the mirror's copy before merge_element mutates it,
+                // so the diff describes this patch rather than last-write-wins.
+                let before = doc.element(&element.id).cloned();
                 if canvas_core::merge_element(&mut doc, element) {
-                    changed_ids.push(element.id.clone());
+                    changes.push(ChangedElement {
+                        id: element.id.clone(),
+                        kinds: classify_change(before.as_ref(), doc.element(&element.id)),
+                    });
                 } else if let Some(stored) = doc.elements.get(&element.id) {
                     if stored != element && !corrections.iter().any(|e| e.id == element.id) {
                         corrections.push(stored.clone());
@@ -517,14 +768,15 @@ impl Workspace {
                 }
             }
         }
-        if changed_ids.is_empty() && corrections.is_empty() {
+        if changes.is_empty() && corrections.is_empty() {
             return false;
         }
 
-        let revision = if changed_ids.is_empty() {
+        let changed_ids: Vec<String> = changes.iter().map(|change| change.id.clone()).collect();
+        let revision = if changes.is_empty() {
             self.revision.load(Ordering::SeqCst)
         } else {
-            self.record_ids(changed_ids.clone(), "page").await
+            self.record_ids(changes, "page").await
         };
         let winners: Vec<Element> = {
             let doc = self.doc.lock().await;
@@ -604,21 +856,27 @@ impl Workspace {
         after: &Document,
         source: &str,
     ) -> (u64, Vec<Element>) {
-        let mut changed: Vec<String> = Vec::new();
+        let mut changed: Vec<ChangedElement> = Vec::new();
         for (id, after_element) in &after.elements {
             match before.elements.get(id) {
                 Some(before_element) if before_element == after_element => {}
-                _ => changed.push(id.clone()),
+                before_element => changed.push(ChangedElement {
+                    id: id.clone(),
+                    kinds: classify_change(before_element, Some(after_element)),
+                }),
             }
         }
-        for id in before.elements.keys() {
+        for (id, before_element) in &before.elements {
             if !after.elements.contains_key(id) {
-                changed.push(id.clone());
+                changed.push(ChangedElement {
+                    id: id.clone(),
+                    kinds: classify_change(Some(before_element), None),
+                });
             }
         }
         let put: Vec<Element> = changed
             .iter()
-            .filter_map(|id| after.element(id).cloned())
+            .filter_map(|change| after.element(&change.id).cloned())
             .collect();
         if changed.is_empty() {
             return (self.revision.load(Ordering::SeqCst), put);
@@ -632,11 +890,18 @@ impl Workspace {
     /// (which would retain every element); wrap them in a frame to remove
     /// them later with one clear.
     pub async fn record_bulk(&self, changed: Vec<String>) -> u64 {
+        let changed = changed
+            .into_iter()
+            .map(|id| ChangedElement {
+                id,
+                kinds: vec![ChangeKind::Added],
+            })
+            .collect();
         self.record_ids(changed, "agent").await
     }
 
-    /// Record a change by the ids it touched.
-    async fn record_ids(&self, changed: Vec<String>, source: &str) -> u64 {
+    /// Record a change by the elements it touched and the kinds detected.
+    async fn record_ids(&self, changed: Vec<ChangedElement>, source: &str) -> u64 {
         let revision = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
         let mut log = self.change_log.lock().await;
         log.push(ChangeRecord {
@@ -899,6 +1164,44 @@ impl AppState {
             .clone()
     }
 
+    /// Create a new, empty workspace for the user to open. Refuses names that
+    /// are invalid, reserved, already live or already on disk. An empty
+    /// document is written immediately when the workspace has a backing file,
+    /// so creation survives a restart before its first edit.
+    pub async fn create_workspace(
+        &self,
+        name: &str,
+    ) -> Result<Arc<Workspace>, WorkspaceManagementError> {
+        use WorkspaceManagementError::*;
+        if !valid_workspace_name(name) {
+            return Err(Invalid(
+                "Use 1–40 lowercase letters, digits or dashes, starting with a letter or digit."
+                    .into(),
+            ));
+        }
+        if name == DEFAULT_WORKSPACE {
+            return Err(Conflict("The default workspace already exists.".into()));
+        }
+        let _management = self.workspace_management.lock().await;
+        if self.workspaces.lock().unwrap().contains_key(name) {
+            return Err(Conflict(
+                "That workspace already exists. Choose another name.".into(),
+            ));
+        }
+        let candidate = self.build_workspace(name);
+        if let Some(path) = &candidate.doc_path {
+            if tokio::fs::try_exists(path).await.map_err(Io)? {
+                return Err(Conflict(
+                    "That workspace already exists. Choose another name.".into(),
+                ));
+            }
+        }
+        let workspace = self.workspace_unlocked(name).await;
+        workspace.created.store(true, Ordering::SeqCst);
+        workspace.persist_document().await;
+        Ok(workspace)
+    }
+
     /// Serialize connection admission with workspace management so a tab
     /// cannot join a document while it is being renamed or deleted.
     pub async fn register_page(&self, workspace: &Workspace) -> bool {
@@ -977,6 +1280,9 @@ impl AppState {
             .unwrap_or_else(|| doc.clone());
         if let Some(new_name) = renamed {
             let destination = Arc::new(self.build_workspace(new_name));
+            destination
+                .created
+                .store(source.created.load(Ordering::SeqCst), Ordering::SeqCst);
             if let Some(path) = &destination.doc_path {
                 let bytes =
                     serialization::to_bytes(&merged).map_err(|error| Invalid(error.to_string()))?;
@@ -1045,7 +1351,11 @@ impl AppState {
         for ws in workspaces {
             let elements = ws.doc.lock().await.live_count();
             let pages = ws.pages.load(Ordering::SeqCst);
-            if ws.name != DEFAULT_WORKSPACE && ws.doc_path.is_none() && pages == 0 && elements == 0
+            if ws.name != DEFAULT_WORKSPACE
+                && !ws.created.load(Ordering::SeqCst)
+                && ws.doc_path.is_none()
+                && pages == 0
+                && elements == 0
             {
                 continue;
             }
@@ -1194,6 +1504,40 @@ mod tests {
         doc.add(shape_at(x), version);
     }
 
+    fn shape_element(id: &str, index: &str, x: f64) -> Element {
+        Element::new(shape_at(x), index.into(), 1).with_id(id)
+    }
+
+    fn text_kind(text: &str, x: f64) -> ElementKind {
+        ElementKind::Text {
+            rect: canvas_core::geometry::Rect::new(x, 0.0, 100.0, 20.0),
+            text: text.into(),
+            align: canvas_core::model::TextAlign::Left,
+            fixed_width: false,
+            container_id: None,
+            style: Style::default(),
+        }
+    }
+
+    fn kinds_of(changed: &[ChangedElement], id: &str) -> Vec<ChangeKind> {
+        changed
+            .iter()
+            .find(|change| change.id == id)
+            .unwrap_or_else(|| panic!("changed id {id} was dropped"))
+            .kinds
+            .clone()
+    }
+
+    async fn kinds_between(before: &Document, after: &Document) -> Vec<ChangeKind> {
+        let state = AppState::new(PathBuf::from("."), None, true);
+        let workspace = state.workspace(DEFAULT_WORKSPACE).await;
+        workspace.record_change(before, after, "test").await;
+        let records = workspace.changes_since(0).await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].changed.len(), 1);
+        records[0].changed[0].kinds.clone()
+    }
+
     #[test]
     fn workspace_names_are_validated() {
         for valid in ["default", "a", "vpc-redesign-2", "x".repeat(40).as_str()] {
@@ -1335,6 +1679,63 @@ mod tests {
         let alpha = reopened.workspace("alpha").await;
         assert_eq!(alpha.doc.lock().await.live_count(), 1);
         let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+
+    #[tokio::test]
+    async fn creating_a_workspace_is_validated_and_persisted_empty() {
+        let dir = std::env::temp_dir().join(format!(
+            "rs-workspace-create-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let state = AppState::new(PathBuf::from("."), Some(dir.join("current.json")), true);
+        assert!(matches!(
+            state.create_workspace("Bad Name").await,
+            Err(WorkspaceManagementError::Invalid(_))
+        ));
+        assert!(matches!(
+            state.create_workspace(DEFAULT_WORKSPACE).await,
+            Err(WorkspaceManagementError::Conflict(_))
+        ));
+
+        let created = state.create_workspace("fresh").await.unwrap();
+        assert_eq!(created.doc.lock().await.live_count(), 0);
+        assert!(created.created.load(Ordering::SeqCst));
+        assert!(
+            dir.join("workspaces/fresh.json").exists(),
+            "an explicitly created workspace is durable before its first edit"
+        );
+        assert!(matches!(
+            state.create_workspace("fresh").await,
+            Err(WorkspaceManagementError::Conflict(_))
+        ));
+
+        let restarted = AppState::new(PathBuf::from("."), Some(dir.join("current.json")), true);
+        let names: Vec<String> = restarted
+            .list_workspaces()
+            .await
+            .iter()
+            .map(|info| info.name.clone())
+            .collect();
+        assert!(names.contains(&"fresh".to_string()), "{names:?}");
+        let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+
+    #[tokio::test]
+    async fn created_workspaces_are_listed_without_a_backing_file() {
+        let state = AppState::new(PathBuf::from("."), None, true);
+        let created = state.create_workspace("fresh").await.unwrap();
+        assert_eq!(created.doc_path, None);
+        let names: Vec<String> = state
+            .list_workspaces()
+            .await
+            .iter()
+            .map(|info| info.name.clone())
+            .collect();
+        assert!(
+            names.contains(&"fresh".to_string()),
+            "an explicit create must be discoverable even in memory-only mode: {names:?}"
+        );
     }
 
     #[tokio::test]
@@ -1731,6 +2132,256 @@ mod tests {
         let (revision, doc) = canvas_core::wire::decode_snapshot(&bytes).unwrap();
         assert_eq!(revision, 5);
         assert_eq!(doc.live_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn record_change_classifies_every_kind() {
+        let original = shape_element("shape", "a0", 0.0);
+
+        // Added.
+        let before = Document::new();
+        let mut after = Document::new();
+        after.insert(original.clone());
+        assert_eq!(
+            kinds_between(&before, &after).await,
+            vec![ChangeKind::Added]
+        );
+
+        // Removed by absence.
+        let mut before = Document::new();
+        before.insert(original.clone());
+        assert_eq!(
+            kinds_between(&before, &Document::new()).await,
+            vec![ChangeKind::Removed]
+        );
+
+        // Removed by tombstone.
+        let mut after = Document::new();
+        let mut tombstone = original.clone();
+        tombstone.is_deleted = true;
+        tombstone.touch(2);
+        after.insert(tombstone);
+        assert_eq!(
+            kinds_between(&before, &after).await,
+            vec![ChangeKind::Removed]
+        );
+
+        // Moved.
+        let mut after = before.clone();
+        let moved = after.element_mut("shape").unwrap();
+        if let ElementKind::Shape { rect, .. } = &mut moved.kind {
+            rect.x += 20.0;
+        }
+        moved.touch(2);
+        assert_eq!(
+            kinds_between(&before, &after).await,
+            vec![ChangeKind::Moved]
+        );
+
+        // Resized.
+        let mut after = before.clone();
+        let resized = after.element_mut("shape").unwrap();
+        if let ElementKind::Shape { rect, .. } = &mut resized.kind {
+            rect.w += 10.0;
+        }
+        resized.touch(2);
+        assert_eq!(
+            kinds_between(&before, &after).await,
+            vec![ChangeKind::Resized]
+        );
+
+        // Reordered.
+        let mut after = before.clone();
+        let reordered = after.element_mut("shape").unwrap();
+        reordered.index = "a1".into();
+        reordered.touch(2);
+        assert_eq!(
+            kinds_between(&before, &after).await,
+            vec![ChangeKind::Reordered]
+        );
+
+        // Reparented.
+        let mut after = before.clone();
+        let reparented = after.element_mut("shape").unwrap();
+        reparented.frame_id = Some("frame".into());
+        reparented.touch(2);
+        assert_eq!(
+            kinds_between(&before, &after).await,
+            vec![ChangeKind::Reparented]
+        );
+
+        // Restyled.
+        let mut after = before.clone();
+        let restyled = after.element_mut("shape").unwrap();
+        if let ElementKind::Shape { style, .. } = &mut restyled.kind {
+            style.stroke_width = 6.0;
+        }
+        restyled.touch(2);
+        assert_eq!(
+            kinds_between(&before, &after).await,
+            vec![ChangeKind::Restyled]
+        );
+
+        // Other: a shape-family change outside the named categories.
+        let mut after = before.clone();
+        let other = after.element_mut("shape").unwrap();
+        if let ElementKind::Shape { shape, .. } = &mut other.kind {
+            *shape = canvas_core::model::ShapeKind::Ellipse;
+        }
+        other.touch(2);
+        assert_eq!(
+            kinds_between(&before, &after).await,
+            vec![ChangeKind::Other]
+        );
+
+        // Other: a merge-metadata-only touch still reports the id.
+        let mut after = before.clone();
+        after.element_mut("shape").unwrap().touch(2);
+        assert_eq!(
+            kinds_between(&before, &after).await,
+            vec![ChangeKind::Other]
+        );
+
+        // Relabelled: text content and frame name are labels.
+        let mut before = Document::new();
+        let text = before.add(text_kind("old", 0.0), 1);
+        let mut after = before.clone();
+        if let ElementKind::Text { text, .. } = &mut after.element_mut(&text).unwrap().kind {
+            *text = "new".into();
+        }
+        after.element_mut(&text).unwrap().touch(2);
+        assert_eq!(
+            kinds_between(&before, &after).await,
+            vec![ChangeKind::Relabelled]
+        );
+
+        let mut before = Document::new();
+        let frame = before.add(
+            ElementKind::Frame {
+                rect: canvas_core::geometry::Rect::new(0.0, 0.0, 200.0, 100.0),
+                name: "old".into(),
+            },
+            1,
+        );
+        let mut after = before.clone();
+        if let ElementKind::Frame { name, .. } = &mut after.element_mut(&frame).unwrap().kind {
+            *name = "new".into();
+        }
+        after.element_mut(&frame).unwrap().touch(2);
+        assert_eq!(
+            kinds_between(&before, &after).await,
+            vec![ChangeKind::Relabelled]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_multi_kind_update_reports_every_kind() {
+        let mut before = Document::new();
+        let id = before.add(text_kind("old", 0.0), 1);
+        let mut after = before.clone();
+        let changed = after.element_mut(&id).unwrap();
+        if let ElementKind::Text {
+            rect, text, style, ..
+        } = &mut changed.kind
+        {
+            rect.x += 20.0;
+            rect.w += 10.0;
+            *text = "new".into();
+            style.font_size = 28.0;
+        }
+        changed.touch(2);
+
+        assert_eq!(
+            kinds_between(&before, &after).await,
+            vec![
+                ChangeKind::Moved,
+                ChangeKind::Resized,
+                ChangeKind::Relabelled,
+                ChangeKind::Restyled
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn absorb_patch_classifies_before_merge_and_removed_elements() {
+        let state = AppState::new(PathBuf::from("."), None, true);
+        let workspace = state.workspace(DEFAULT_WORKSPACE).await;
+        let element = shape_element("one", "a0", 0.0);
+
+        assert!(workspace.absorb_patch(vec![element.clone()], 1).await);
+        let record = workspace.changes_since(0).await.pop().unwrap();
+        assert_eq!(kinds_of(&record.changed, "one"), vec![ChangeKind::Added]);
+
+        let mut moved = element.clone();
+        moved.version = 2;
+        if let ElementKind::Shape { rect, style, .. } = &mut moved.kind {
+            rect.x += 50.0;
+            style.stroke_width = 5.0;
+        }
+        assert!(workspace.absorb_patch(vec![moved.clone()], 1).await);
+        let record = workspace.changes_since(1).await.pop().unwrap();
+        assert_eq!(
+            kinds_of(&record.changed, "one"),
+            vec![ChangeKind::Moved, ChangeKind::Restyled]
+        );
+
+        let mut tombstone = moved;
+        tombstone.version = 3;
+        tombstone.is_deleted = true;
+        tombstone.touch(3);
+        assert!(workspace.absorb_patch(vec![tombstone], 1).await);
+        let record = workspace.changes_since(2).await.pop().unwrap();
+        assert_eq!(kinds_of(&record.changed, "one"), vec![ChangeKind::Removed]);
+    }
+
+    #[tokio::test]
+    async fn bulk_recordings_are_added() {
+        let state = AppState::new(PathBuf::from("."), None, true);
+        let workspace = state.workspace(DEFAULT_WORKSPACE).await;
+        assert_eq!(workspace.record_bulk(vec!["a".into(), "b".into()]).await, 1);
+        let record = workspace.changes_since(0).await.pop().unwrap();
+        assert_eq!(record.changed.len(), 2);
+        assert_eq!(kinds_of(&record.changed, "a"), vec![ChangeKind::Added]);
+        assert_eq!(kinds_of(&record.changed, "b"), vec![ChangeKind::Added]);
+    }
+
+    #[tokio::test]
+    async fn no_changed_id_is_dropped_from_a_change_record() {
+        let mut before = Document::new();
+        before.insert(shape_element("gone", "a0", 0.0));
+        before.insert(shape_element("stays", "a1", 10.0));
+        let mut after = before.clone();
+        after.elements.remove("gone");
+        let stays = after.element_mut("stays").unwrap();
+        if let ElementKind::Shape { rect, .. } = &mut stays.kind {
+            rect.x += 5.0;
+        }
+        stays.touch(2);
+
+        let state = AppState::new(PathBuf::from("."), None, true);
+        let workspace = state.workspace(DEFAULT_WORKSPACE).await;
+        let (_, put) = workspace.record_change(&before, &after, "page").await;
+        assert_eq!(put.len(), 1, "only the surviving element is broadcast");
+        let record = workspace.changes_since(0).await.pop().unwrap();
+        assert_eq!(record.changed.len(), 2);
+        assert_eq!(kinds_of(&record.changed, "gone"), vec![ChangeKind::Removed]);
+        assert_eq!(kinds_of(&record.changed, "stays"), vec![ChangeKind::Moved]);
+    }
+
+    #[tokio::test]
+    async fn the_change_log_stays_bounded_with_kinds() {
+        let state = AppState::new(PathBuf::from("."), None, true);
+        let workspace = state.workspace(DEFAULT_WORKSPACE).await;
+        for index in 0..CHANGE_LOG_LIMIT + 5 {
+            workspace.record_bulk(vec![format!("id-{index}")]).await;
+        }
+        let records = workspace.changes_since(0).await;
+        assert_eq!(records.len(), CHANGE_LOG_LIMIT);
+        assert_eq!(records.first().unwrap().revision, 6);
+        assert_eq!(
+            records.last().unwrap().revision,
+            CHANGE_LOG_LIMIT as u64 + 5
+        );
     }
 
     #[test]

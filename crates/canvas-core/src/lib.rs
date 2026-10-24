@@ -25,6 +25,7 @@ pub mod merge;
 pub mod model;
 pub mod nav;
 pub mod patch;
+pub mod relations;
 pub mod rough;
 pub mod scene;
 pub mod serialization;
@@ -38,7 +39,7 @@ pub use benchmark::benchmark_fixture;
 pub use bulk::{BulkStats, BulkStyle, GridSpec, KeyChain, LinkMode, ShapeCode, ShapeSpec};
 pub use camera::{Camera, CameraTween};
 pub use connector::{anchor_points, nearest_anchor, resolve_endpoint, route, AnchorSide};
-pub use delta::{Delta, EditError};
+pub use delta::{Delta, EditError, Tombstone};
 pub use demo::demo_document;
 pub use describe::{
     describe, describe_element, describe_element_with, describe_with, IdMap, UuidMap,

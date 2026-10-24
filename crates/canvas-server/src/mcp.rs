@@ -4,15 +4,17 @@
 //! document, history or storage. Drawing tools edit the mirrored document.
 //! The server is created per MCP session but shares `AppState`. Every tool
 //! call acts on the current workspace — the one the user's most recently
-//! active page is viewing (ADR-0007) — never on an agent-owned one.
+//! active page is viewing (ADR-0007) — except `canvas_workspace_create`,
+//! which opens a new workspace and moves that page with it (ADR-0008).
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
-use canvas_core::geometry::Point;
-use canvas_core::model::Document;
+use canvas_core::camera::Camera;
+use canvas_core::geometry::{Point, Rect};
+use canvas_core::model::{Document, Element, ElementKind, ShapeKind};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
 use rmcp::{schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
@@ -20,19 +22,26 @@ use rmcp::{schemars, tool, tool_handler, tool_router, ErrorData as McpError, Ser
 use crate::doc_ops;
 use crate::render;
 use crate::script::{self, ScriptBeat};
-use crate::state::{AppState, PageMessage, Workspace};
+use crate::state::{
+    AppState, ChangeKind, ChangedElement, PageMessage, Workspace, WorkspaceManagementError,
+};
 use crate::verbs;
 
 const INSTRUCTIONS: &str =
     "rs-canvas is a hand-drawn architecture canvas open in the user's browser. \
 Use canvas_status to check that the local bridge and the page are up before acting. \
 canvas_read shows the current drawing as compact lines, each starting with a short \
-handle (e1, e2, ...); every tool accepts handles or raw ids. canvas_draw creates one \
+handle (e1, e2, ...); every tool accepts handles or raw ids. It is the primary view \
+of the workspace; canvas_screenshot is only for rendered appearance or when the user \
+asks to see it. canvas_draw creates one \
 element and canvas_pen draws a freehand stroke with per-point pressure and ink style \
 (width, colour, roughness, dash, opacity, fill/shading). \
 Camera and presentation tools move the user's view; they never change the drawing. \
 The user may keep several workspaces (named, isolated canvases); every tool acts on \
 the one the user is currently viewing — canvas_status names it and lists the rest. \
+canvas_workspace_create starts a new workspace and brings the user's page to it, so \
+later calls act there. Give a new discussion its own session workspace unless the \
+user is pointing at an existing drawing or workspace. \
 Think together: sketch the smallest useful idea, explore one concrete tradeoff or \
 failure case, and revise existing elements with canvas_script update beats. \
 Read selected elements, ids or a frame rather than unrelated content. Reads return \
@@ -48,6 +57,12 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as u64)
         .unwrap_or_default()
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct CreateWorkspaceArgs {
+    /// 1–40 lowercase letters, digits or dashes, starting with a letter or digit.
+    name: String,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -337,6 +352,18 @@ struct ReadArgs {
     /// hundred tokens at any scale. Ignores scope and pagination.
     #[serde(default)]
     summary: bool,
+    /// Include the explicit ownership/connection graph after the element
+    /// lines: frame children, labels/containers, arrow endpoints and labels,
+    /// sticky stacks, and dangling references. Full and scoped reads only;
+    /// summary and since ignore it. Off by default.
+    #[serde(default)]
+    relations: bool,
+    /// Read what the user is looking at: the view rect and zoom, selected
+    /// handles, visible elements, elements just outside the view and an
+    /// off-screen summary. Needs a page reporting view state; cannot be
+    /// combined with ids, frame, query, selected or since.
+    #[serde(default)]
+    attention: bool,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -503,15 +530,23 @@ fn image_from_data_url(data_url: &str) -> Result<CallToolResult, McpError> {
 
 /// The `canvas_read(since)` report: change records plus the current state of
 /// everything they touched.
+///
+/// Returns the compact text plus the same report as structured data: one entry
+/// per change record, the handles still live, and the handles removed.
 fn describe_changes(
     doc: &canvas_core::model::Document,
     records: &[crate::state::ChangeRecord],
     since: u64,
     revision: u64,
     ids: &mut dyn canvas_core::describe::IdMap,
-) -> String {
+) -> (String, Vec<serde_json::Value>, Vec<String>, Vec<String>) {
     if records.is_empty() {
-        return format!("revision {revision}\nno changes since revision {since}");
+        return (
+            format!("revision {revision}\nno changes since revision {since}"),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
     }
     let mut text = format!("revision {revision}\nchanges since revision {since}:");
     for record in records {
@@ -521,26 +556,67 @@ fn describe_changes(
             record.source,
             record.changed.len()
         ));
+        let counts: Vec<String> = record
+            .kind_counts()
+            .into_iter()
+            .map(|(kind, count)| format!("{count} {}", kind.label()))
+            .collect();
+        if !counts.is_empty() {
+            text.push_str(&format!(" ({})", counts.join(", ")));
+        }
     }
-    let mut seen = std::collections::HashSet::new();
-    let mut changed_ids: Vec<String> = Vec::new();
+    // One current-state line per id, with the union of the kinds seen for it
+    // across the whole window.
+    let mut changes: Vec<ChangedElement> = Vec::new();
+    let mut positions: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for record in records {
-        for id in &record.changed {
-            if seen.insert(id.clone()) {
-                changed_ids.push(id.clone());
+        for change in &record.changed {
+            match positions.get(&change.id) {
+                Some(&position) => {
+                    let existing = &mut changes[position];
+                    for kind in &change.kinds {
+                        if !existing.kinds.contains(kind) {
+                            existing.kinds.push(*kind);
+                        }
+                    }
+                }
+                None => {
+                    positions.insert(change.id.clone(), changes.len());
+                    changes.push(change.clone());
+                }
             }
         }
     }
     let mut live = Vec::new();
+    let mut changed = Vec::new();
     let mut removed = Vec::new();
-    for id in &changed_ids {
-        match doc.element(id).filter(|element| !element.is_deleted) {
+    let mut removed_handles = Vec::new();
+    for change in &mut changes {
+        change.kinds.sort_unstable();
+        change.kinds.dedup();
+        let kinds = kind_list(&change.kinds);
+        match doc
+            .element(&change.id)
+            .filter(|element| !element.is_deleted)
+        {
             Some(element) => {
-                live.push(canvas_core::describe::describe_element_with(
-                    doc, element, ids,
-                ));
+                changed.push(ids.map(&change.id));
+                let line = canvas_core::describe::describe_element_with(doc, element, ids);
+                if kinds.is_empty() {
+                    live.push(line);
+                } else {
+                    live.push(format!("{line} ({kinds})"));
+                }
             }
-            None => removed.push(ids.map(id)),
+            None => {
+                let handle = ids.map(&change.id);
+                removed_handles.push(handle.clone());
+                if kinds.is_empty() {
+                    removed.push(handle);
+                } else {
+                    removed.push(format!("{handle} ({kinds})"));
+                }
+            }
         }
     }
     if !live.is_empty() {
@@ -553,7 +629,203 @@ fn describe_changes(
     if !removed.is_empty() {
         text.push_str(&format!("removed: {}\n", removed.join(" ")));
     }
-    text
+    // Build after the text so handle assignment for the text surface is
+    // unchanged by structured content.
+    let changes: Vec<_> = records
+        .iter()
+        .map(|record| {
+            serde_json::json!({
+                "revision": record.revision,
+                "source": record.source,
+                "changed": record.changed.iter().map(|change| ids.map(&change.id)).collect::<Vec<_>>(),
+                "kinds": record.changed.iter().filter(|change| !change.kinds.is_empty()).map(|change| serde_json::json!({
+                    "handle": ids.map(&change.id),
+                    "kinds": change.kinds.iter().map(|kind| kind.label()).collect::<Vec<_>>(),
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    (text, changes, changed, removed_handles)
+}
+
+fn kind_list(kinds: &[ChangeKind]) -> String {
+    kinds
+        .iter()
+        .map(|kind| kind.label())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// How many visible and nearby element lines an attention read prints.
+const ATTENTION_VISIBLE_CAP: usize = 100;
+const ATTENTION_NEARBY_CAP: usize = 25;
+const ATTENTION_NEARBY_MARGIN: f64 = 0.1;
+
+#[derive(serde::Deserialize)]
+struct HintCamera {
+    x: f64,
+    y: f64,
+    zoom: f64,
+}
+
+#[derive(serde::Deserialize)]
+struct HintViewport {
+    w: f64,
+    h: f64,
+}
+
+/// The camera and viewport from a page hint, or `None` when the hint is
+/// missing, malformed or cannot produce a finite world view.
+fn hint_view(hint: &crate::state::ViewHint) -> Option<(Camera, (f64, f64))> {
+    let camera: HintCamera = serde_json::from_value(hint.camera.clone()?).ok()?;
+    let viewport: HintViewport = serde_json::from_value(hint.viewport.clone()?).ok()?;
+    if !camera.x.is_finite()
+        || !camera.y.is_finite()
+        || !camera.zoom.is_finite()
+        || camera.zoom <= 0.0
+        || !viewport.w.is_finite()
+        || !viewport.h.is_finite()
+        || viewport.w <= 0.0
+        || viewport.h <= 0.0
+    {
+        return None;
+    }
+    let camera = Camera {
+        scroll: Point::new(camera.x, camera.y),
+        zoom: camera.zoom,
+    };
+    Some((camera, (viewport.w, viewport.h)))
+}
+
+fn attention_kind_name(element: &Element) -> &'static str {
+    match &element.kind {
+        ElementKind::Shape { shape, .. } => match shape {
+            ShapeKind::Rectangle => "rect",
+            ShapeKind::Ellipse => "ellipse",
+            ShapeKind::Diamond => "diamond",
+            ShapeKind::Sticky => "sticky",
+        },
+        ElementKind::Freehand { .. } => "stroke",
+        ElementKind::Glyph { .. } => "glyph",
+        ElementKind::Arrow { .. } => "arrow",
+        ElementKind::Text { .. } => "text",
+        ElementKind::StickyStack { .. } => "stack",
+        ElementKind::Frame { .. } => "frame",
+    }
+}
+
+/// The `canvas_read(attention)` report: the user's current world view, the
+/// selected handles, visible and barely-off-screen element lines, and a
+/// summary of everything outside the view. All names go through `ids`.
+fn describe_attention(
+    doc: &Document,
+    hint: &crate::state::ViewHint,
+    live_page: bool,
+    revision: u64,
+    ids: &mut dyn canvas_core::describe::IdMap,
+) -> Option<String> {
+    let (camera, viewport) = hint_view(hint)?;
+    let view = camera.viewport(viewport.0, viewport.1);
+    let margin_x = view.w * ATTENTION_NEARBY_MARGIN;
+    let margin_y = view.h * ATTENTION_NEARBY_MARGIN;
+    let around = Rect::new(
+        view.x - margin_x,
+        view.y - margin_y,
+        view.w + 2.0 * margin_x,
+        view.h + 2.0 * margin_y,
+    );
+
+    let live: Vec<&Element> = doc.ordered_live();
+    let visible: Vec<&Element> = live
+        .iter()
+        .copied()
+        .filter(|element| element.bounds().intersects(&view))
+        .collect();
+    let nearby: Vec<&Element> = live
+        .iter()
+        .copied()
+        .filter(|element| {
+            let bounds = element.bounds();
+            !bounds.intersects(&view) && bounds.intersects(&around)
+        })
+        .collect();
+    let offscreen: Vec<&Element> = live
+        .iter()
+        .copied()
+        .filter(|element| !element.bounds().intersects(&view))
+        .collect();
+
+    let selected: Vec<String> = hint.selection.iter().map(|id| ids.map(id)).collect();
+    let mut text = format!(
+        "revision {revision}\nview {:.0},{:.0} {:.0}x{:.0} zoom={} page={}\n",
+        view.x,
+        view.y,
+        view.w,
+        view.h,
+        camera.zoom,
+        if live_page { "live" } else { "none" }
+    );
+    text.push_str(&format!(
+        "selected {}\n",
+        if selected.is_empty() {
+            "none".to_string()
+        } else {
+            selected.join(" ")
+        }
+    ));
+    text.push_str(&format!(
+        "visible {} showing {}\n",
+        visible.len(),
+        visible.len().min(ATTENTION_VISIBLE_CAP)
+    ));
+    for element in visible.iter().take(ATTENTION_VISIBLE_CAP) {
+        text.push_str(&canvas_core::describe::describe_element_with(
+            doc, element, ids,
+        ));
+        text.push('\n');
+    }
+    text.push_str(&format!(
+        "nearby {} showing {}\n",
+        nearby.len(),
+        nearby.len().min(ATTENTION_NEARBY_CAP)
+    ));
+    for element in nearby.iter().take(ATTENTION_NEARBY_CAP) {
+        text.push_str(&canvas_core::describe::describe_element_with(
+            doc, element, ids,
+        ));
+        text.push('\n');
+    }
+    if offscreen.is_empty() {
+        text.push_str("offscreen 0\n");
+    } else {
+        let bounds = offscreen
+            .iter()
+            .map(|element| element.bounds())
+            .reduce(|acc, rect| acc.union(&rect))
+            .unwrap_or(Rect::ZERO);
+        let mut kinds: std::collections::BTreeMap<&'static str, usize> =
+            std::collections::BTreeMap::new();
+        for element in &offscreen {
+            *kinds.entry(attention_kind_name(element)).or_default() += 1;
+        }
+        let mut top: Vec<(&str, usize)> = kinds.into_iter().collect();
+        top.sort_by_key(|(name, count)| (std::cmp::Reverse(*count), *name));
+        let kinds: Vec<String> = top
+            .into_iter()
+            .take(6)
+            .map(|(name, count)| format!("{name}:{count}"))
+            .collect();
+        text.push_str(&format!(
+            "offscreen {} bounds={:.0},{:.0} {:.0}x{:.0} kinds={}\n",
+            offscreen.len(),
+            bounds.x,
+            bounds.y,
+            bounds.w,
+            bounds.h,
+            kinds.join(" ")
+        ));
+    }
+    Some(text)
 }
 
 #[derive(Clone)]
@@ -736,6 +1008,86 @@ impl CanvasServer {
     }
 
     #[tool(
+        description = "Create a named workspace and open it for the user: the page \
+                       showing the current workspace saves its drawing and switches to \
+                       the new one, so later calls act there. Use it once at the start \
+                       of a session that has no existing drawing to work on, then reuse \
+                       that workspace for the session. Names are 1–40 lowercase \
+                       letters, digits or dashes, starting with a letter or digit; the \
+                       name must not exist. With no page connected the workspace is \
+                       created but the agent stays on the current workspace until the \
+                       user opens it. Waits briefly for the page to arrive and reports \
+                       whether it did; read canvas_status before drawing if it did not."
+    )]
+    async fn canvas_workspace_create(
+        &self,
+        Parameters(args): Parameters<CreateWorkspaceArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let source = self.current().await;
+        let workspace = match self.state.create_workspace(&args.name).await {
+            Ok(workspace) => workspace,
+            Err(WorkspaceManagementError::Invalid(message))
+            | Err(WorkspaceManagementError::Conflict(message)) => {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(message)]));
+            }
+            Err(WorkspaceManagementError::NotFound) => {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(
+                    "Could not create the workspace.",
+                )]));
+            }
+            Err(WorkspaceManagementError::Io(error)) => {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                    "Could not create the workspace: {error}"
+                ))]));
+            }
+        };
+        let watching = source.pages.load(Ordering::SeqCst);
+        let mut switched = false;
+        if watching > 0 {
+            let message = serde_json::json!({
+                "type": "workspace_changed",
+                "action": "switch",
+                "workspace": workspace.name,
+            })
+            .to_string();
+            let _ = source.to_pages.send(PageMessage::all(message));
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while tokio::time::Instant::now() < deadline {
+                if workspace.pages.load(Ordering::SeqCst) > 0 {
+                    switched = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            if switched {
+                // This call put the user on the new workspace, so it is a
+                // valid observation for subsequent context guards.
+                *self.observed.lock().await = Some(workspace.context());
+            }
+        }
+        let elements = workspace.doc.lock().await.live_count();
+        let note = if switched {
+            "The page is on the new workspace; later calls act there."
+        } else if watching > 0 {
+            "The workspace was created, but the page did not switch before the timeout; read canvas_status before drawing."
+        } else {
+            "No page is connected; the workspace exists but the agent still targets the current workspace."
+        };
+        let body = serde_json::json!({
+            "workspace": workspace.name,
+            "context": workspace.context(),
+            "switched": switched,
+            "pages_connected": workspace.pages.load(Ordering::SeqCst),
+            "persisted": workspace.doc_path.is_some(),
+            "document": { "elements": elements },
+            "note": note,
+        });
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            body.to_string(),
+        )]))
+    }
+
+    #[tool(
         description = "Read the current drawing as compact lines: `handle kind x,y wxh`, \
                        then membership and labels. Every line starts with a short handle \
                        (e1, e2, ...) that all id-taking tools accept. Read it before \
@@ -746,7 +1098,15 @@ impl CanvasServer {
                        offset pagination needs the first read's context and unchanged revision. \
                        detail adds exact element JSON, including full stroke points. \
                        summary returns whole-document counts by kind, bounds and top fills \
-                       in a few hundred tokens at any scale: start there on large boards."
+                       in a few hundred tokens at any scale: start there on large boards. \
+                       attention reads what the user is looking at: the view rect and zoom, \
+                       selected handles, visible elements, elements just outside the view \
+                       and an off-screen summary; it needs a page reporting view state and \
+                       cannot be combined with ids, frame, query, selected or since. \
+                       relations adds the explicit graph of frame children, labels and \
+                       containers, connector endpoints/labels/routing, stacks, and dangling \
+                       references. This is the primary way to understand the workspace; a \
+                       screenshot adds only rendered appearance."
     )]
     async fn canvas_read(
         &self,
@@ -755,15 +1115,45 @@ impl CanvasServer {
         let workspace = self.current().await;
         let doc = workspace.doc.lock().await;
         let revision = workspace.revision.load(Ordering::SeqCst);
+        let failure = |message: &str| Ok(CallToolResult::error(vec![ContentBlock::text(message)]));
+        if args.attention {
+            if args.ids.is_some() || args.frame.is_some() || args.query.is_some() || args.selected {
+                return failure(
+                    "attention cannot be combined with ids, frame, query or selected; it reads the current view as a whole",
+                );
+            }
+            if args.since.is_some() {
+                return failure(
+                    "attention cannot be combined with since; read the current view or the change log, not both",
+                );
+            }
+            let hint = workspace.view_hint.lock().await.clone();
+            let live_page = workspace.pages.load(Ordering::SeqCst) > 0;
+            let mut aliases = workspace.aliases.lock().await;
+            let Some(text) = hint.as_ref().and_then(|hint| {
+                describe_attention(&doc, hint, live_page, revision, &mut *aliases)
+            }) else {
+                return failure(
+                    "no_view: no page is reporting view state; connect a page or read without attention",
+                );
+            };
+            *self.observed.lock().await = Some(workspace.context());
+            return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                "{text}\nworkspace {:?} context {:?}",
+                workspace.name,
+                workspace.context()
+            ))]));
+        }
         if args.summary {
             let mut body = canvas_core::bulk::summarize(&doc);
             body["revision"] = serde_json::json!(revision);
             body["context"] = serde_json::json!(workspace.context());
-            return Ok(CallToolResult::success(vec![ContentBlock::text(
-                body.to_string(),
-            )]));
+            let mut structured = body.clone();
+            structured["workspace"] = serde_json::json!(workspace.name);
+            let mut result = CallToolResult::success(vec![ContentBlock::text(body.to_string())]);
+            result.structured_content = Some(structured);
+            return Ok(result);
         }
-        let failure = |message: &str| Ok(CallToolResult::error(vec![ContentBlock::text(message)]));
         if args.since.is_some()
             && args.context.is_none()
             && self
@@ -804,12 +1194,22 @@ impl CanvasServer {
             );
         }
         let mut aliases = workspace.aliases.lock().await;
-        let text = if let Some(since) = args.since {
+        let (text, structured) = if let Some(since) = args.since {
             if !workspace.cursor_valid(since).await {
                 return failure("resync_required: change history no longer covers that cursor; start a full or scoped read");
             }
             let records = workspace.changes_since(since).await;
-            describe_changes(&doc, &records, since, revision, &mut *aliases)
+            let (text, changes, changed, removed) =
+                describe_changes(&doc, &records, since, revision, &mut *aliases);
+            let structured = serde_json::json!({
+                "workspace": workspace.name,
+                "context": workspace.context(),
+                "revision": revision,
+                "changes": changes,
+                "changed": changed,
+                "removed": removed,
+            });
+            (text, structured)
         } else {
             let mut roots = std::collections::BTreeSet::new();
             let has_scope = args.ids.is_some() || args.selected || args.frame.is_some();
@@ -879,6 +1279,15 @@ impl CanvasServer {
                     })
                 })
                 .collect();
+            let relation_scope: Option<std::collections::BTreeSet<String>> = if !args.relations {
+                None
+            } else if query.is_some() {
+                Some(matches.iter().map(|element| element.id.clone()).collect())
+            } else if has_scope {
+                Some(roots.clone())
+            } else {
+                None
+            };
             let limit = args.limit.unwrap_or(100).clamp(1, 500);
             let offset = args.offset.unwrap_or(0);
             let mut text = format!(
@@ -890,6 +1299,7 @@ impl CanvasServer {
                     ""
                 }
             );
+            let mut elements = Vec::new();
             for element in matches.iter().skip(offset).take(limit) {
                 text.push_str(&canvas_core::describe::describe_element_with(
                     &doc,
@@ -904,6 +1314,18 @@ impl CanvasServer {
                     );
                     text.push('\n');
                 }
+                let mut element_json =
+                    canvas_core::describe::structured_element(&doc, element, &mut *aliases);
+                if args.detail {
+                    element_json["element"] = serde_json::to_value(element)
+                        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                }
+                elements.push(element_json);
+            }
+            if args.relations {
+                let graph =
+                    canvas_core::relations::RelationGraph::build(&doc, relation_scope.as_ref());
+                text.push_str(&graph.render(&mut *aliases));
             }
             if offset.saturating_add(limit) < matches.len() {
                 text.push_str(&format!(
@@ -911,14 +1333,23 @@ impl CanvasServer {
                     offset.saturating_add(limit)
                 ));
             }
-            text
+            let structured = serde_json::json!({
+                "workspace": workspace.name,
+                "context": workspace.context(),
+                "revision": revision,
+                "matched": matches.len(),
+                "elements": elements,
+            });
+            (text, structured)
         };
         *self.observed.lock().await = Some(workspace.context());
-        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+        let mut result = CallToolResult::success(vec![ContentBlock::text(format!(
             "{text}\nworkspace {:?} context {:?}",
             workspace.name,
             workspace.context()
-        ))]))
+        ))]);
+        result.structured_content = Some(structured);
+        Ok(result)
     }
 
     #[tool(
@@ -1452,8 +1883,12 @@ impl CanvasServer {
                         Err(message) => return failure(message),
                     };
                     let id = canvas_core::id::new_element_id();
-                    let frame = canvas_core::model::Element::new(frame_kind, index, now)
-                        .with_id(id.clone());
+                    let frame = canvas_core::model::Element::new_with_id(
+                        frame_kind,
+                        index,
+                        now,
+                        id.clone(),
+                    );
                     for shape_id in stats.shape_ids.clone() {
                         if let Some(element) = doc.element_mut(&shape_id) {
                             element.frame_id = Some(id.clone());
@@ -1636,10 +2071,13 @@ impl CanvasServer {
     }
 
     #[tool(
-        description = "Look at the canvas: returns a PNG image of what the user is looking \
-                       at right now, camera included, after any in-flight explanation \
-                       settles. With no page open it renders the whole drawing headlessly. \
-                       Use it to check your own layout, spacing, labels and overlaps."
+        description = "Look at the rendered canvas: returns a PNG image of what the user \
+                       is looking at right now, camera included, after any in-flight \
+                       explanation settles. With no page open it renders the whole drawing \
+                       headlessly. Use canvas_read for geometry, content and handles; reach \
+                       for this only when the rendered result itself matters (text wrapping, \
+                       ink, exact camera framing) or the user asks to see it. It can also \
+                       check your own layout, spacing, labels and overlaps."
     )]
     async fn canvas_screenshot(
         &self,
@@ -1766,6 +2204,13 @@ mod tests {
             .expect("text content")
             .text
             .clone()
+    }
+
+    fn structured(result: &CallToolResult) -> serde_json::Value {
+        result
+            .structured_content
+            .clone()
+            .expect("successful read carries structured content")
     }
 
     fn point(x: f64, y: f64) -> PenPoint {
@@ -2094,6 +2539,214 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn canvas_read_relations_cover_ownership_connectors_and_dangling_refs() {
+        use canvas_core::geometry::Rect;
+        use canvas_core::model::{
+            Binding, ElementKind, Endpoint, Routing, ShapeKind, Style, TextAlign,
+        };
+
+        let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
+        let workspace = state.workspace(crate::state::DEFAULT_WORKSPACE).await;
+        let (frame_id, s1, s2, t1, t2, arrow_id, dangling_id, stack_id) = {
+            let mut doc = workspace.doc.lock().await;
+            let frame_id = doc.add_at(
+                ElementKind::Frame {
+                    rect: Rect::new(0.0, 0.0, 400.0, 300.0),
+                    name: "VPC".into(),
+                },
+                "a1".into(),
+                1,
+            );
+            let shape = |x: f64| ElementKind::Shape {
+                shape: ShapeKind::Rectangle,
+                rect: Rect::new(x, 0.0, 100.0, 60.0),
+                style: Style::default(),
+                bound_text_id: None,
+            };
+            let s1 = doc.add_at(shape(0.0), "a2".into(), 1);
+            let s2 = doc.add_at(shape(180.0), "a3".into(), 1);
+            let text = |text: &str, container: &str| ElementKind::Text {
+                rect: Rect::new(0.0, 0.0, 40.0, 20.0),
+                text: text.into(),
+                align: TextAlign::Center,
+                fixed_width: false,
+                container_id: Some(container.into()),
+                style: Style::default(),
+            };
+            let t1 = doc.add_at(text("API", &s1), "a4".into(), 1);
+            let t2 = doc.add_at(text("extra", &s2), "a5".into(), 1);
+            let t3 = doc.add_at(text("reads", &s1), "a6".into(), 1);
+            let arrow_id = doc.add_at(
+                ElementKind::Arrow {
+                    start: Endpoint {
+                        x: 0.0,
+                        y: 0.0,
+                        binding: Some(Binding {
+                            element_id: s1.clone(),
+                            focus: None,
+                        }),
+                    },
+                    end: Endpoint {
+                        x: 0.0,
+                        y: 0.0,
+                        binding: Some(Binding {
+                            element_id: s2.clone(),
+                            focus: None,
+                        }),
+                    },
+                    routing: Routing::Straight,
+                    start_arrowhead: false,
+                    end_arrowhead: true,
+                    style: Style::default(),
+                    waypoints: Vec::new(),
+                    label_id: Some(t3.clone()),
+                },
+                "a7".into(),
+                1,
+            );
+            let stack_id = doc.add_at(
+                ElementKind::StickyStack {
+                    rect: Rect::new(500.0, 0.0, 140.0, 140.0),
+                    style: Style::default(),
+                },
+                "a8".into(),
+                1,
+            );
+            let dangling_id = doc.add_at(
+                ElementKind::Arrow {
+                    start: Endpoint {
+                        x: 0.0,
+                        y: 0.0,
+                        binding: Some(Binding {
+                            element_id: s1.clone(),
+                            focus: None,
+                        }),
+                    },
+                    end: Endpoint {
+                        x: 0.0,
+                        y: 0.0,
+                        binding: Some(Binding {
+                            element_id: "ghost".into(),
+                            focus: None,
+                        }),
+                    },
+                    routing: Routing::Elbow,
+                    start_arrowhead: false,
+                    end_arrowhead: true,
+                    style: Style::default(),
+                    waypoints: Vec::new(),
+                    label_id: None,
+                },
+                "a9".into(),
+                1,
+            );
+            doc.element_mut(&s1).unwrap().frame_id = Some(frame_id.clone());
+            doc.element_mut(&s2).unwrap().frame_id = Some(frame_id.clone());
+            if let ElementKind::Shape { bound_text_id, .. } =
+                &mut doc.element_mut(&s1).unwrap().kind
+            {
+                *bound_text_id = Some(t1.clone());
+            }
+            // The arrow's label is t3; t2 is a container-only text on s2.
+            if let ElementKind::Text {
+                container_id: Some(owner),
+                ..
+            } = &mut doc.element_mut(&t3).unwrap().kind
+            {
+                *owner = arrow_id.clone();
+            }
+            (frame_id, s1, s2, t1, t2, arrow_id, dangling_id, stack_id)
+        };
+
+        let server = CanvasServer::new(state.clone());
+        let default_read = error_text(
+            &server
+                .canvas_read(Parameters(ReadArgs::default()))
+                .await
+                .unwrap(),
+        );
+        assert!(!default_read.contains("relations:"), "{default_read}");
+
+        let related = error_text(
+            &server
+                .canvas_read(Parameters(ReadArgs {
+                    relations: true,
+                    ..Default::default()
+                }))
+                .await
+                .unwrap(),
+        );
+        let handles = {
+            let mut aliases = workspace.aliases.lock().await;
+            (
+                aliases.handle(&frame_id),
+                aliases.handle(&s1),
+                aliases.handle(&s2),
+                aliases.handle(&t1),
+                aliases.handle(&t2),
+                aliases.handle(&arrow_id),
+                aliases.handle(&dangling_id),
+                aliases.handle(&stack_id),
+                aliases.handle("ghost"),
+            )
+        };
+        let (fh, s1h, s2h, t1h, t2h, ah, dh, sth, ghosth) = handles;
+        assert!(
+            related.contains("relations: 1 frame, 3 labels, 2 arrows, 1 stack, 1 dangling"),
+            "{related}"
+        );
+        assert!(
+            related.contains(&format!("frame {fh} \"VPC\": {s1h} {s2h}")),
+            "{related}"
+        );
+        assert!(
+            related.contains(&format!("label {t1h} -> {s1h}")),
+            "{related}"
+        );
+        assert!(
+            related.contains(&format!("container {t2h} -> {s2h}")),
+            "{related}"
+        );
+        assert!(
+            related.contains(&format!("arrow {ah}: {s1h} -> {s2h} straight \"reads\"")),
+            "{related}"
+        );
+        assert!(related.contains(&format!("stack {sth}")), "{related}");
+        assert!(
+            related.contains(&format!("dangling {dh} end -> {ghosth}")),
+            "{related}"
+        );
+
+        // The element section is identical; relations are opt-in and appended.
+        assert_eq!(
+            related.split("relations:").next().unwrap().trim_end(),
+            default_read.split("\nworkspace").next().unwrap().trim_end()
+        );
+
+        // A scoped read keeps the graph local but still names direct owners
+        // and children, so a single child reveals its frame and siblings.
+        let scoped = error_text(
+            &server
+                .canvas_read(Parameters(ReadArgs {
+                    ids: Some(vec![s1.clone()]),
+                    relations: true,
+                    ..Default::default()
+                }))
+                .await
+                .unwrap(),
+        );
+        assert!(
+            scoped.contains(&format!("frame {fh} \"VPC\": {s1h} {s2h}")),
+            "{scoped}"
+        );
+        assert!(
+            scoped.contains(&format!("label {t1h} -> {s1h}")),
+            "{scoped}"
+        );
+        assert!(!scoped.contains(&format!("stack {sth}")), "{scoped}");
+    }
+
+    #[tokio::test]
     async fn canvas_read_since_reports_only_changes() {
         let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
         let workspace = state.workspace(crate::state::DEFAULT_WORKSPACE).await;
@@ -2173,6 +2826,133 @@ mod tests {
         assert!(report.contains("(page)"), "{report}");
         assert!(report.contains("changed now:"), "{report}");
         assert!(report.contains(&handle), "{report}");
+    }
+
+    #[test]
+    fn change_reports_count_kinds_and_label_elements() {
+        let mut doc = Document::new();
+        let moved = doc.add(
+            canvas_core::model::ElementKind::Shape {
+                shape: canvas_core::model::ShapeKind::Rectangle,
+                rect: canvas_core::geometry::Rect::new(0.0, 0.0, 100.0, 60.0),
+                style: canvas_core::model::Style::default(),
+                bound_text_id: None,
+            },
+            1,
+        );
+        let records = vec![
+            crate::state::ChangeRecord {
+                revision: 13,
+                source: "agent".into(),
+                changed: vec![ChangedElement {
+                    id: moved.clone(),
+                    kinds: vec![ChangeKind::Moved],
+                }],
+            },
+            crate::state::ChangeRecord {
+                revision: 14,
+                source: "page".into(),
+                changed: vec![
+                    ChangedElement {
+                        id: moved.clone(),
+                        kinds: vec![ChangeKind::Restyled],
+                    },
+                    ChangedElement {
+                        id: "gone".into(),
+                        kinds: vec![ChangeKind::Removed],
+                    },
+                ],
+            },
+        ];
+        let mut ids = crate::aliases::Aliases::default();
+        let (report, _, _, _) = describe_changes(&doc, &records, 12, 14, &mut ids);
+
+        assert!(
+            report.contains("- rev 13 (agent): 1 changed (1 moved)"),
+            "{report}"
+        );
+        assert!(
+            report.contains("- rev 14 (page): 2 changed (1 removed, 1 restyled)"),
+            "{report}"
+        );
+        assert!(
+            report.contains("(moved, restyled)"),
+            "kinds are unioned across the window: {report}"
+        );
+        assert!(report.contains("(removed)"), "{report}");
+        assert!(report.contains("removed: "), "{report}");
+    }
+
+    #[tokio::test]
+    async fn canvas_read_since_reports_kinds_per_revision_and_element() {
+        let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
+        let workspace = state.workspace(crate::state::DEFAULT_WORKSPACE).await;
+        let server = CanvasServer::new(state.clone());
+        let draw = |kind: &str| DrawArgs {
+            kind: kind.into(),
+            text: None,
+            name: None,
+            glyph: None,
+            x: None,
+            y: None,
+            w: None,
+            h: None,
+            near: None,
+            side: None,
+        };
+        server
+            .canvas_draw(Parameters(draw("rectangle")))
+            .await
+            .unwrap();
+        server
+            .canvas_draw(Parameters(draw("ellipse")))
+            .await
+            .unwrap();
+        let revision = workspace.revision.load(Ordering::SeqCst);
+        assert_eq!(revision, 2);
+
+        {
+            let mut doc = workspace.doc.lock().await;
+            let ids: Vec<String> = doc
+                .ordered_live()
+                .iter()
+                .map(|element| element.id.clone())
+                .collect();
+            let before = doc.clone();
+            let moved = doc.element_mut(&ids[0]).unwrap();
+            if let canvas_core::model::ElementKind::Shape { rect, .. } = &mut moved.kind {
+                rect.x += 30.0;
+            }
+            moved.touch(now_ms());
+            let removed = doc.element_mut(&ids[1]).unwrap();
+            removed.is_deleted = true;
+            removed.touch(now_ms());
+            workspace.record_change(&before, &doc, "page").await;
+        }
+
+        let report = error_text(
+            &server
+                .canvas_read(Parameters(ReadArgs {
+                    since: Some(revision),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap(),
+        );
+        assert!(
+            report.contains("- rev 3 (page): 2 changed (1 removed, 1 moved)"),
+            "{report}"
+        );
+        assert!(report.contains("changed now:"), "{report}");
+        assert!(
+            report.contains("(moved)"),
+            "live element carries its kind: {report}"
+        );
+        assert!(
+            report.contains("(removed)"),
+            "removed element carries its kind: {report}"
+        );
+        assert!(report.contains("removed: "), "{report}");
     }
 
     fn bulk_shape(k: &str, x: f64, y: f64) -> BulkShape {
@@ -2338,6 +3118,487 @@ mod tests {
         assert!(body["bounds"].is_array(), "{summary}");
         assert!(body["revision"].is_u64(), "{summary}");
         assert!(workspace.doc.lock().await.live_count() > 0);
+    }
+
+    fn attention_rect(doc: &mut Document, x: f64, y: f64, w: f64, h: f64) -> String {
+        doc.add(
+            ElementKind::Shape {
+                shape: ShapeKind::Rectangle,
+                rect: Rect::new(x, y, w, h),
+                style: canvas_core::model::Style::default(),
+                bound_text_id: None,
+            },
+            0,
+        )
+    }
+
+    #[tokio::test]
+    async fn canvas_read_attention_reports_the_view_and_nearby_elements() {
+        let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
+        let workspace = state.workspace(crate::state::DEFAULT_WORKSPACE).await;
+        workspace.pages.store(1, Ordering::SeqCst);
+        let (inside, nearby) = {
+            let mut doc = workspace.doc.lock().await;
+            (
+                attention_rect(&mut doc, 20.0, 20.0, 20.0, 20.0),
+                attention_rect(&mut doc, 105.0, 20.0, 10.0, 10.0),
+            )
+        };
+        {
+            let mut doc = workspace.doc.lock().await;
+            attention_rect(&mut doc, 400.0, 400.0, 10.0, 10.0);
+        }
+        *workspace.view_hint.lock().await = Some(crate::state::ViewHint {
+            camera: Some(serde_json::json!({ "x": 0.0, "y": 0.0, "zoom": 1.0 })),
+            viewport: Some(serde_json::json!({ "w": 100.0, "h": 100.0 })),
+            selection: vec![inside.clone()],
+        });
+        let server = CanvasServer::new(state);
+        let text = error_text(
+            &server
+                .canvas_read(Parameters(ReadArgs {
+                    attention: true,
+                    ..Default::default()
+                }))
+                .await
+                .unwrap(),
+        );
+        let (inside_handle, nearby_handle) = {
+            let mut aliases = workspace.aliases.lock().await;
+            (aliases.handle(&inside), aliases.handle(&nearby))
+        };
+        assert!(text.contains("view 0,0 100x100 zoom=1 page=live"), "{text}");
+        assert!(
+            text.contains(&format!("selected {inside_handle}")),
+            "{text}"
+        );
+        assert!(text.contains("visible 1 showing 1"), "{text}");
+        assert!(
+            text.contains(&format!("{inside_handle} rect 20,20 20x20")),
+            "{text}"
+        );
+        assert!(text.contains("nearby 1 showing 1"), "{text}");
+        assert!(
+            text.contains(&format!("{nearby_handle} rect 105,20 10x10")),
+            "{text}"
+        );
+        assert!(
+            text.contains("offscreen 2 bounds=105,20 305x390 kinds=rect:2"),
+            "{text}"
+        );
+        assert!(!text.contains("rect 400,400"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn canvas_read_attention_caps_visible_and_nearby_lines() {
+        let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
+        let workspace = state.workspace(crate::state::DEFAULT_WORKSPACE).await;
+        {
+            let mut doc = workspace.doc.lock().await;
+            for i in 0..101 {
+                attention_rect(&mut doc, (i % 10) as f64, (i / 10) as f64, 1.0, 1.0);
+            }
+            for i in 0..30 {
+                attention_rect(&mut doc, 105.0, i as f64, 1.0, 1.0);
+            }
+        }
+        *workspace.view_hint.lock().await = Some(crate::state::ViewHint {
+            camera: Some(serde_json::json!({ "x": 0.0, "y": 0.0, "zoom": 1.0 })),
+            viewport: Some(serde_json::json!({ "w": 100.0, "h": 100.0 })),
+            selection: Vec::new(),
+        });
+        let server = CanvasServer::new(state);
+        let text = error_text(
+            &server
+                .canvas_read(Parameters(ReadArgs {
+                    attention: true,
+                    ..Default::default()
+                }))
+                .await
+                .unwrap(),
+        );
+        assert!(text.contains("visible 101 showing 100"), "{text}");
+        assert!(text.contains("nearby 30 showing 25"), "{text}");
+        assert_eq!(
+            text.matches("rect 105,").count(),
+            25,
+            "nearby is capped at 25 lines: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn canvas_read_attention_without_a_view_hint_is_a_tool_error() {
+        let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
+        let workspace = state.workspace(crate::state::DEFAULT_WORKSPACE).await;
+        let server = CanvasServer::new(state);
+        let args = ReadArgs {
+            attention: true,
+            ..Default::default()
+        };
+        let missing = server
+            .canvas_read(Parameters(args))
+            .await
+            .expect("a missing hint must not panic");
+        assert_eq!(missing.is_error, Some(true));
+        assert_eq!(
+            error_text(&missing),
+            "no_view: no page is reporting view state; connect a page or read without attention"
+        );
+
+        *workspace.view_hint.lock().await = Some(crate::state::ViewHint {
+            camera: None,
+            viewport: Some(serde_json::json!({ "w": 100.0, "h": 100.0 })),
+            selection: Vec::new(),
+        });
+        let incomplete = server
+            .canvas_read(Parameters(ReadArgs {
+                attention: true,
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert_eq!(incomplete.is_error, Some(true));
+        assert!(
+            error_text(&incomplete).starts_with("no_view:"),
+            "{incomplete:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn canvas_read_attention_rejects_scopes_and_since() {
+        let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
+        let workspace = state.workspace(crate::state::DEFAULT_WORKSPACE).await;
+        *workspace.view_hint.lock().await = Some(crate::state::ViewHint {
+            camera: Some(serde_json::json!({ "x": 0.0, "y": 0.0, "zoom": 1.0 })),
+            viewport: Some(serde_json::json!({ "w": 100.0, "h": 100.0 })),
+            selection: Vec::new(),
+        });
+        let server = CanvasServer::new(state);
+        let attention = || ReadArgs {
+            attention: true,
+            ..Default::default()
+        };
+        let cases = [
+            ReadArgs {
+                ids: Some(vec!["e1".into()]),
+                ..attention()
+            },
+            ReadArgs {
+                frame: Some("e1".into()),
+                ..attention()
+            },
+            ReadArgs {
+                query: Some("api".into()),
+                ..attention()
+            },
+            ReadArgs {
+                selected: true,
+                ..attention()
+            },
+            ReadArgs {
+                since: Some(0),
+                ..attention()
+            },
+        ];
+        for args in cases {
+            let result = server.canvas_read(Parameters(args)).await.unwrap();
+            assert_eq!(result.is_error, Some(true));
+            let text = error_text(&result);
+            assert!(text.contains("attention cannot be combined"), "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn canvas_read_without_attention_has_no_view_section() {
+        let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
+        let workspace = state.workspace(crate::state::DEFAULT_WORKSPACE).await;
+        {
+            let mut doc = workspace.doc.lock().await;
+            attention_rect(&mut doc, 0.0, 0.0, 10.0, 10.0);
+        }
+        *workspace.view_hint.lock().await = Some(crate::state::ViewHint {
+            camera: Some(serde_json::json!({ "x": 0.0, "y": 0.0, "zoom": 1.0 })),
+            viewport: Some(serde_json::json!({ "w": 100.0, "h": 100.0 })),
+            selection: Vec::new(),
+        });
+        let server = CanvasServer::new(state);
+        let text = error_text(
+            &server
+                .canvas_read(Parameters(ReadArgs::default()))
+                .await
+                .unwrap(),
+        );
+        assert!(text.contains("rect 0,0 10x10"), "{text}");
+        for marker in ["view 0,0", "selected", "visible ", "nearby ", "offscreen "] {
+            assert!(!text.contains(marker), "unexpected {marker:?} in {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn canvas_read_scoped_result_carries_structured_elements() {
+        let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
+        let workspace = state.workspace(crate::state::DEFAULT_WORKSPACE).await;
+        let server = CanvasServer::new(state);
+        let (frame, sticky, text, outside) = {
+            let mut doc = workspace.doc.lock().await;
+            let frame = doc.add(
+                canvas_core::ElementKind::Frame {
+                    rect: canvas_core::geometry::Rect::new(0.0, 0.0, 400.0, 300.0),
+                    name: "VPC".into(),
+                },
+                1,
+            );
+            let text = doc.add(
+                canvas_core::ElementKind::Text {
+                    rect: canvas_core::geometry::Rect::new(10.0, 10.0, 40.0, 20.0),
+                    text: "DB".into(),
+                    align: canvas_core::model::TextAlign::Center,
+                    fixed_width: false,
+                    container_id: None,
+                    style: canvas_core::model::Style::default(),
+                },
+                2,
+            );
+            let sticky = doc.add(
+                canvas_core::ElementKind::Shape {
+                    shape: canvas_core::model::ShapeKind::Sticky,
+                    rect: canvas_core::geometry::Rect::new(10.0, 10.0, 140.0, 140.0),
+                    style: canvas_core::model::Style::default(),
+                    bound_text_id: Some(text.clone()),
+                },
+                3,
+            );
+            doc.element_mut(&sticky).unwrap().frame_id = Some(frame.clone());
+            if let canvas_core::ElementKind::Text { container_id, .. } =
+                &mut doc.element_mut(&text).unwrap().kind
+            {
+                *container_id = Some(sticky.clone());
+            }
+            let outside = doc.add(
+                canvas_core::ElementKind::Shape {
+                    shape: canvas_core::model::ShapeKind::Rectangle,
+                    rect: canvas_core::geometry::Rect::new(600.0, 0.0, 80.0, 40.0),
+                    style: canvas_core::model::Style::default(),
+                    bound_text_id: None,
+                },
+                4,
+            );
+            (frame, sticky, text, outside)
+        };
+
+        let result = server
+            .canvas_read(Parameters(ReadArgs {
+                frame: Some(frame.clone()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let body = structured(&result);
+        assert_eq!(body["workspace"], "default");
+        assert_eq!(body["context"], workspace.context());
+        assert_eq!(body["revision"], 0);
+        assert_eq!(body["matched"], 3, "frame, sticky and its bound label");
+        let elements = body["elements"].as_array().unwrap();
+        assert_eq!(elements.len(), 3);
+        assert_eq!(elements[0]["id"], frame);
+        assert_eq!(elements[0]["kind"], "frame");
+        assert_eq!(
+            elements[0]["bounds"],
+            serde_json::json!([0.0, 0.0, 400.0, 300.0])
+        );
+        assert_eq!(elements[0]["label"], "VPC");
+        assert!(elements[0]["frame"].is_null());
+        let sticky_json = elements.iter().find(|e| e["id"] == sticky).unwrap();
+        assert_eq!(sticky_json["kind"], "sticky");
+        assert_eq!(sticky_json["label"], "DB");
+        assert_eq!(sticky_json["frame"], elements[0]["handle"]);
+        let text_json = elements.iter().find(|e| e["id"] == text).unwrap();
+        assert_eq!(text_json["kind"], "text");
+        assert_eq!(text_json["label"], "DB");
+        assert!(
+            elements.iter().all(|e| e["id"] != outside),
+            "scoped reads exclude elements outside the frame"
+        );
+        assert!(
+            elements.iter().all(|e| e.get("element").is_none()),
+            "exact element JSON is detail-only"
+        );
+        let text_output = error_text(&result);
+        assert!(
+            text_output.starts_with("revision 0\n3 elements matched\n"),
+            "{text_output}"
+        );
+        assert!(
+            text_output.ends_with(&format!(
+                "\nworkspace {:?} context {:?}",
+                "default",
+                workspace.context()
+            )),
+            "{text_output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn canvas_read_detail_carries_the_exact_element_json() {
+        let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
+        let workspace = state.workspace(crate::state::DEFAULT_WORKSPACE).await;
+        let server = CanvasServer::new(state);
+        let drawn = server
+            .canvas_draw(Parameters(DrawArgs {
+                kind: "rectangle".into(),
+                text: Some("API".into()),
+                name: None,
+                glyph: None,
+                x: Some(0.0),
+                y: Some(0.0),
+                w: None,
+                h: None,
+                near: None,
+                side: None,
+            }))
+            .await
+            .unwrap();
+        let created: serde_json::Value = serde_json::from_str(&error_text(&drawn)).unwrap();
+        let handle = created["id"].as_str().unwrap().to_string();
+        let id = workspace.resolve_id(&handle).await;
+
+        let result = server
+            .canvas_read(Parameters(ReadArgs {
+                ids: Some(vec![handle.clone()]),
+                detail: true,
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let body = structured(&result);
+        assert_eq!(body["matched"], 2, "the rectangle and its bound label");
+        let elements = body["elements"].as_array().unwrap();
+        assert_eq!(elements.len(), 2);
+        assert!(
+            elements.iter().all(|e| e.get("element").is_some()),
+            "detail attaches the exact element JSON"
+        );
+        let shape = elements.iter().find(|e| e["id"] == id).unwrap();
+        let exact = {
+            let doc = workspace.doc.lock().await;
+            serde_json::to_value(doc.element(&id).unwrap()).unwrap()
+        };
+        assert_eq!(shape["element"], exact);
+        assert_eq!(shape["handle"], handle);
+        assert_eq!(shape["label"], "API");
+    }
+
+    #[tokio::test]
+    async fn canvas_read_summary_carries_structured_counts() {
+        let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
+        let workspace = state.workspace(crate::state::DEFAULT_WORKSPACE).await;
+        let server = CanvasServer::new(state);
+        let draw = |kind: &str| DrawArgs {
+            kind: kind.into(),
+            text: None,
+            name: None,
+            glyph: None,
+            x: None,
+            y: None,
+            w: None,
+            h: None,
+            near: None,
+            side: None,
+        };
+        server
+            .canvas_draw(Parameters(draw("rectangle")))
+            .await
+            .unwrap();
+        server
+            .canvas_draw(Parameters(draw("ellipse")))
+            .await
+            .unwrap();
+
+        let result = server
+            .canvas_read(Parameters(ReadArgs {
+                summary: true,
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let body = structured(&result);
+        assert_eq!(body["workspace"], "default");
+        assert_eq!(body["context"], workspace.context());
+        assert_eq!(body["revision"], 2);
+        assert_eq!(body["live"], 2);
+        assert_eq!(body["rectangles"], 1);
+        assert_eq!(body["ellipses"], 1);
+        assert!(
+            body.get("elements").is_none(),
+            "summary is the summary object, not an element page"
+        );
+        let text_body: serde_json::Value = serde_json::from_str(&error_text(&result)).unwrap();
+        assert_eq!(text_body["live"], body["live"]);
+        assert_eq!(text_body["revision"], body["revision"]);
+        assert!(
+            text_body.get("workspace").is_none(),
+            "text summary output is unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn canvas_read_since_carries_structured_changes_and_removals() {
+        let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
+        let workspace = state.workspace(crate::state::DEFAULT_WORKSPACE).await;
+        let server = CanvasServer::new(state);
+        let draw = |kind: &str| DrawArgs {
+            kind: kind.into(),
+            text: None,
+            name: None,
+            glyph: None,
+            x: None,
+            y: None,
+            w: None,
+            h: None,
+            near: None,
+            side: None,
+        };
+        let first = server
+            .canvas_draw(Parameters(draw("rectangle")))
+            .await
+            .unwrap();
+        let first: serde_json::Value = serde_json::from_str(&error_text(&first)).unwrap();
+        let removed_handle = first["id"].as_str().unwrap().to_string();
+        let baseline = workspace.revision.load(Ordering::SeqCst);
+
+        let second = server
+            .canvas_draw(Parameters(draw("ellipse")))
+            .await
+            .unwrap();
+        let second: serde_json::Value = serde_json::from_str(&error_text(&second)).unwrap();
+        let changed_handle = second["id"].as_str().unwrap().to_string();
+        let cleared = server
+            .canvas_clear(Parameters(ElementIdsArgs {
+                ids: vec![removed_handle.clone()],
+            }))
+            .await
+            .unwrap();
+        assert_ne!(cleared.is_error, Some(true), "{}", error_text(&cleared));
+
+        let result = server
+            .canvas_read(Parameters(ReadArgs {
+                since: Some(baseline),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let body = structured(&result);
+        assert_eq!(body["workspace"], "default");
+        assert_eq!(body["context"], workspace.context());
+        assert_eq!(body["revision"], workspace.revision.load(Ordering::SeqCst));
+        let changes = body["changes"].as_array().unwrap();
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0]["source"], "agent");
+        assert_eq!(changes[0]["changed"], serde_json::json!([changed_handle]));
+        assert_eq!(changes[1]["changed"], serde_json::json!([removed_handle]));
+        assert_eq!(body["changed"], serde_json::json!([changed_handle]));
+        assert_eq!(body["removed"], serde_json::json!([removed_handle]));
+        assert!(error_text(&result).contains("changed now:"));
     }
 
     #[tokio::test]
@@ -2823,6 +4084,123 @@ mod tests {
             .collect();
         assert!(names.contains(&"beta"), "{names:?}");
         assert!(names.contains(&"default"), "{names:?}");
+    }
+
+    #[tokio::test]
+    async fn workspace_create_without_a_page_is_listed_but_does_not_reroute_the_agent() {
+        let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
+        let server = CanvasServer::new(state.clone());
+
+        let result = server
+            .canvas_workspace_create(Parameters(CreateWorkspaceArgs {
+                name: "fresh".into(),
+            }))
+            .await
+            .unwrap();
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&error_text(&result)).unwrap();
+        assert_eq!(body["workspace"], "fresh");
+        assert_eq!(body["switched"], false);
+        assert_eq!(state.current_workspace().await.name, "default");
+
+        let status = server.canvas_status().await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&error_text(&status)).unwrap();
+        let names: Vec<&str> = body["workspaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|info| info["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"fresh"), "{names:?}");
+    }
+
+    #[tokio::test]
+    async fn workspace_create_rejects_invalid_reserved_and_existing_names() {
+        let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
+        let server = CanvasServer::new(state);
+
+        for (name, expected) in [("Bad Name", "lowercase"), ("default", "default workspace")] {
+            let result = server
+                .canvas_workspace_create(Parameters(CreateWorkspaceArgs { name: name.into() }))
+                .await
+                .unwrap();
+            assert_eq!(result.is_error, Some(true), "{name}");
+            assert!(error_text(&result).contains(expected), "{name}");
+        }
+        server
+            .canvas_workspace_create(Parameters(CreateWorkspaceArgs {
+                name: "fresh".into(),
+            }))
+            .await
+            .unwrap();
+        let duplicate = server
+            .canvas_workspace_create(Parameters(CreateWorkspaceArgs {
+                name: "fresh".into(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(duplicate.is_error, Some(true));
+        assert!(error_text(&duplicate).contains("already exists"));
+    }
+
+    #[tokio::test]
+    async fn workspace_create_opens_the_workspace_and_later_tools_land_there() {
+        let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
+        let source = state.workspace(crate::state::DEFAULT_WORKSPACE).await;
+        source.pages.store(1, Ordering::SeqCst);
+        source.note_page_activity();
+        let mut from_server = source.to_pages.subscribe();
+        let page_state = state.clone();
+        let page = tokio::spawn(async move {
+            let message = from_server.recv().await.unwrap();
+            let frame: serde_json::Value =
+                serde_json::from_str(&message.json.unwrap()).unwrap();
+            assert_eq!(frame["type"], "workspace_changed");
+            assert_eq!(frame["action"], "switch");
+            let target = page_state
+                .workspace(frame["workspace"].as_str().unwrap())
+                .await;
+            target.pages.store(1, Ordering::SeqCst);
+            target.note_page_activity();
+            target
+        });
+        let server = CanvasServer::new(state.clone());
+
+        let result = server
+            .canvas_workspace_create(Parameters(CreateWorkspaceArgs {
+                name: "fresh".into(),
+            }))
+            .await
+            .unwrap();
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&error_text(&result)).unwrap();
+        assert_eq!(body["switched"], true);
+        assert_eq!(body["pages_connected"], 1);
+        let target = page.await.unwrap();
+
+        server
+            .canvas_draw(Parameters(DrawArgs {
+                kind: "sticky".into(),
+                text: Some("on the new workspace".into()),
+                name: None,
+                glyph: None,
+                x: None,
+                y: None,
+                w: None,
+                h: None,
+                near: None,
+                side: None,
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            target.doc.lock().await.live_count(),
+            2,
+            "the sticky and its label land where the page followed"
+        );
+        assert_eq!(source.doc.lock().await.live_count(), 0);
+        assert_eq!(state.current_workspace().await.name, "fresh");
     }
 
     #[tokio::test]

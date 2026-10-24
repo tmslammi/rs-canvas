@@ -1,0 +1,34 @@
+{
+  "name": "load-100k-connected",
+  "actionError": null,
+  "result": {
+    "loadMs": 431.4,
+    "count": 199684
+  },
+  "durationMs": 454.4,
+  "metrics": {
+    "LayoutCount": 0,
+    "RecalcStyleCount": 1,
+    "LayoutDuration": 0,
+    "RecalcStyleDuration": 0.000042,
+    "ScriptDuration": 0.000262,
+    "TaskDuration": 0.450378,
+    "JSHeapUsedSize": 1720016,
+    "JSHeapTotalSize": 18415616,
+    "Nodes": 262,
+    "Documents": 1,
+    "Frames": 1,
+    "JSEventListeners": 117
+  },
+  "wasm": {
+    "bytes": 215023616,
+    "memories": 1,
+    "grows": 0,
+    "growBytes": 215023616
+  },
+  "longTasks": {
+    "count": 1,
+    "totalMs": 436,
+    "maxMs": 436
+  }
+}

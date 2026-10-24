@@ -1,0 +1,53 @@
+
+=== evidence/v1-5b9b3ae/load-100k-connected.cpuprofile — total 1326ms of samples ===
+
+top functions by self time:
+     513.6ms  38.7%  [wasm] <dlmalloc::sys::System as dlmalloc::Allocator>::alloc::h5e0d28c009e5d62c @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+      80.1ms   6.0%  [wasm] dlmalloc::dlmalloc::Dlmalloc<A>::malloc::h56d0ddc1cdd2a835 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+      76.0ms   5.7%  [wasm] memcmp @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+      67.4ms   5.1%  [js] (anonymous) @ http://localhost:4180/src/wasm/canvas_wasm.js:871
+      45.5ms   3.4%  [wasm] compiler_builtins::math::libm_math::sin::sin::h08c600313cafce2e @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+      44.3ms   3.3%  [wasm] alloc::collections::btree::search::<impl alloc::collections::btree::node::NodeRef<BorrowType,K,V,Type>>::find_key_index::h172b5697dc3c5b86 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+      33.3ms   2.5%  [wasm] compiler_builtins::math::libm_math::rem_pio2::rem_pio2::h9744b0998c265fd2 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+      31.2ms   2.4%  [wasm] canvas_core::rough::pen_band::h7a69bc969416fe9c @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+      29.0ms   2.2%  [wasm] canvas_core::rough::normal_at::h3e6beee84384f7ea @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+      27.7ms   2.1%  [wasm] canvas_core::scene::layer_bounds::h8d3ca0821eed9841 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+      27.6ms   2.1%  [wasm] alloc::collections::btree::search::<impl alloc::collections::btree::node::NodeRef<BorrowType,K,V,alloc::collections::btree::node::marker::LeafOrInternal>>::search_tree::ha0583298f016c63a @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+      27.5ms   2.1%  [wasm] alloc::collections::btree::search::<impl alloc::collections::btree::node::NodeRef<BorrowType,K,V,Type>>::find_key_index::h4183a6870d93103f @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+      15.7ms   1.2%  [wasm] dlmalloc::dlmalloc::Dlmalloc<A>::free::h1ed7b84c178240f9 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+      12.8ms   1.0%  [wasm] alloc::collections::btree::search::<impl alloc::collections::btree::node::NodeRef<BorrowType,K,V,Type>>::find_key_index::h1fdacb286ff6a437 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+      11.6ms   0.9%  [wasm] compiler_builtins::math::libm_math::cos::cos::h2353097d5b3f90e2 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+      11.2ms   0.8%  [wasm] alloc::raw_vec::RawVecInner<A>::deallocate::hfddf13f82b4e11dd @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+      10.8ms   0.8%  [other] (program) @ (native):0
+      10.8ms   0.8%  [wasm] <core::iter::adapters::map::Map<I,F> as core::iter::traits::iterator::Iterator>::fold::h2ca762ba6c5e4842 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+      10.3ms   0.8%  [wasm] alloc::collections::btree::search::<impl alloc::collections::btree::node::NodeRef<BorrowType,K,V,Type>>::find_key_index::h2377eb0f33596013 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+      10.0ms   0.8%  [wasm] alloc::collections::btree::search::<impl alloc::collections::btree::node::NodeRef<BorrowType,K,V,alloc::collections::btree::node::marker::LeafOrInternal>>::search_tree::h17717325e1748208 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+
+totals: wasm 1223.5ms (92.3%), js 75.0ms (5.7%)
+
+top wasm functions by self time:
+     513.6ms  38.7%  <dlmalloc::sys::System as dlmalloc::Allocator>::alloc::h5e0d28c009e5d62c @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+      80.1ms   6.0%  dlmalloc::dlmalloc::Dlmalloc<A>::malloc::h56d0ddc1cdd2a835 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+      76.0ms   5.7%  memcmp @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+      45.5ms   3.4%  compiler_builtins::math::libm_math::sin::sin::h08c600313cafce2e @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+      44.3ms   3.3%  alloc::collections::btree::search::<impl alloc::collections::btree::node::NodeRef<BorrowType,K,V,Type>>::find_key_index::h172b5697dc3c5b86 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+      33.3ms   2.5%  compiler_builtins::math::libm_math::rem_pio2::rem_pio2::h9744b0998c265fd2 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+      31.2ms   2.4%  canvas_core::rough::pen_band::h7a69bc969416fe9c @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+      29.0ms   2.2%  canvas_core::rough::normal_at::h3e6beee84384f7ea @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+      27.7ms   2.1%  canvas_core::scene::layer_bounds::h8d3ca0821eed9841 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+      27.6ms   2.1%  alloc::collections::btree::search::<impl alloc::collections::btree::node::NodeRef<BorrowType,K,V,alloc::collections::btree::node::marker::LeafOrInternal>>::search_tree::ha0583298f016c63a @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+      27.5ms   2.1%  alloc::collections::btree::search::<impl alloc::collections::btree::node::NodeRef<BorrowType,K,V,Type>>::find_key_index::h4183a6870d93103f @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+      15.7ms   1.2%  dlmalloc::dlmalloc::Dlmalloc<A>::free::h1ed7b84c178240f9 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+      12.8ms   1.0%  alloc::collections::btree::search::<impl alloc::collections::btree::node::NodeRef<BorrowType,K,V,Type>>::find_key_index::h1fdacb286ff6a437 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+      11.6ms   0.9%  compiler_builtins::math::libm_math::cos::cos::h2353097d5b3f90e2 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+      11.2ms   0.8%  alloc::raw_vec::RawVecInner<A>::deallocate::hfddf13f82b4e11dd @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+      10.8ms   0.8%  <core::iter::adapters::map::Map<I,F> as core::iter::traits::iterator::Iterator>::fold::h2ca762ba6c5e4842 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+      10.3ms   0.8%  alloc::collections::btree::search::<impl alloc::collections::btree::node::NodeRef<BorrowType,K,V,Type>>::find_key_index::h2377eb0f33596013 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+      10.0ms   0.8%  alloc::collections::btree::search::<impl alloc::collections::btree::node::NodeRef<BorrowType,K,V,alloc::collections::btree::node::marker::LeafOrInternal>>::search_tree::h17717325e1748208 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       7.7ms   0.6%  <alloc::collections::btree::map::Values<K,V> as core::iter::traits::iterator::Iterator>::next::h0e3e6eb54e3a07cc @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       7.2ms   0.5%  alloc::collections::btree::search::<impl alloc::collections::btree::node::NodeRef<BorrowType,K,V,Type>>::find_key_index::h50e0147131ce2948 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+
+top scripts by self time:
+    1223.5ms  92.3%  http://localhost:4180/src/wasm/canvas_wasm_bg.wasm
+      75.0ms   5.7%  http://localhost:4180/src/wasm/canvas_wasm.js
+      27.5ms   2.1%  (native)

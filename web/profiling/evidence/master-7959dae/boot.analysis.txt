@@ -1,0 +1,47 @@
+
+=== evidence/master-7959dae/boot.cpuprofile — total 47ms of samples ===
+
+top functions by self time:
+      18.4ms  39.0%  [other] (program) @ (native):0
+      12.3ms  26.0%  [js] __wbg_clientWidth_08d5512595aacb73 @ http://localhost:4180/src/wasm/canvas_wasm.js:831
+       4.3ms   9.1%  [other] (idle) @ (native):0
+       1.3ms   2.8%  [js] boot @ http://localhost:4180/src/main.js:33
+       1.0ms   2.0%  [other] js-to-wasm @ (native):0
+       0.9ms   2.0%  [js] __wbg_save_f32554f1747071d1 @ http://localhost:4180/src/wasm/canvas_wasm.js:1155
+       0.4ms   0.8%  [other] UtilityScript @ (native):280
+       0.4ms   0.8%  [wasm] wasm_bindgen::convert::closures::<impl wasm_bindgen::closure::WasmClosureFnOnce<dyn core::ops::function::FnMut<(A,)>+Output = R,A,R> for T>::into_fn_mut::{{closure}}::h83120c0aa6767a1a @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.4ms   0.8%  [wasm] alloc::vec::Vec<T,A>::extend_from_slice::hdcc98928537530c0 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.3ms   0.7%  [other] (anonymous) @ (native):2
+       0.3ms   0.7%  [wasm] <idb::event::database::OpenDatabaseRequestEvent as idb::event::Event>::target::h4cba253e3504a8f5 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.3ms   0.7%  [js] swatches @ http://localhost:4180/src/stylePanel.js:52
+       0.3ms   0.7%  [wasm] idb::request::database::DatabaseRequest::on_upgrade_needed::hf130beaedb6801f1 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.3ms   0.7%  [other] createElement @ (native):0
+       0.3ms   0.7%  [js] remember @ http://localhost:4180/src/workspacePanel.js:140
+       0.3ms   0.7%  [other] InjectedScript @ (native):6810
+       0.3ms   0.7%  [js] __wbg_init @ http://localhost:4180/src/wasm/canvas_wasm.js:1658
+       0.3ms   0.7%  [other] grow @ (native):0
+       0.3ms   0.7%  [wasm] idb::database::Database::transaction::heb77096cef4cbf3c @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.3ms   0.7%  [wasm] std::sys::random::unsupported::hashmap_random_keys::h8ce533668958160a @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+
+totals: wasm 3.3ms (6.9%), js 18.0ms (38.1%)
+
+top wasm functions by self time:
+       0.4ms   0.8%  wasm_bindgen::convert::closures::<impl wasm_bindgen::closure::WasmClosureFnOnce<dyn core::ops::function::FnMut<(A,)>+Output = R,A,R> for T>::into_fn_mut::{{closure}}::h83120c0aa6767a1a @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.4ms   0.8%  alloc::vec::Vec<T,A>::extend_from_slice::hdcc98928537530c0 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.3ms   0.7%  <idb::event::database::OpenDatabaseRequestEvent as idb::event::Event>::target::h4cba253e3504a8f5 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.3ms   0.7%  idb::request::database::DatabaseRequest::on_upgrade_needed::hf130beaedb6801f1 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.3ms   0.7%  idb::database::Database::transaction::heb77096cef4cbf3c @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.3ms   0.7%  std::sys::random::unsupported::hashmap_random_keys::h8ce533668958160a @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.3ms   0.7%  canvas_core::model::_::<impl serde_core::ser::Serialize for canvas_core::model::Style>::serialize::h1fb85795a825f292 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.3ms   0.7%  <canvas_wasm::Canvas2dRenderer as canvas_core::display::Renderer>::clear::haf06429daca114e9 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.3ms   0.7%  hashbrown::table::HashTable<T,A>::entry::hc426fbfad0d5a33f @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.3ms   0.6%  dlmalloc::dlmalloc::Dlmalloc<A>::free::h1ed7b84c178240f9 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+
+top scripts by self time:
+      26.0ms  55.0%  (native)
+      15.1ms  32.0%  http://localhost:4180/src/wasm/canvas_wasm.js
+       3.3ms   6.9%  http://localhost:4180/src/wasm/canvas_wasm_bg.wasm
+       1.6ms   3.5%  http://localhost:4180/src/main.js
+       0.6ms   1.3%  http://localhost:4180/src/stylePanel.js
+       0.3ms   0.7%  http://localhost:4180/src/workspacePanel.js
+       0.3ms   0.6%  http://localhost:4180/src/agentBridge.js

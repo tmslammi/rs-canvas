@@ -32,7 +32,7 @@ impl Patch {
             let element = match delta {
                 Delta::Add { element } => element.clone(),
                 Delta::Update { after, .. } => after.clone(),
-                Delta::Remove { tombstoned, .. } => tombstoned.clone(),
+                Delta::Remove { before, tombstone } => tombstone.materialize(before),
                 Delta::Purge { element } => {
                     let mut tombstone = element.clone();
                     tombstone.is_deleted = true;
@@ -83,6 +83,7 @@ pub fn merge_element(doc: &mut Document, incoming: &Element) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::delta::Tombstone;
     use crate::geometry::Rect;
     use crate::model::{ElementKind, ShapeKind, Style};
 
@@ -115,13 +116,40 @@ mod tests {
             },
             Delta::Remove {
                 before: updated.clone(),
-                tombstoned: tombstoned.clone(),
+                tombstone: Tombstone {
+                    version: tombstoned.version,
+                    version_nonce: tombstoned.version_nonce,
+                    updated: tombstoned.updated,
+                },
             },
         ];
 
         let patch = Patch::from_deltas(&deltas, 9);
         assert_eq!(patch.put.len(), 1, "the later delta for an id wins");
         assert_eq!(patch.put[0], tombstoned);
+    }
+
+    #[test]
+    fn remove_projects_the_derived_tombstone() {
+        let before = element("one", 0.0);
+        let tombstone = Tombstone {
+            version: before.version + 3,
+            version_nonce: 77,
+            updated: 42,
+        };
+        let patch = Patch::from_deltas(
+            &[Delta::Remove {
+                before: before.clone(),
+                tombstone,
+            }],
+            9,
+        );
+        let mut expected = before;
+        expected.is_deleted = true;
+        expected.version = tombstone.version;
+        expected.version_nonce = tombstone.version_nonce;
+        expected.updated = tombstone.updated;
+        assert_eq!(patch.put, vec![expected]);
     }
 
     #[test]

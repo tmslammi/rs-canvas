@@ -19,6 +19,7 @@ declare global {
       can_redo(): boolean;
       undo(): void;
       redo(): void;
+      key_down(key: string, shift: boolean, alt: boolean, ctrl: boolean, meta: boolean): boolean;
       selection_bounds(): Float64Array | undefined;
       current_style(): string;
       update_style(patch: string): void;

@@ -30,7 +30,7 @@ jobs:
       ref: ${{ inputs.tag || github.ref }}
 
   guard:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         with:
@@ -55,7 +55,8 @@ jobs:
 
   build:
     needs: [ci, guard]
-    runs-on: macos-latest
+    # Pin the image so the SDK and Rosetta setup used for the release stay stable.
+    runs-on: macos-26
     env:
       # Keep the binaries usable on the oldest macOS either architecture is
       # likely to run in an alpha.
@@ -70,13 +71,19 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag || github.ref }}
+      - name: Read the Rust toolchain
+        id: toolchain
+        run: |
+          version=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
+          [ -n "$version" ] || { echo "::error::rust-toolchain.toml has no channel"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.94.0"
+          toolchain: ${{ steps.toolchain.outputs.version }}
           targets: wasm32-unknown-unknown,${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          key: ${{ matrix.target }}-${{ env.MACOSX_DEPLOYMENT_TARGET }}
       - name: Read the wasm-bindgen version
         id: wasm-bindgen
         run: |
@@ -100,7 +107,8 @@ jobs:
       - name: Build rs-canvas
         run: |
           set -euo pipefail
-          export RS_CANVAS_GIT_SHA="$(git rev-parse --short HEAD)"
+          sha="$(git rev-parse --short HEAD)"
+          export RS_CANVAS_GIT_SHA="$sha"
           cargo build --release --locked -p canvas-server \
             --features embed-web --target "${{ matrix.target }}"
 
@@ -110,9 +118,17 @@ jobs:
           staging="$(mktemp -d)"
           cp "target/${{ matrix.target }}/release/canvas-server" "$staging/rs-canvas"
           cp LICENSE "$staging/LICENSE"
+          cp web/fonts/ComicShanns-LICENSE.txt "$staging/ComicShanns-LICENSE.txt"
           tar -czf "rs-canvas-${{ matrix.target }}.tar.gz" \
-            -C "$staging" rs-canvas LICENSE
+            -C "$staging" rs-canvas LICENSE ComicShanns-LICENSE.txt
           rm -rf "$staging"
+
+      - name: Test the installer against the packaged release
+        run: |
+          bash scripts/test-install.sh \
+            "rs-canvas-${{ matrix.target }}.tar.gz" \
+            "${{ matrix.target }}" \
+            "$TAG"
 
       - name: Smoke-test the packaged binary
         run: |
@@ -120,6 +136,9 @@ jobs:
           package="$(mktemp -d)"
           tar -xzf "rs-canvas-${{ matrix.target }}.tar.gz" -C "$package"
           "$package/rs-canvas" --version
+          # Run from the package directory (only the binary and licenses) so
+          # the assets can only come from the embedded front end.
+          cd "$package"
           "$package/rs-canvas" --no-open --port 5199 --doc "$RUNNER_TEMP/smoke.json" &
           server=$!
           trap 'kill "$server" 2>/dev/null || true' EXIT
@@ -141,6 +160,12 @@ jobs:
           grep -q '<title>rs-canvas</title>' "$package/index.html"
           curl -fsS http://127.0.0.1:5199/src/main.js >/dev/null
           curl -fsS http://127.0.0.1:5199/src/wasm/canvas_wasm_bg.wasm >/dev/null
+          curl -fsS http://127.0.0.1:5199/fonts/ComicShanns-Regular.ttf >/dev/null
+          curl -fsS -X POST http://127.0.0.1:5199/mcp \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json, text/event-stream' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}' \
+            >/dev/null
 
           kill "$server" 2>/dev/null || true
           wait "$server" 2>/dev/null || true
@@ -153,7 +178,7 @@ jobs:
 
   release:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
@@ -166,7 +191,7 @@ jobs:
           merge-multiple: true
       - name: Checksums
         working-directory: dist
-        run: sha256sum *.tar.gz > SHA256SUMS
+        run: sha256sum -- *.tar.gz > SHA256SUMS
       - name: Publish the pre-release
         env:
           GH_TOKEN: ${{ github.token }}

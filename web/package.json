@@ -1,7 +1,7 @@
 {
   "name": "rs-canvas-web",
   "private": true,
-  "version": "0.1.0-alpha.1",
+  "version": "0.1.0-alpha.2",
   "description": "Front end for the rs-canvas local drawing tool",
   "license": "MIT",
   "type": "module",
@@ -14,7 +14,8 @@
     "build": "npm run build:wasm && npm run stage",
     "dev": "npm run build:wasm && bash scripts/dev.sh",
     "typecheck": "tsc --noEmit",
-    "test:e2e": "npm run build:wasm && playwright test"
+    "test:e2e": "npm run build:wasm && playwright test",
+    "profile": "npm run build:wasm && playwright test --config profiling/playwright.profiling.config.ts"
   },
   "devDependencies": {
     "@playwright/test": "^1.63.0",

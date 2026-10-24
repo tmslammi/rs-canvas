@@ -1,0 +1,53 @@
+
+=== evidence/v1-5b9b3ae/select-all-delete-undo.cpuprofile — total 354ms of samples ===
+
+top functions by self time:
+     165.6ms  46.8%  [wasm] memcmp @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+      57.0ms  16.1%  [wasm] alloc::vec::Vec<T,A>::remove::h3ed3f6fe12e689ee @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+      37.8ms  10.7%  [wasm] canvas_core::scene::Scene::update::hb34fa188ea46913a @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+      11.7ms   3.3%  [other] (program) @ (native):0
+       6.7ms   1.9%  [wasm] canvas_core::rough::hachure_lines::h6378872764c7ed5c @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       6.4ms   1.8%  [wasm] canvas_core::editor::Editor::rebuild_changed::haf81cb386515825b @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       6.0ms   1.7%  [other] (idle) @ (native):0
+       4.4ms   1.2%  [wasm] dlmalloc::dlmalloc::Dlmalloc<A>::malloc::h56d0ddc1cdd2a835 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       3.5ms   1.0%  [wasm] dlmalloc::dlmalloc::Dlmalloc<A>::unlink_chunk::h73e8fc0a8f8e75b2 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       3.2ms   0.9%  [wasm] compiler_builtins::math::libm_math::sin::sin::h08c600313cafce2e @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       2.8ms   0.8%  [wasm] compiler_builtins::math::libm_math::rem_pio2::rem_pio2::h9744b0998c265fd2 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       2.8ms   0.8%  [wasm] canvas_core::rough::normal_at::h3e6beee84384f7ea @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       2.5ms   0.7%  [wasm] dlmalloc::dlmalloc::Dlmalloc<A>::free::h1ed7b84c178240f9 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       2.2ms   0.6%  [wasm] alloc::collections::btree::search::<impl alloc::collections::btree::node::NodeRef<BorrowType,K,V,alloc::collections::btree::node::marker::LeafOrInternal>>::search_tree::h0393cc27e7219ac4 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       1.9ms   0.5%  [wasm] dlmalloc::dlmalloc::Dlmalloc<A>::insert_large_chunk::h05591b2b4b88c2c0 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       1.8ms   0.5%  [wasm] __rustc[4425a7e20b4c8619]::__rdl_realloc @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       1.8ms   0.5%  [other] (garbage collector) @ (native):0
+       1.7ms   0.5%  [wasm] canvas_core::rough::pen_band::h7a69bc969416fe9c @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       1.6ms   0.4%  [wasm] <alloc::string::String as core::clone::Clone>::clone::h513f30159ab4c799 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       1.6ms   0.4%  [wasm] alloc::collections::btree::search::<impl alloc::collections::btree::node::NodeRef<BorrowType,K,V,alloc::collections::btree::node::marker::LeafOrInternal>>::search_tree::ha0583298f016c63a @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+
+totals: wasm 333.4ms (94.2%), js 0.3ms (0.1%)
+
+top wasm functions by self time:
+     165.6ms  46.8%  memcmp @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+      57.0ms  16.1%  alloc::vec::Vec<T,A>::remove::h3ed3f6fe12e689ee @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+      37.8ms  10.7%  canvas_core::scene::Scene::update::hb34fa188ea46913a @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       6.7ms   1.9%  canvas_core::rough::hachure_lines::h6378872764c7ed5c @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       6.4ms   1.8%  canvas_core::editor::Editor::rebuild_changed::haf81cb386515825b @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       4.4ms   1.2%  dlmalloc::dlmalloc::Dlmalloc<A>::malloc::h56d0ddc1cdd2a835 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       3.5ms   1.0%  dlmalloc::dlmalloc::Dlmalloc<A>::unlink_chunk::h73e8fc0a8f8e75b2 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       3.2ms   0.9%  compiler_builtins::math::libm_math::sin::sin::h08c600313cafce2e @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       2.8ms   0.8%  compiler_builtins::math::libm_math::rem_pio2::rem_pio2::h9744b0998c265fd2 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       2.8ms   0.8%  canvas_core::rough::normal_at::h3e6beee84384f7ea @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       2.5ms   0.7%  dlmalloc::dlmalloc::Dlmalloc<A>::free::h1ed7b84c178240f9 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       2.2ms   0.6%  alloc::collections::btree::search::<impl alloc::collections::btree::node::NodeRef<BorrowType,K,V,alloc::collections::btree::node::marker::LeafOrInternal>>::search_tree::h0393cc27e7219ac4 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       1.9ms   0.5%  dlmalloc::dlmalloc::Dlmalloc<A>::insert_large_chunk::h05591b2b4b88c2c0 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       1.8ms   0.5%  __rustc[4425a7e20b4c8619]::__rdl_realloc @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       1.7ms   0.5%  canvas_core::rough::pen_band::h7a69bc969416fe9c @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       1.6ms   0.4%  <alloc::string::String as core::clone::Clone>::clone::h513f30159ab4c799 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       1.6ms   0.4%  alloc::collections::btree::search::<impl alloc::collections::btree::node::NodeRef<BorrowType,K,V,alloc::collections::btree::node::marker::LeafOrInternal>>::search_tree::ha0583298f016c63a @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       1.3ms   0.4%  fmin @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       1.3ms   0.4%  canvas_core::scene::layer_bounds::h8d3ca0821eed9841 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       1.3ms   0.4%  <canvas_core::model::Element as core::clone::Clone>::clone::hda0db372887a016b @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+
+top scripts by self time:
+     333.4ms  94.2%  http://localhost:4180/src/wasm/canvas_wasm_bg.wasm
+      20.1ms   5.7%  (native)
+       0.3ms   0.1%  http://localhost:4180/src/wasm/canvas_wasm.js

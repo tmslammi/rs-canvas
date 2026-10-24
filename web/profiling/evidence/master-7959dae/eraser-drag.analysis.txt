@@ -1,0 +1,45 @@
+
+=== evidence/master-7959dae/eraser-drag.cpuprofile — total 848ms of samples ===
+
+top functions by self time:
+     809.0ms  95.4%  [other] (idle) @ (native):0
+      20.0ms   2.4%  [other] (program) @ (native):0
+       4.4ms   0.5%  [wasm] canvas_core::scene::Scene::reindex_from::hc405e09c22be5e5e @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       3.6ms   0.4%  [wasm] memcmp @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       1.0ms   0.1%  [other] evaluate @ (native):305
+       1.0ms   0.1%  [wasm] hashbrown::map::HashMap<K,V,S,A>::insert::h6fc71b42f4ac0448 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       1.0ms   0.1%  [other] (garbage collector) @ (native):0
+       1.0ms   0.1%  [wasm] core::hash::BuildHasher::hash_one::h2c5be82e4094a6a8 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.7ms   0.1%  [other] (anonymous) @ (native):1
+       0.7ms   0.1%  [other] (anonymous) @ (native):0
+       0.7ms   0.1%  [other] setupDragListeners @ (native):1
+       0.4ms   0.0%  [wasm] dlmalloc::dlmalloc::Dlmalloc<A>::malloc::h56d0ddc1cdd2a835 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.4ms   0.0%  [other] addEventListener @ (native):0
+       0.4ms   0.0%  [other] removeEventListener @ (native):0
+       0.3ms   0.0%  [js] (anonymous) @ http://localhost:4180/src/main.js:527
+       0.3ms   0.0%  [wasm] js-to-wasm:: @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.3ms   0.0%  [wasm] alloc::vec::in_place_collect::from_iter_in_place::h06bb37a838f4cb67 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.3ms   0.0%  [other] innerSerialize @ (native):186
+       0.3ms   0.0%  [js] decodeText @ http://localhost:4180/src/wasm/canvas_wasm.js:1562
+       0.3ms   0.0%  [other] wasm-to-js @ (native):0
+
+totals: wasm 12.3ms (1.4%), js 1.3ms (0.2%)
+
+top wasm functions by self time:
+       4.4ms   0.5%  canvas_core::scene::Scene::reindex_from::hc405e09c22be5e5e @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       3.6ms   0.4%  memcmp @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       1.0ms   0.1%  hashbrown::map::HashMap<K,V,S,A>::insert::h6fc71b42f4ac0448 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       1.0ms   0.1%  core::hash::BuildHasher::hash_one::h2c5be82e4094a6a8 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.4ms   0.0%  dlmalloc::dlmalloc::Dlmalloc<A>::malloc::h56d0ddc1cdd2a835 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.3ms   0.0%  js-to-wasm:: @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.3ms   0.0%  alloc::vec::in_place_collect::from_iter_in_place::h06bb37a838f4cb67 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.3ms   0.0%  core::slice::sort::unstable::quicksort::partition_lomuto_branchless_cyclic::h681e078e51e7e746 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.3ms   0.0%  canvas_wasm::Editor::cursor::h6706996eeba994e8 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.3ms   0.0%  canvas_core::hit::hits::he8e3eddf6162a7c4 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.3ms   0.0%  canvas_core::hit::hit_test_raw_indexed::h54d1a24960cdbdc8 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+
+top scripts by self time:
+     834.4ms  98.4%  (native)
+      12.3ms   1.4%  http://localhost:4180/src/wasm/canvas_wasm_bg.wasm
+       1.0ms   0.1%  http://localhost:4180/src/main.js
+       0.3ms   0.0%  http://localhost:4180/src/wasm/canvas_wasm.js
