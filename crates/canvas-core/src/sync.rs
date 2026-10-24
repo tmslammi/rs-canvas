@@ -6,17 +6,14 @@
 //! Pages materialize those tombstones into the snapshot from their purge
 //! ledger, so undo of a creation still propagates without guessing.
 //!
-//! The same module exposes the frame decoder both wire encodings converge on,
-//! and the ledger that keeps purged elements expressible across reconnects.
+//! The same module exposes the binary frame decoder and the ledger that keeps
+//! purged elements expressible across reconnects.
 
 use std::collections::BTreeMap;
-
-use serde_json::Value;
 
 use crate::delta::Delta;
 use crate::model::{Document, Element, ElementId};
 use crate::patch::Patch;
-use crate::serialization;
 use crate::wire::{self, FrameKind, WireError};
 
 /// A document frame uploaded by a page.
@@ -46,24 +43,6 @@ impl PageFrame {
                 let (_, put) = wire::decode_patch(bytes)?;
                 Ok(PageFrame::Patch { put })
             }
-        }
-    }
-
-    /// Decode a JSON document frame. A snapshot must carry the server revision
-    /// it was based on; a frame without `rev` is malformed. Control frames
-    /// return `None` so the caller can keep handling them separately.
-    pub fn from_json(frame: &Value) -> Option<Self> {
-        match frame.get("type").and_then(Value::as_str) {
-            Some("snapshot") => {
-                let doc = serialization::from_value(frame.get("doc")?.clone()).ok()?;
-                let base_revision = frame.get("rev").and_then(Value::as_u64)?;
-                Some(PageFrame::Snapshot { base_revision, doc })
-            }
-            Some("patch") => {
-                let put = serde_json::from_value(frame.get("put")?.clone()).ok()?;
-                Some(PageFrame::Patch { put })
-            }
-            _ => None,
         }
     }
 }
@@ -162,7 +141,7 @@ mod tests {
     }
 
     #[test]
-    fn binary_and_json_snapshots_carry_the_page_base_revision() {
+    fn binary_snapshots_carry_the_page_base_revision() {
         let mut doc = Document::new();
         doc.insert(element("one", 1));
 
@@ -174,57 +153,16 @@ mod tests {
                 doc: doc.clone()
             }
         );
-
-        let json = serde_json::json!({
-            "type": "snapshot",
-            "rev": 9,
-            "doc": serde_json::to_value(&doc).unwrap(),
-        });
-        assert_eq!(
-            PageFrame::from_json(&json).unwrap(),
-            PageFrame::Snapshot {
-                base_revision: 9,
-                doc
-            }
-        );
     }
 
     #[test]
-    fn json_snapshots_without_a_base_revision_are_rejected() {
-        let mut doc = Document::new();
-        doc.insert(element("one", 1));
-        let json = serde_json::json!({
-            "type": "snapshot",
-            "doc": serde_json::to_value(&doc).unwrap(),
-        });
-        assert!(PageFrame::from_json(&json).is_none());
-    }
-
-    #[test]
-    fn json_and_binary_patches_decode_to_the_same_elements() {
+    fn binary_patches_decode_to_full_elements() {
         let element = element("one", 1);
-        let json = serde_json::json!({
-            "type": "patch",
-            "rev": 4,
-            "put": [serde_json::to_value(&element).unwrap()],
-        });
-        let from_json = PageFrame::from_json(&json).unwrap();
         let bytes = wire::encode_patch(4, std::slice::from_ref(&element)).unwrap();
-        let from_binary = PageFrame::from_binary(&bytes).unwrap();
-        assert_eq!(from_json, from_binary);
-        assert_eq!(from_json, PageFrame::Patch { put: vec![element] });
-    }
-
-    #[test]
-    fn control_frames_are_not_page_document_frames() {
-        assert!(PageFrame::from_json(&serde_json::json!({
-            "type": "hello", "sync": true
-        }))
-        .is_none());
-        assert!(PageFrame::from_json(&serde_json::json!({
-            "type": "synced", "rev": 3
-        }))
-        .is_none());
+        assert_eq!(
+            PageFrame::from_binary(&bytes).unwrap(),
+            PageFrame::Patch { put: vec![element] }
+        );
     }
 
     #[test]

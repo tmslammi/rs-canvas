@@ -418,7 +418,7 @@ async function boot() {
     : `rs-canvas-unload-checkpoint:workspace:${name}`;
   const UNLOAD_CHECKPOINT = checkpointKey(workspace);
   // localStorage is string-only, so binary checkpoints carry base64 with a
-  // distinct prefix. A checkpoint without the prefix is the old JSON format.
+  // distinct prefix.
   const CHECKPOINT_PREFIX = "rsc-bin1:";
   const bytesToBase64 = (bytes) => {
     let binary = "";
@@ -431,7 +431,7 @@ async function boot() {
   const checkpointValue = (bytes) => CHECKPOINT_PREFIX + bytesToBase64(bytes);
   const checkpointBytes = (value) => value.startsWith(CHECKPOINT_PREFIX)
     ? Uint8Array.from(atob(value.slice(CHECKPOINT_PREFIX.length)), (c) => c.charCodeAt(0))
-    : new TextEncoder().encode(value);
+    : null;
   const checkpointAutosave = () => {
     if (!autosaveTimer) return; // nothing pending — IndexedDB is already current
     window.clearTimeout(autosaveTimer);
@@ -669,7 +669,7 @@ async function boot() {
       if (name) await save_workspace_bytes(name, bytes);
       await managementRequest(name ? "/rename" : "", name ? {
         method: "POST", headers: { "Content-Type": "application/json" },
-        // The server merges the document through its JSON wire path.
+        // The workspace-management API merges the embedded document.
         body: JSON.stringify({ name, doc: JSON.parse(editor.save_json()) }),
       } : { method: "DELETE" });
       serverChanged = true;
@@ -804,8 +804,11 @@ async function boot() {
     const checkpoint = localStorage.getItem(UNLOAD_CHECKPOINT);
     if (checkpoint) {
       localStorage.removeItem(UNLOAD_CHECKPOINT);
-      editor.load_bytes(checkpointBytes(checkpoint));
-      editor.flush_save();
+      const bytes = checkpointBytes(checkpoint);
+      if (bytes) {
+        editor.load_bytes(bytes);
+        editor.flush_save();
+      }
     }
   } catch (error) {
     console.warn("could not restore unload checkpoint", error);
@@ -817,8 +820,6 @@ async function boot() {
   // server hands over its mirror, and the two reconcile.
   bridge = connectAgentBridge(editor, {
     workspace,
-    // `?wire=json` exercises the legacy path against a current server.
-    wire: new URLSearchParams(location.search).get("wire"),
     onRemoteChange: () => {
       if (!autosavePaused) editor.flush_save();
       refreshToolbar();

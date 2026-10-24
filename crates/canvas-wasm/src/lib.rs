@@ -340,13 +340,6 @@ struct PresentOutcome {
     cancelled: bool,
 }
 
-/// A deferred server frame, kept in the form it arrived in so the legacy JSON
-/// path and the binary path share the same mid-gesture deferral.
-enum PendingRemote {
-    Json(String),
-    Binary(Vec<u8>),
-}
-
 /// The editor handle the shell talks to.
 #[wasm_bindgen]
 pub struct Editor {
@@ -371,12 +364,12 @@ pub struct Editor {
     /// Agent highlight pulse in flight, if any (view state only).
     pulse: Option<Pulse>,
     /// A server snapshot that arrived mid-gesture, applied on pointer-up.
-    pending_remote: Option<PendingRemote>,
+    pending_remote: Option<Vec<u8>>,
     /// Server patches that arrived mid-gesture, applied on pointer-up.
-    pending_patches: Vec<PendingRemote>,
-    /// The last server revision this page has seen (a binary frame header or a
-    /// JSON `rev`). Outbound snapshot and patch frames carry it as the page's
-    /// base revision; merging never depends on it.
+    pending_patches: Vec<Vec<u8>>,
+    /// The last server revision this page has seen (a binary frame header or
+    /// the `synced` acknowledgement). Outbound snapshot and patch frames carry
+    /// it as the page's base revision; merging never depends on it.
     wire_revision: u64,
     /// Explicit deletions whose element entry was purged locally (undo of a
     /// creation). The live document has no entry left, so the ledger is folded
@@ -562,27 +555,6 @@ impl Editor {
         canvas_core::serialization::to_json(&self.synced_document()).unwrap_or_default()
     }
 
-    /// The live document wrapped as a `{"type":"snapshot","rev":N,"doc":{...}}`
-    /// frame, so the shell sends it without a parse/stringify round trip.
-    /// Legacy fallback for servers that do not advertise the binary wire. The
-    /// revision is the page's base: the last server revision it has seen.
-    pub fn snapshot_frame_json(&self) -> String {
-        let doc = self.synced_document();
-        #[derive(serde::Serialize)]
-        struct Snapshot<'a> {
-            #[serde(rename = "type")]
-            kind: &'static str,
-            rev: u64,
-            doc: &'a Document,
-        }
-        serde_json::to_string(&Snapshot {
-            kind: "snapshot",
-            rev: self.wire_revision,
-            doc: &doc,
-        })
-        .unwrap_or_default()
-    }
-
     /// The live document as a binary snapshot wire frame: header (whose
     /// revision is the page's base), then the versioned document envelope.
     /// No JSON pass and no string.
@@ -591,35 +563,23 @@ impl Editor {
         wire::encode_snapshot(self.wire_revision, &doc).unwrap_or_default()
     }
 
-    /// Record the server revision carried by a JSON frame. Binary decoding
-    /// updates the revision itself; the legacy JSON path calls this before
-    /// applying so the next snapshot uploads a truthful base.
+    /// Record the server revision carried by the `synced` control frame.
+    /// Binary document decoding updates the revision itself; the
+    /// acknowledgement covers a snapshot that needed no correction, so the
+    /// next snapshot uploads a truthful base.
     pub fn set_wire_revision(&mut self, revision: f64) {
         if revision.is_finite() && revision >= 0.0 {
             self.wire_revision = revision as u64;
         }
     }
 
-    /// Merge a server snapshot into this page's document using the merge-ready
-    /// rules, keeping local edits. Inbound merges never touch history, so the
-    /// user's undo stack stays theirs. Returns whether anything changed.
-    ///
-    /// A snapshot that lands mid-gesture is deferred to pointer-up: replacing
-    /// the document under an in-flight drag would corrupt the gesture.
-    pub fn reconcile_json(&mut self, json: &str) -> Result<bool, JsValue> {
-        if self.core.is_interacting() {
-            self.pending_remote = Some(PendingRemote::Json(json.to_string()));
-            return Ok(false);
-        }
-        self.reconcile_json_now(json)
-    }
-
     /// Merge a binary snapshot wire frame. The payload is decoded straight
     /// into the model; the shell passes the `Uint8Array` through untouched.
-    /// Mid-gesture snapshots are deferred to pointer-up like the JSON path.
+    /// A snapshot that lands mid-gesture is deferred to pointer-up: replacing
+    /// the document under an in-flight drag would corrupt the gesture.
     pub fn reconcile_bytes(&mut self, bytes: &[u8]) -> Result<bool, JsValue> {
         if self.core.is_interacting() {
-            self.pending_remote = Some(PendingRemote::Binary(bytes.to_vec()));
+            self.pending_remote = Some(bytes.to_vec());
             return Ok(false);
         }
         self.reconcile_bytes_now(bytes)
@@ -632,23 +592,9 @@ impl Editor {
         wire::kind(bytes).map(wire::FrameKind::id).unwrap_or(0)
     }
 
-    /// Drain the deltas applied since the last call as one legacy JSON wire
-    /// patch frame (`{"type":"patch","put":[...]}`), or an empty string when
-    /// nothing changed.
-    pub fn take_outbound_frame(&mut self) -> String {
-        let Some(patch) = self.take_outbound_patch() else {
-            return String::new();
-        };
-        serde_json::json!({
-            "type": "patch",
-            "rev": self.wire_revision,
-            "put": patch.put,
-        })
-        .to_string()
-    }
-
-    /// Drain the same outbox as one binary patch wire frame: header,
-    /// revision, then the frozen v1 element list. No JSON pass and no string.
+    /// Drain the deltas applied since the last call as one binary patch wire
+    /// frame: header, revision, then the frozen v1 element list. No JSON pass
+    /// and no string.
     pub fn take_outbound_frame_bytes(&mut self) -> Vec<u8> {
         let Some(patch) = self.take_outbound_patch() else {
             return Vec::new();
@@ -668,25 +614,11 @@ impl Editor {
         self.purge_ledger.record(&deltas, &projected);
     }
 
-    /// Merge a server patch — a JSON array of full elements, tombstones
-    /// included — into the document with the merge rules. Returns whether
-    /// anything changed. Mid-gesture patches are deferred to pointer-up.
-    pub fn merge_patch_json(&mut self, json: &str) -> Result<bool, JsValue> {
-        if self.core.is_interacting() {
-            self.pending_patches
-                .push(PendingRemote::Json(json.to_string()));
-            return Ok(false);
-        }
-        self.merge_patch_json_now(json)
-    }
-
-    /// Merge a binary patch wire frame. Element merging is the same
-    /// per-element last-writer-wins path as the JSON fallback. Mid-gesture
-    /// patches are deferred to pointer-up.
+    /// Merge a binary patch wire frame. Elements are merged per element with
+    /// last-writer-wins. Mid-gesture patches are deferred to pointer-up.
     pub fn merge_patch_bytes(&mut self, bytes: &[u8]) -> Result<bool, JsValue> {
         if self.core.is_interacting() {
-            self.pending_patches
-                .push(PendingRemote::Binary(bytes.to_vec()));
+            self.pending_patches.push(bytes.to_vec());
             return Ok(false);
         }
         self.merge_patch_bytes_now(bytes)
@@ -816,9 +748,7 @@ impl Editor {
         Ok(())
     }
 
-    /// Replace the document from persisted bytes. Legacy JSON bytes are
-    /// accepted, so autosaves and checkpoints written before the binary
-    /// format still restore.
+    /// Replace the document from persisted binary bytes.
     pub fn load_bytes(&mut self, bytes: &[u8]) -> Result<(), JsValue> {
         let doc = canvas_core::serialization::from_bytes(bytes)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
@@ -1729,12 +1659,6 @@ impl Editor {
     }
 
     /// Merge a remote snapshot now: reconcile, rebuild the scene, repaint.
-    fn reconcile_json_now(&mut self, json: &str) -> Result<bool, JsValue> {
-        let remote = canvas_core::serialization::from_json(json)
-            .map_err(|error| JsValue::from_str(&error.to_string()))?;
-        Ok(self.apply_remote_snapshot(remote))
-    }
-
     fn reconcile_bytes_now(&mut self, bytes: &[u8]) -> Result<bool, JsValue> {
         let (revision, remote) =
             wire::decode_snapshot(bytes).map_err(|error| JsValue::from_str(&error.to_string()))?;
@@ -1760,12 +1684,6 @@ impl Editor {
     /// Merge a remote patch now: per-element LWW, then rebuild only the
     /// changed layers and repaint them. This is the steady-state path — the
     /// cost is proportional to what changed, not to the document.
-    fn merge_patch_json_now(&mut self, json: &str) -> Result<bool, JsValue> {
-        let elements: Vec<canvas_core::Element> =
-            serde_json::from_str(json).map_err(|error| JsValue::from_str(&error.to_string()))?;
-        Ok(self.apply_remote_elements(elements))
-    }
-
     fn merge_patch_bytes_now(&mut self, bytes: &[u8]) -> Result<bool, JsValue> {
         let (revision, elements) =
             wire::decode_patch(bytes).map_err(|error| JsValue::from_str(&error.to_string()))?;
@@ -1793,17 +1711,11 @@ impl Editor {
     /// Apply any frame deferred during a gesture. Called at gesture end, after
     /// the local edit has committed, so remote merges see its final state.
     fn apply_pending_remote(&mut self) {
-        if let Some(pending) = self.pending_remote.take() {
-            let _ = match pending {
-                PendingRemote::Json(json) => self.reconcile_json_now(&json),
-                PendingRemote::Binary(bytes) => self.reconcile_bytes_now(&bytes),
-            };
+        if let Some(bytes) = self.pending_remote.take() {
+            let _ = self.reconcile_bytes_now(&bytes);
         }
-        for patch in std::mem::take(&mut self.pending_patches) {
-            let _ = match patch {
-                PendingRemote::Json(json) => self.merge_patch_json_now(&json),
-                PendingRemote::Binary(bytes) => self.merge_patch_bytes_now(&bytes),
-            };
+        for bytes in std::mem::take(&mut self.pending_patches) {
+            let _ = self.merge_patch_bytes_now(&bytes);
         }
     }
 
@@ -2278,25 +2190,13 @@ impl Editor {
 }
 
 /// Load the workspace's autosaved document bytes, if any (the shell calls this
-/// at boot). Legacy JSON autosaves are returned as JSON bytes.
+/// at boot).
 #[wasm_bindgen]
 pub async fn load_saved_document(workspace: Option<String>) -> Option<Vec<u8>> {
     storage::load_document(workspace.as_deref().unwrap_or("default"))
         .await
         .ok()
         .flatten()
-}
-
-/// Load the workspace's autosave as JSON. Kept for callers that expect the
-/// historical JSON API; the shell itself uses `load_saved_document`.
-#[wasm_bindgen]
-pub async fn load_saved_json(workspace: Option<String>) -> Option<String> {
-    let bytes = storage::load_document(workspace.as_deref().unwrap_or("default"))
-        .await
-        .ok()
-        .flatten()?;
-    let doc = canvas_core::serialization::from_bytes(&bytes).ok()?;
-    canvas_core::serialization::to_json(&doc).ok()
 }
 
 /// Names of workspace autosaves in this browser.
@@ -2307,23 +2207,10 @@ pub async fn list_saved_workspaces() -> String {
 }
 
 /// Await a save of already-serialized document bytes before leaving or
-/// managing a workspace. The bytes are validated and rewritten canonically, so
-/// a legacy JSON payload also upgrades to binary here.
+/// managing a workspace. The bytes are validated and rewritten canonically.
 #[wasm_bindgen]
 pub async fn save_workspace_bytes(workspace: String, bytes: Vec<u8>) -> Result<(), JsValue> {
     let doc = canvas_core::serialization::from_bytes(&bytes)
-        .map_err(|error| JsValue::from_str(&error.to_string()))?;
-    let bytes = canvas_core::serialization::to_bytes(&doc)
-        .map_err(|error| JsValue::from_str(&error.to_string()))?;
-    storage::save_document(&bytes, &workspace)
-        .await
-        .map_err(|error| JsValue::from_str(&error))
-}
-
-/// Await a save before leaving or managing a workspace (legacy JSON API).
-#[wasm_bindgen]
-pub async fn save_workspace_json(workspace: String, json: String) -> Result<(), JsValue> {
-    let doc = canvas_core::serialization::from_json(&json)
         .map_err(|error| JsValue::from_str(&error.to_string()))?;
     let bytes = canvas_core::serialization::to_bytes(&doc)
         .map_err(|error| JsValue::from_str(&error.to_string()))?;

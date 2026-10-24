@@ -79,45 +79,28 @@ pub fn valid_workspace_name(name: &str) -> bool {
 /// One broadcast frame plus the page that must not receive it (the origin of
 /// a patch never gets its own change echoed back).
 ///
-/// Control frames carry only `json`. Document frames may carry both encodings:
-/// the workspace builds JSON only while legacy pages are connected and binary
-/// only while capable pages are connected, so a binary-only workspace never
-/// pays a JSON snapshot/patch pass.
+/// A control frame is a JSON text frame. A document frame is a binary wire
+/// frame (ADR-0010). There is exactly one encoding per message kind.
 #[derive(Clone, Debug)]
-pub struct PageMessage {
-    pub json: Option<String>,
-    pub binary: Option<Vec<u8>>,
-    pub except: Option<u64>,
+pub enum PageMessage {
+    Control(String),
+    Document { bytes: Vec<u8>, except: Option<u64> },
 }
 
 impl PageMessage {
-    pub fn all(text: String) -> Self {
-        Self {
-            json: Some(text),
-            binary: None,
-            except: None,
-        }
+    pub fn control(text: String) -> Self {
+        Self::Control(text)
     }
 
-    /// A document frame: whichever encodings the connected page mix needs.
-    pub fn document(json: Option<String>, binary: Option<Vec<u8>>, except: Option<u64>) -> Self {
-        Self {
-            json,
-            binary,
-            except,
-        }
+    pub fn document(bytes: Vec<u8>, except: Option<u64>) -> Self {
+        Self::Document { bytes, except }
     }
-}
 
-/// Drops a page's binary capability when its connection ends, including a
-/// cancelled socket task.
-pub struct BinaryPageGuard<'a> {
-    workspace: &'a Workspace,
-}
-
-impl Drop for BinaryPageGuard<'_> {
-    fn drop(&mut self) {
-        self.workspace.binary_pages.fetch_sub(1, Ordering::SeqCst);
+    pub fn except(&self) -> Option<u64> {
+        match self {
+            PageMessage::Control(_) => None,
+            PageMessage::Document { except, .. } => *except,
+        }
     }
 }
 
@@ -493,14 +476,8 @@ pub struct Workspace {
     pub doc_path: Option<PathBuf>,
     /// Connected pages on this workspace.
     pub pages: AtomicUsize,
-    /// Connected pages that negotiated the binary wire. Pages start as JSON
-    /// and are promoted when they send their first binary frame.
-    binary_pages: AtomicUsize,
-    /// Serializes page joins with document-frame encoding and broadcast, so a
-    /// page can never join between the capability check and the send and
-    /// receive a frame with no encoding it can read.
-    wire_gate: Mutex<()>,
-    /// Server-to-page messages (JSON text or binary frames over the WebSocket).
+    /// Server-to-page messages (JSON control frames or binary document frames
+    /// over the WebSocket).
     pub to_pages: broadcast::Sender<PageMessage>,
     /// A persist is queued; bursts coalesce into one write.
     persist_pending: AtomicBool,
@@ -551,8 +528,6 @@ impl Workspace {
             doc: Mutex::new(Document::new()),
             doc_path,
             pages: AtomicUsize::new(0),
-            binary_pages: AtomicUsize::new(0),
-            wire_gate: Mutex::new(()),
             to_pages,
             persist_pending: AtomicBool::new(false),
             persist_write: Mutex::new(()),
@@ -627,85 +602,27 @@ impl Workspace {
         names.iter().map(|name| aliases.resolve(name)).collect()
     }
 
-    /// The legacy `{"type":"snapshot","rev":N,"doc":{...}}` frame for the
-    /// mirror. The document is embedded as an object, not an escaped string:
-    /// one parse on the page and no escaping overhead.
-    pub async fn snapshot_frame(&self) -> String {
-        let revision = self.revision.load(Ordering::SeqCst);
-        self.snapshot_json(revision).await
-    }
-
-    /// The same snapshot as a binary wire frame, without a JSON pass.
+    /// The mirror as a binary snapshot wire frame. The document payload is the
+    /// same binary envelope persistence uses.
     pub async fn snapshot_frame_bytes(&self) -> Result<Vec<u8>, canvas_core::wire::WireError> {
         let revision = self.revision.load(Ordering::SeqCst);
         let doc = self.doc.lock().await;
         canvas_core::wire::encode_snapshot(revision, &doc)
     }
 
-    async fn snapshot_json(&self, revision: u64) -> String {
-        #[derive(serde::Serialize)]
-        struct Snapshot<'a> {
-            #[serde(rename = "type")]
-            kind: &'static str,
-            rev: u64,
-            doc: &'a Document,
-        }
-        let doc = self.doc.lock().await;
-        serde_json::to_string(&Snapshot {
-            kind: "snapshot",
-            rev: revision,
-            doc: &doc,
-        })
-        .unwrap_or_default()
-    }
-
-    /// The legacy `{"type":"patch","rev":N,"put":[...]}` frame.
-    pub fn patch_frame(revision: u64, put: &[Element]) -> String {
-        #[derive(serde::Serialize)]
-        struct Patch<'a> {
-            #[serde(rename = "type")]
-            kind: &'static str,
-            rev: u64,
-            put: &'a [Element],
-        }
-        serde_json::to_string(&Patch {
-            kind: "patch",
-            rev: revision,
-            put,
-        })
-        .unwrap_or_default()
-    }
-
-    /// Whether any connected page reads the binary wire.
-    fn binary_pages(&self) -> usize {
-        self.binary_pages.load(Ordering::SeqCst)
-    }
-
-    /// Promote a connection to the binary wire. The guard decrements the
-    /// capability count when the connection future is dropped, even if the
-    /// socket is cancelled before its cleanup path runs.
-    pub fn promote_binary_page(&self) -> BinaryPageGuard<'_> {
-        self.binary_pages.fetch_add(1, Ordering::SeqCst);
-        BinaryPageGuard { workspace: self }
-    }
-
-    /// Broadcast a patch to every page but `except`, in the encodings the
-    /// connected mix needs. Holds the wire gate so a page joining during
-    /// encoding is counted before the JSON skip decision.
+    /// Broadcast a patch to every page but `except` as one binary frame.
     async fn broadcast_patch(&self, revision: u64, put: &[Element], except: Option<u64>) {
-        let _gate = self.wire_gate.lock().await;
-        let pages = self.pages.load(Ordering::SeqCst);
-        if pages == 0 {
+        if self.pages.load(Ordering::SeqCst) == 0 {
             return;
         }
-        let binary_pages = self.binary_pages();
-        let json = (binary_pages < pages).then(|| Self::patch_frame(revision, put));
-        let binary = (binary_pages > 0)
-            .then(|| canvas_core::wire::encode_patch(revision, put).ok())
-            .flatten();
-        let _ = self
-            .to_pages
-            .send(PageMessage::document(json, binary, except));
+        match canvas_core::wire::encode_patch(revision, put) {
+            Ok(bytes) => {
+                let _ = self.to_pages.send(PageMessage::document(bytes, except));
+            }
+            Err(error) => {
+                tracing::warn!(%error, "could not encode binary patch; dropping broadcast");
+            }
+        }
     }
 
     /// Merge an already-parsed page snapshot into the mirror. The page's
@@ -788,9 +705,9 @@ impl Workspace {
         }
     }
 
-    /// Apply one decoded page frame, whether it came from a binary or JSON
-    /// frame. This is the WebSocket-free seam: connection code only decodes
-    /// transport bytes, and tests can drive the same sequence directly.
+    /// Apply one decoded binary page frame. This is the WebSocket-free seam:
+    /// connection code only decodes transport bytes, and tests can drive the
+    /// same sequence directly.
     pub async fn apply_page_frame(&self, origin: u64, frame: PageFrame) -> PageFrameOutcome {
         let outcome = match frame {
             PageFrame::Snapshot { base_revision, doc } => {
@@ -1166,7 +1083,7 @@ impl AppState {
         } else {
             self.workspaces_dir
                 .as_ref()
-                .map(|dir| dir.join(format!("{name}.json")))
+                .map(|dir| dir.join(format!("{name}.rsc")))
         };
         Workspace::new(name, doc_path)
     }
@@ -1243,9 +1160,6 @@ impl AppState {
         if workspace.retired.load(Ordering::SeqCst) {
             return false;
         }
-        // Count the page under the wire gate so a document broadcast can
-        // never encode for the old page mix and then send to this newcomer.
-        let _gate = workspace.wire_gate.lock().await;
         workspace.pages.fetch_add(1, Ordering::SeqCst);
         workspace.note_page_activity();
         true
@@ -1351,7 +1265,7 @@ impl AppState {
         source.retired.store(true, Ordering::SeqCst);
         *doc = Document::new();
         source.persist_notify.notify_one();
-        let _ = source.to_pages.send(PageMessage::all(serde_json::json!({
+        let _ = source.to_pages.send(PageMessage::control(serde_json::json!({
             "type": "workspace_changed", "action": if renamed.is_some() { "rename" } else { "delete" },
             "workspace": renamed.unwrap_or(DEFAULT_WORKSPACE),
         }).to_string()));
@@ -1405,7 +1319,7 @@ impl AppState {
             if let Ok(mut entries) = tokio::fs::read_dir(dir).await {
                 while let Ok(Some(entry)) = entries.next_entry().await {
                     let path = entry.path();
-                    if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                    if path.extension().and_then(|ext| ext.to_str()) != Some("rsc") {
                         continue;
                     }
                     let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
@@ -1492,7 +1406,7 @@ impl AppState {
         let workspaces: Vec<Arc<Workspace>> =
             self.workspaces.lock().unwrap().values().cloned().collect();
         for ws in workspaces {
-            let _ = ws.to_pages.send(PageMessage::all(frame.clone()));
+            let _ = ws.to_pages.send(PageMessage::control(frame.clone()));
         }
         Ok(settings)
     }
@@ -1561,10 +1475,18 @@ mod tests {
         PageFrame::Patch { put }
     }
 
-    fn patch_put(message: PageMessage) -> Vec<Element> {
-        let frame: serde_json::Value =
-            serde_json::from_str(message.json.as_deref().unwrap_or_default()).unwrap();
-        serde_json::from_value(frame["put"].clone()).unwrap()
+    fn control_frame(message: PageMessage) -> serde_json::Value {
+        match message {
+            PageMessage::Control(text) => serde_json::from_str(&text).unwrap(),
+            PageMessage::Document { .. } => panic!("expected a control frame"),
+        }
+    }
+
+    fn document_put(message: PageMessage) -> (u64, Vec<Element>) {
+        match message {
+            PageMessage::Document { bytes, .. } => canvas_core::wire::decode_patch(&bytes).unwrap(),
+            PageMessage::Control(_) => panic!("expected a document frame"),
+        }
     }
 
     fn text_kind(text: &str, x: f64) -> ElementKind {
@@ -1633,7 +1555,7 @@ mod tests {
     #[tokio::test]
     async fn persistence_round_trips_through_disk() {
         let dir = std::env::temp_dir().join(format!("rs-canvas-state-{}", std::process::id()));
-        let path = dir.join("document.json");
+        let path = dir.join("document.rsc");
         let state = AppState::new(PathBuf::from("."), Some(path.clone()), true);
         let ws = state.workspace(DEFAULT_WORKSPACE).await;
         add_shape(&mut *ws.doc.lock().await, 10.0, 1);
@@ -1698,7 +1620,7 @@ mod tests {
             now_ms()
         ));
         tokio::fs::create_dir_all(&dir).await.unwrap();
-        let path = dir.join("document.json");
+        let path = dir.join("document.rsc");
         let bytes =
             canvas_core::envelope::encode(99, canvas_core::envelope::Codec::Postcard, &[]).unwrap();
         tokio::fs::write(&path, bytes).await.unwrap();
@@ -1713,7 +1635,7 @@ mod tests {
     async fn unreadable_documents_are_ignored() {
         let dir = std::env::temp_dir().join(format!("rs-canvas-bad-{}", std::process::id()));
         tokio::fs::create_dir_all(&dir).await.unwrap();
-        let path = dir.join("document.json");
+        let path = dir.join("document.rsc");
         tokio::fs::write(&path, "{not json").await.unwrap();
 
         let state = AppState::new(PathBuf::from("."), Some(path), true);
@@ -1725,16 +1647,16 @@ mod tests {
     #[tokio::test]
     async fn named_workspaces_persist_beside_the_default_document() {
         let dir = std::env::temp_dir().join(format!("rs-canvas-ws-{}", std::process::id()));
-        let state = AppState::new(PathBuf::from("."), Some(dir.join("current.json")), true);
+        let state = AppState::new(PathBuf::from("."), Some(dir.join("current.rsc")), true);
         let alpha = state.workspace("alpha").await;
         assert_eq!(
             alpha.doc_path.as_deref(),
-            Some(dir.join("workspaces/alpha.json").as_path())
+            Some(dir.join("workspaces/alpha.rsc").as_path())
         );
         add_shape(&mut *alpha.doc.lock().await, 5.0, 1);
         alpha.persist_document().await;
 
-        let reopened = AppState::new(PathBuf::from("."), Some(dir.join("current.json")), true);
+        let reopened = AppState::new(PathBuf::from("."), Some(dir.join("current.rsc")), true);
         let alpha = reopened.workspace("alpha").await;
         assert_eq!(alpha.doc.lock().await.live_count(), 1);
         let _ = tokio::fs::remove_dir_all(dir).await;
@@ -1747,7 +1669,7 @@ mod tests {
             std::process::id(),
             now_ms()
         ));
-        let state = AppState::new(PathBuf::from("."), Some(dir.join("current.json")), true);
+        let state = AppState::new(PathBuf::from("."), Some(dir.join("current.rsc")), true);
         assert!(matches!(
             state.create_workspace("Bad Name").await,
             Err(WorkspaceManagementError::Invalid(_))
@@ -1761,7 +1683,7 @@ mod tests {
         assert_eq!(created.doc.lock().await.live_count(), 0);
         assert!(created.created.load(Ordering::SeqCst));
         assert!(
-            dir.join("workspaces/fresh.json").exists(),
+            dir.join("workspaces/fresh.rsc").exists(),
             "an explicitly created workspace is durable before its first edit"
         );
         assert!(matches!(
@@ -1769,7 +1691,7 @@ mod tests {
             Err(WorkspaceManagementError::Conflict(_))
         ));
 
-        let restarted = AppState::new(PathBuf::from("."), Some(dir.join("current.json")), true);
+        let restarted = AppState::new(PathBuf::from("."), Some(dir.join("current.rsc")), true);
         let names: Vec<String> = restarted
             .list_workspaces()
             .await
@@ -1829,7 +1751,7 @@ mod tests {
             std::process::id(),
             now_ms()
         ));
-        let state = AppState::new(PathBuf::from("."), Some(dir.join("current.json")), true);
+        let state = AppState::new(PathBuf::from("."), Some(dir.join("current.rsc")), true);
         let old = state.workspace("alpha").await;
         add_shape(&mut *old.doc.lock().await, 42.0, 1);
         old.persist_document().await;
@@ -1844,23 +1766,22 @@ mod tests {
             !state.register_page(&old).await,
             "retired connections cannot rejoin"
         );
-        let message = messages.recv().await.unwrap();
-        let frame: serde_json::Value = serde_json::from_str(&message.json.unwrap()).unwrap();
+        let frame = control_frame(messages.recv().await.unwrap());
         assert_eq!(frame["action"], "rename");
         assert_eq!(frame["workspace"], "beta");
         old.persist_document().await;
         assert!(
-            !dir.join("workspaces/alpha.json").exists(),
+            !dir.join("workspaces/alpha.rsc").exists(),
             "a late persist cannot recreate the old file"
         );
-        let renamed = tokio::fs::read(dir.join("workspaces/beta.json"))
+        let renamed = tokio::fs::read(dir.join("workspaces/beta.rsc"))
             .await
             .unwrap();
         assert!(
             canvas_core::envelope::is_binary(&renamed),
             "workspace rename writes the same binary format"
         );
-        let restarted = AppState::new(PathBuf::from("."), Some(dir.join("current.json")), true);
+        let restarted = AppState::new(PathBuf::from("."), Some(dir.join("current.rsc")), true);
         assert_eq!(*restarted.workspace("beta").await.doc.lock().await, before);
         assert!(!restarted
             .list_workspaces()
@@ -1910,18 +1831,18 @@ mod tests {
             std::process::id(),
             now_ms()
         ));
-        let initial = AppState::new(PathBuf::from("."), Some(dir.join("current.json")), true);
+        let initial = AppState::new(PathBuf::from("."), Some(dir.join("current.rsc")), true);
         let old = initial.workspace("alpha").await;
         add_shape(&mut *old.doc.lock().await, 4.0, 1);
         old.persist_document().await;
-        let state = AppState::new(PathBuf::from("."), Some(dir.join("current.json")), true);
+        let state = AppState::new(PathBuf::from("."), Some(dir.join("current.rsc")), true);
         assert!(state
             .list_workspaces()
             .await
             .iter()
             .any(|info| info.name == "alpha"));
         state.manage_workspace("alpha", None, None).await.unwrap();
-        assert!(!dir.join("workspaces/alpha.json").exists());
+        assert!(!dir.join("workspaces/alpha.rsc").exists());
         assert!(!state
             .list_workspaces()
             .await
@@ -2040,7 +1961,7 @@ mod tests {
     #[tokio::test]
     async fn persisted_mirrors_survive_idle() {
         let dir = std::env::temp_dir().join(format!("rs-canvas-idle-{}", std::process::id()));
-        let state = AppState::new(PathBuf::from("."), Some(dir.join("document.json")), true);
+        let state = AppState::new(PathBuf::from("."), Some(dir.join("document.rsc")), true);
         let ws = state.workspace(DEFAULT_WORKSPACE).await;
         add_shape(&mut *ws.doc.lock().await, 0.0, 1);
         ws.release_when_idle(0).await;
@@ -2062,10 +1983,10 @@ mod tests {
                 .changed
         );
         let message = from_server.recv().await.unwrap();
-        assert_eq!(message.except, Some(7), "the origin page is skipped");
-        let frame: serde_json::Value = serde_json::from_str(&message.json.unwrap()).unwrap();
-        assert_eq!(frame["type"], "patch");
-        assert_eq!(frame["put"].as_array().unwrap().len(), 1);
+        assert_eq!(message.except(), Some(7), "the origin page is skipped");
+        let (revision, put) = document_put(message);
+        assert_eq!(revision, 1);
+        assert_eq!(put.len(), 1);
         assert_eq!(ws.revision.load(Ordering::SeqCst), 1);
 
         assert!(
@@ -2093,31 +2014,16 @@ mod tests {
         );
 
         // The page that sent the stale copy is corrected back to the winner.
-        let frame: serde_json::Value =
-            serde_json::from_str(&from_server.recv().await.unwrap().json.unwrap()).unwrap();
-        assert_eq!(frame["type"], "patch");
-        let put = frame["put"].as_array().unwrap();
+        let (_, put) = document_put(from_server.recv().await.unwrap());
         assert_eq!(put.len(), 1);
-        assert_eq!(put[0]["version"], 4);
+        assert_eq!(put[0].version, 4);
     }
 
     #[tokio::test]
-    async fn snapshot_frames_embed_the_document_as_an_object() {
-        let state = AppState::new(PathBuf::from("."), None, true);
-        let ws = state.workspace(DEFAULT_WORKSPACE).await;
-        add_shape(&mut *ws.doc.lock().await, 0.0, 1);
-        let frame: serde_json::Value = serde_json::from_str(&ws.snapshot_frame().await).unwrap();
-        assert_eq!(frame["type"], "snapshot");
-        assert!(frame["doc"]["elements"].is_object());
-        assert_eq!(frame["rev"], 0);
-    }
-
-    #[tokio::test]
-    async fn binary_only_workspaces_broadcast_patches_without_json() {
+    async fn workspaces_broadcast_patches_as_binary_frames() {
         let state = AppState::new(PathBuf::from("."), None, true);
         let ws = state.workspace(DEFAULT_WORKSPACE).await;
         ws.pages.store(1, Ordering::SeqCst);
-        let _binary = ws.promote_binary_page();
         let mut from_server = ws.to_pages.subscribe();
         let element = Element::new(shape_at(0.0), "a0".into(), 1).with_id("one");
 
@@ -2126,56 +2032,13 @@ mod tests {
                 .await
                 .changed
         );
-        let message = from_server.recv().await.unwrap();
-        assert!(
-            message.json.is_none(),
-            "a binary-only page mix must not pay the JSON patch encoding"
-        );
-        let bytes = message.binary.expect("binary patch");
-        let (revision, put) = canvas_core::wire::decode_patch(&bytes).unwrap();
+        let (revision, put) = document_put(from_server.recv().await.unwrap());
         assert_eq!(revision, 1);
         assert_eq!(put, vec![element]);
     }
 
     #[tokio::test]
-    async fn legacy_workspaces_broadcast_patches_as_json() {
-        let state = AppState::new(PathBuf::from("."), None, true);
-        let ws = state.workspace(DEFAULT_WORKSPACE).await;
-        ws.pages.store(1, Ordering::SeqCst);
-        let mut from_server = ws.to_pages.subscribe();
-        let element = Element::new(shape_at(0.0), "a0".into(), 1).with_id("one");
-
-        assert!(ws.apply_page_frame(9, patch(vec![element])).await.changed);
-        let message = from_server.recv().await.unwrap();
-        assert!(
-            message.binary.is_none(),
-            "a legacy-only page mix must not pay the binary encoding"
-        );
-        let frame: serde_json::Value = serde_json::from_str(&message.json.unwrap()).unwrap();
-        assert_eq!(frame["type"], "patch");
-    }
-
-    #[tokio::test]
-    async fn mixed_workspaces_broadcast_both_patch_encodings() {
-        let state = AppState::new(PathBuf::from("."), None, true);
-        let ws = state.workspace(DEFAULT_WORKSPACE).await;
-        ws.pages.store(2, Ordering::SeqCst);
-        let _binary = ws.promote_binary_page();
-        let mut from_server = ws.to_pages.subscribe();
-        let element = Element::new(shape_at(0.0), "a0".into(), 1).with_id("one");
-
-        assert!(ws.apply_page_frame(9, patch(vec![element])).await.changed);
-        let message = from_server.recv().await.unwrap();
-        assert!(message.json.is_some(), "the legacy page needs JSON");
-        assert!(message.binary.is_some(), "the binary page needs bytes");
-        let frame: serde_json::Value = serde_json::from_str(&message.json.unwrap()).unwrap();
-        assert_eq!(frame["type"], "patch");
-        let (_, put) = canvas_core::wire::decode_patch(&message.binary.unwrap()).unwrap();
-        assert_eq!(put.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn direct_binary_snapshots_carry_the_current_revision() {
+    async fn snapshots_carry_the_current_revision_as_a_binary_frame() {
         let state = AppState::new(PathBuf::from("."), None, true);
         let ws = state.workspace(DEFAULT_WORKSPACE).await;
         add_shape(&mut *ws.doc.lock().await, 3.0, 1);
@@ -2474,7 +2337,7 @@ mod tests {
         assert_eq!(outcome.corrections.len(), 1);
         assert_eq!(outcome.corrections[0].kind, newer.kind);
 
-        let correction = patch_put(messages.recv().await.unwrap());
+        let (_, correction) = document_put(messages.recv().await.unwrap());
         assert_eq!(correction, vec![newer]);
     }
 

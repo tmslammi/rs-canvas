@@ -19,7 +19,7 @@ test.beforeAll(async () => {
   if (occupied) throw new Error(`Workspace test port ${PORT} is already in use`);
   directory = fs.mkdtempSync(path.join(os.tmpdir(), "rs-canvas-workspaces-"));
   server = spawn(path.resolve("../target/debug/canvas-server"), [
-    "--web", ".", "--port", PORT, "--doc", path.join(directory, "current.json"),
+    "--web", ".", "--port", PORT, "--doc", path.join(directory, "current.rsc"),
   ], { cwd: process.cwd(), stdio: "ignore" });
   for (let attempt = 0; attempt < 100; attempt++) {
     if (server.exitCode !== null) throw new Error("Workspace test server exited before startup");
@@ -104,7 +104,7 @@ test("create, switch and reopen preserve separate documents and other URL state"
 });
 
 test("the server mirror is written in the binary envelope", async ({ page }) => {
-  const docPath = path.join(directory, "current.json");
+  const docPath = path.join(directory, "current.rsc");
   await page.goto(`${BASE}/`);
   await ready(page);
   await drawRectangle(page);
@@ -156,8 +156,8 @@ test("switching cancels an unfinished drawing before checkpointing", async ({ pa
   expect(await page.evaluate(() => window.__rsEditor!.can_undo())).toBe(false);
 });
 
-test("legacy browser autosaves remain listed and switchable when the API is unavailable", async ({ page }) => {
-  await page.goto(`${BASE}/?ws=ui-legacy`);
+test("browser autosaves remain listed and switchable when the API is unavailable", async ({ page }) => {
+  await page.goto(`${BASE}/?ws=ui-browser`);
   await ready(page);
   await drawRectangle(page);
   await switchWorkspace(page, "default");
@@ -166,10 +166,10 @@ test("legacy browser autosaves remain listed and switchable when the API is unav
   await page.reload();
   await ready(page);
   await openPicker(page);
-  await expect(page.getByRole("button", { name: "Switch to workspace ui-legacy", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Switch to workspace ui-browser", exact: true })).toBeVisible();
   await expect(page.locator(".workspace-status")).toContainText(/unavailable|browser/i);
-  await page.getByRole("button", { name: "Switch to workspace ui-legacy", exact: true }).click();
-  await expect.poll(() => new URL(page.url()).searchParams.get("ws")).toBe("ui-legacy");
+  await page.getByRole("button", { name: "Switch to workspace ui-browser", exact: true }).click();
+  await expect.poll(() => new URL(page.url()).searchParams.get("ws")).toBe("ui-browser");
   await ready(page);
   await expect.poll(() => count(page)).toBe(1);
 });
@@ -178,12 +178,21 @@ test("a checkpoint-only workspace is discoverable despite damaged catalogue and 
   await page.goto(`${BASE}/?ws=ui-checkpoint-source`);
   await ready(page);
   await drawRectangle(page);
-  const saved = await documentJson(page);
+  // localStorage is string-only: a checkpoint is base64 binary with the
+  // current prefix, exactly what the unload path writes.
+  const checkpoint = await page.evaluate(() => {
+    const bytes = window.__rsEditor!.save_bytes();
+    let binary = "";
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+    }
+    return `rsc-bin1:${btoa(binary)}`;
+  });
   await switchWorkspace(page, "default");
-  await page.evaluate((json) => {
-    localStorage.setItem("rs-canvas-unload-checkpoint:workspace:ui-checkpoint-only", json);
+  await page.evaluate(({ name, value }) => {
+    localStorage.setItem(`rs-canvas-unload-checkpoint:workspace:${name}`, value);
     localStorage.setItem("rs-canvas-workspaces", "{broken catalogue");
-  }, saved);
+  }, { name: "ui-checkpoint-only", value: checkpoint });
   await page.route("**/api/workspaces", (route) => route.abort());
   await page.reload();
   await ready(page);

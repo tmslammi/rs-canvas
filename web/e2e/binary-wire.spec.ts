@@ -3,9 +3,8 @@ import { mcpClient, toolJson } from "./mcp-client";
 import { testBase } from "./server-address";
 
 // Binary wire: snapshots and patches travel as WebSocket binary frames between
-// the page and the server, while a legacy page (or an old server) keeps the
-// JSON fallback. Runs against its own server so element counts and page mixes
-// are exact.
+// the page and the server; only control frames stay JSON. Runs against its own
+// server so element counts are exact.
 test.describe.configure({ mode: "serial" });
 
 const BASE = testBase(5);
@@ -23,7 +22,6 @@ type WireProbe = {
   received: FrameRecord[];
   docParses: string[];
   docStringifies: string[];
-  stringToWasm: string[];
   reset(): void;
 };
 
@@ -33,18 +31,17 @@ declare global {
   }
 }
 
-// Installed before the app boots. It records every WebSocket frame, flags any
-// JSON parse/stringify that sees a document frame, and wraps the legacy
-// string-based wasm methods so the hot-path test can prove they are unused.
+// Installed before the app boots. It records every WebSocket frame and flags
+// any JSON parse/stringify that sees a document-shaped payload, so the hot
+// path can prove that no document crosses as JSON.
 const PROBE = String.raw`(() => {
   const probe = (window.__wireProbe = {
-    sent: [], received: [], docParses: [], docStringifies: [], stringToWasm: [],
+    sent: [], received: [], docParses: [], docStringifies: [],
     reset() {
       this.sent.length = 0;
       this.received.length = 0;
       this.docParses.length = 0;
       this.docStringifies.length = 0;
-      this.stringToWasm.length = 0;
     },
   });
   const classify = (data) => {
@@ -102,27 +99,6 @@ const PROBE = String.raw`(() => {
     }
     return out;
   };
-  let editorValue;
-  const wrapEditor = (editor) => {
-    if (!editor || editor.__wireWrapped) return editor;
-    for (const name of [
-      "snapshot_frame_json", "take_outbound_frame", "reconcile_json", "merge_patch_json", "load_json",
-    ]) {
-      const original = editor[name];
-      if (typeof original !== "function") continue;
-      editor[name] = function (...args) {
-        probe.stringToWasm.push(name);
-        return original.apply(this, args);
-      };
-    }
-    editor.__wireWrapped = true;
-    return editor;
-  };
-  Object.defineProperty(window, "__rsEditor", {
-    configurable: true,
-    get() { return editorValue; },
-    set(value) { editorValue = wrapEditor(value); },
-  });
 })();`;
 
 const isDocText = (frame: FrameRecord): boolean =>
@@ -183,7 +159,6 @@ const probe = (page: Page) =>
     received: window.__wireProbe!.received,
     docParses: window.__wireProbe!.docParses.length,
     docStringifies: window.__wireProbe!.docStringifies.length,
-    stringToWasm: window.__wireProbe!.stringToWasm,
   }));
 
 const resetProbe = (page: Page) =>
@@ -206,7 +181,7 @@ test("two pages and an agent converge over binary frames", async ({
   const first = page;
   await openPage(first, `?ws=${workspace}`);
   const hello = await waitForHello(first);
-  expect(hello).toContain('"binary_sync":1');
+  expect(hello).toContain('"sync":true');
 
   const second = await context.newPage();
   await openPage(second, `?ws=${workspace}`);
@@ -249,7 +224,6 @@ test("two pages and an agent converge over binary frames", async ({
     const captured = await probe(page);
     expect(captured.docParses, "document frames parsed as JSON").toBe(0);
     expect(captured.docStringifies, "document frames stringified as JSON").toBe(0);
-    expect(captured.stringToWasm, "string APIs used on the binary hot path").toEqual([]);
     expect(captured.sent.filter(isDocText), "text document frame sent").toEqual([]);
     expect(
       captured.sent.filter(isWireBinary).length,
@@ -268,158 +242,6 @@ test("two pages and an agent converge over binary frames", async ({
   }
 
   await second.close();
-});
-
-test("a legacy raw WebSocket client still reconciles and gets JSON replies", async ({
-  page,
-  request,
-}) => {
-  const workspace = "wire-legacy";
-  await openPage(page, `?ws=${workspace}`);
-  await waitForHello(page);
-  await drawRectangle(page);
-  await expect
-    .poll(() => page.evaluate(() => window.__rsEditor!.element_count()))
-    .toBe(1);
-
-  const doc = JSON.parse(
-    await page.evaluate(() => window.__rsEditor!.save_json()),
-  ) as { schemaVersion: number; elements: Record<string, Record<string, unknown>> };
-  const element = Object.values(doc.elements)[0];
-  const raw = new ((globalThis as { WebSocket: typeof WebSocket }).WebSocket)(
-    `${BASE.replace(/^http/, "ws")}/ws?ws=${workspace}`,
-  );
-  const textMessages: string[] = [];
-  const binaryMessages: unknown[] = [];
-  raw.addEventListener("message", (event: MessageEvent) => {
-    if (typeof event.data === "string") textMessages.push(event.data);
-    else binaryMessages.push(event.data);
-  });
-  await expect.poll(() => raw.readyState).toBe(1);
-  await expect
-    .poll(() => textMessages.find((text) => text.includes('"type":"hello"')))
-    .toBeTruthy();
-  const hello = JSON.parse(
-    textMessages.find((text) => text.includes('"type":"hello"'))!,
-  ) as { binary_sync?: number };
-  // The server advertises the capability, but a client that keeps sending
-  // text frames is treated as legacy and only ever receives JSON.
-  expect(hello.binary_sync).toBe(1);
-
-  // A legacy page patch merges on the server and reaches the binary page as a
-  // binary frame.
-  const patched = {
-    ...element,
-    id: "legacy-raw-patch",
-    index: "a1",
-    version: Number(element.version) + 100,
-    versionNonce: 7,
-    updated: Date.now(),
-    isDeleted: false,
-  };
-  raw.send(JSON.stringify({ type: "patch", put: [patched] }));
-  await expect
-    .poll(() => page.evaluate(() => window.__rsEditor!.element_count()))
-    .toBe(2);
-
-  // An agent edit broadcasts to both: JSON to the raw client, bytes to the
-  // page.
-  const mcp = mcpClient(request, BASE);
-  const before = await page.evaluate(() => window.__rsEditor!.element_count());
-  await mcp.call("canvas_draw", { kind: "ellipse", text: "Legacy" });
-  await expect
-    .poll(() => page.evaluate(() => window.__rsEditor!.element_count()))
-    .toBe(before + 2);
-  await expect
-    .poll(() =>
-      textMessages
-        .map((text) => JSON.parse(text) as { type?: string; put?: unknown[] })
-        .filter((frame) => frame.type === "patch" && Array.isArray(frame.put))
-        .length,
-    )
-    .toBeGreaterThan(0);
-
-  // A legacy full snapshot also reconciles; the binary page receives the
-  // merged result as a binary snapshot.
-  const current = JSON.parse(
-    await page.evaluate(() => window.__rsEditor!.save_json()),
-  ) as { schemaVersion: number; elements: Record<string, Record<string, unknown>> };
-  const extra = Object.values(current.elements)[0];
-  current.elements["legacy-raw-snapshot"] = {
-    ...extra,
-    id: "legacy-raw-snapshot",
-    index: "a2",
-    version: Number(extra.version) + 100,
-    versionNonce: 8,
-    updated: Date.now(),
-    isDeleted: false,
-  };
-  const snapshotBefore = await page.evaluate(() =>
-    window.__rsEditor!.element_count(),
-  );
-  raw.send(JSON.stringify({ type: "snapshot", doc: current }));
-  await expect
-    .poll(() => page.evaluate(() => window.__rsEditor!.element_count()))
-    .toBe(snapshotBefore + 1);
-
-  expect(binaryMessages, "the server sent binary to a legacy client").toEqual(
-    [],
-  );
-  expect(
-    textMessages.every((text) => typeof text === "string"),
-    "every legacy reply is a JSON text frame",
-  ).toBe(true);
-  raw.close();
-});
-
-test("a hello without the capability keeps the page on JSON", async ({
-  page,
-  request,
-}) => {
-  const workspace = "wire-fallback";
-  // `wire=json` makes the current server withhold the capability, exactly as
-  // an old server's hello would.
-  await openPage(page, `?ws=${workspace}&wire=json`);
-  const hello = await waitForHello(page);
-  expect(hello).not.toContain("binary_sync");
-  await expect
-    .poll(() =>
-      page.evaluate(() =>
-        window.__wireProbe!.sent.some((frame) =>
-          frame.head.includes('"type":"snapshot"'),
-        ),
-      ),
-    )
-    .toBe(true);
-
-  await drawRectangle(page);
-  await expect
-    .poll(() => page.evaluate(() => window.__rsEditor!.element_count()))
-    .toBe(1);
-  const mcp = mcpClient(request, BASE);
-  await mcp.call("canvas_draw", { kind: "sticky", text: "Fallback" });
-  await expect
-    .poll(() => page.evaluate(() => window.__rsEditor!.element_count()))
-    .toBe(3);
-
-  const captured = await probe(page);
-  expect(captured.sent.filter(isWireBinary), "binary frame sent").toEqual([]);
-  expect(captured.received.filter(isWireBinary), "binary frame received").toEqual(
-    [],
-  );
-  expect(
-    captured.sent.filter(isDocText).length,
-    "JSON snapshot/patch sent",
-  ).toBeGreaterThan(0);
-  expect(
-    captured.received.filter(isDocText).length,
-    "JSON snapshot/patch received",
-  ).toBeGreaterThan(0);
-  expect(captured.docParses, "legacy JSON path parses document frames").toBeGreaterThan(0);
-  expect(
-    captured.stringToWasm,
-    "legacy path uses the string-based wasm APIs",
-  ).not.toEqual([]);
 });
 
 test("a 10k snapshot and patch stay binary end to end", async ({
@@ -524,7 +346,6 @@ test("a 10k snapshot and patch stay binary end to end", async ({
     const captured = await probe(target);
     expect(captured.docParses, `${name}: document JSON parse`).toBe(0);
     expect(captured.docStringifies, `${name}: document JSON stringify`).toBe(0);
-    expect(captured.stringToWasm, `${name}: string wasm API`).toEqual([]);
     expect(
       captured.sent.filter(isDocText),
       `${name}: text document frame sent`,
@@ -551,39 +372,4 @@ test("a 10k snapshot and patch stay binary end to end", async ({
   );
 
   await freshContext.close();
-});
-
-test("legacy and binary pages coexist on one workspace", async ({
-  page,
-  context,
-  request,
-}) => {
-  // Covered by the raw-client test above for text+binary; this keeps a real
-  // page on the JSON path so a mixed page mix broadcasts both encodings.
-  const workspace = "wire-mixed";
-  await openPage(page, `?ws=${workspace}`);
-  const legacy = await context.newPage();
-  await openPage(legacy, `?ws=${workspace}&wire=json`);
-  await waitForHello(page);
-  await waitForHello(legacy);
-
-  const mcp = mcpClient(request, BASE);
-  await mcp.call("canvas_draw", { kind: "diamond", text: "Mixed" });
-  await expect
-    .poll(() => page.evaluate(() => window.__rsEditor!.element_count()))
-    .toBe(2);
-  await expect
-    .poll(() => legacy.evaluate(() => window.__rsEditor!.element_count()))
-    .toBe(2);
-
-  const binaryProbe = await probe(page);
-  const legacyProbe = await probe(legacy);
-  expect(
-    binaryProbe.received.filter(
-      (frame) => frame.kind === "arraybuffer" && isWireBinary(frame),
-    ).length,
-  ).toBeGreaterThan(0);
-  expect(legacyProbe.received.filter(isDocText).length).toBeGreaterThan(0);
-  expect(legacyProbe.received.filter(isWireBinary)).toEqual([]);
-  await legacy.close();
 });

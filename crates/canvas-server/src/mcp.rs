@@ -480,7 +480,7 @@ async fn deliver_view(
     }
     let _ = workspace
         .to_pages
-        .send(PageMessage::all(message.to_string()));
+        .send(PageMessage::control(message.to_string()));
     Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::json!({ "ok": true, "delivered_to_pages": pages }).to_string(),
     )]))
@@ -1075,7 +1075,7 @@ impl CanvasServer {
                 "workspace": workspace.name,
             })
             .to_string();
-            let _ = source.to_pages.send(PageMessage::all(message));
+            let _ = source.to_pages.send(PageMessage::control(message));
             let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
             while tokio::time::Instant::now() < deadline {
                 if workspace.pages.load(Ordering::SeqCst) > 0 {
@@ -1303,7 +1303,7 @@ impl CanvasServer {
                         let text = match &e.kind {
                             canvas_core::ElementKind::Text { text, .. } => text.clone(),
                             canvas_core::ElementKind::Frame { name, .. } => name.clone(),
-                            _ => canvas_core::edit::owned_label(&doc, &e.id)
+                            _ => canvas_core::commands::owned_label(&doc, &e.id)
                                 .and_then(|id| canvas_core::describe::text_of(&doc, &id))
                                 .unwrap_or_default(),
                         };
@@ -1514,7 +1514,9 @@ impl CanvasServer {
                     "type": "discussion", "workspace": workspace.name, "context": workspace.context(),
                     "discussion": record, "discussion_persisted": workspace.doc_path.is_some(),
                 });
-                let _ = workspace.to_pages.send(PageMessage::all(body.to_string()));
+                let _ = workspace
+                    .to_pages
+                    .send(PageMessage::control(body.to_string()));
                 Ok(CallToolResult::success(vec![ContentBlock::text(
                     body.to_string(),
                 )]))
@@ -1786,7 +1788,7 @@ impl CanvasServer {
             })
             .to_string();
             workspace.presentation_started();
-            let _ = workspace.to_pages.send(PageMessage::all(frame));
+            let _ = workspace.to_pages.send(PageMessage::control(frame));
             played = true;
             cancelled = wait_for_present_ack(&mut acks, presentation_id, total_hold).await;
             workspace.presentation_finished();
@@ -2199,7 +2201,7 @@ impl CanvasServer {
                 "scale": scale,
             })
             .to_string();
-            let _ = workspace.to_pages.send(PageMessage::all(frame));
+            let _ = workspace.to_pages.send(PageMessage::control(frame));
             if let Ok(Some(data_url)) = tokio::time::timeout(
                 Duration::from_secs(8),
                 wait_for_screenshot(&mut replies, id),
@@ -2299,6 +2301,20 @@ impl ServerHandler for CanvasServer {
 mod tests {
     use super::*;
 
+    fn control_frame(message: PageMessage) -> serde_json::Value {
+        match message {
+            PageMessage::Control(text) => serde_json::from_str(&text).unwrap(),
+            PageMessage::Document { .. } => panic!("expected a control frame"),
+        }
+    }
+
+    fn document_patch(message: PageMessage) -> (u64, Vec<Element>) {
+        match message {
+            PageMessage::Document { bytes, .. } => canvas_core::wire::decode_patch(&bytes).unwrap(),
+            PageMessage::Control(_) => panic!("expected a document frame"),
+        }
+    }
+
     fn error_text(result: &CallToolResult) -> String {
         result.content[0]
             .as_text()
@@ -2392,8 +2408,7 @@ mod tests {
             .unwrap();
         assert_ne!(result.is_error, Some(true));
 
-        let message: serde_json::Value =
-            serde_json::from_str(&from_server.recv().await.unwrap().json.unwrap()).unwrap();
+        let message = control_frame(from_server.recv().await.unwrap());
         assert_eq!(message["type"], "view");
         assert_eq!(message["action"], "focus");
         assert_eq!(message["id"], "abc");
@@ -2433,8 +2448,7 @@ mod tests {
             .canvas_point(Parameters(PointArgs { id: "db".into() }))
             .await
             .unwrap();
-        let message: serde_json::Value =
-            serde_json::from_str(&from_server.recv().await.unwrap().json.unwrap()).unwrap();
+        let message = control_frame(from_server.recv().await.unwrap());
         assert_eq!(message["action"], "point");
         assert_eq!(message["id"], "db");
         assert!(message.get("animate").is_none());
@@ -2483,15 +2497,13 @@ mod tests {
         );
         drop(doc);
 
-        let frame: serde_json::Value =
-            serde_json::from_str(&from_server.recv().await.unwrap().json.unwrap()).unwrap();
-        assert_eq!(frame["type"], "patch");
+        let (revision, put) = document_patch(from_server.recv().await.unwrap());
         assert_eq!(
-            frame["put"].as_array().unwrap().len(),
+            put.len(),
             2,
             "sticky plus its bound label travel in one patch"
         );
-        assert!(frame["rev"].as_u64().unwrap() >= 1);
+        assert!(revision >= 1);
     }
 
     #[tokio::test]
@@ -2515,11 +2527,9 @@ mod tests {
         assert_eq!(created["elements"], 1);
         assert!(created["id"].is_string());
 
-        let frame: serde_json::Value =
-            serde_json::from_str(&from_server.recv().await.unwrap().json.unwrap()).unwrap();
-        assert_eq!(frame["type"], "patch");
-        assert_eq!(frame["put"].as_array().unwrap().len(), 1);
-        assert!(frame["rev"].as_u64().unwrap() >= 1);
+        let (revision, put) = document_patch(from_server.recv().await.unwrap());
+        assert_eq!(put.len(), 1);
+        assert!(revision >= 1);
     }
 
     #[tokio::test]
@@ -4002,8 +4012,10 @@ mod tests {
         let (frame_tx, frame_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             while let Ok(message) = from_server.recv().await {
-                let frame: serde_json::Value =
-                    serde_json::from_str(&message.json.unwrap()).unwrap();
+                let PageMessage::Control(text) = message else {
+                    continue;
+                };
+                let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
                 if frame["type"] == "present" {
                     let id = frame["id"].as_u64().unwrap();
                     let _ = ack_state.present_acks.send((id, false));
@@ -4126,8 +4138,10 @@ mod tests {
         let ack_state = workspace.clone();
         tokio::spawn(async move {
             while let Ok(message) = from_server.recv().await {
-                let frame: serde_json::Value =
-                    serde_json::from_str(&message.json.unwrap()).unwrap();
+                let PageMessage::Control(text) = message else {
+                    continue;
+                };
+                let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
                 if frame["type"] == "present" {
                     let id = frame["id"].as_u64().unwrap();
                     let _ = ack_state.present_acks.send((id, false));
@@ -4232,8 +4246,7 @@ mod tests {
         let reply_state = workspace.clone();
         tokio::spawn(async move {
             while let Ok(message) = from_server.recv().await {
-                let frame: serde_json::Value =
-                    serde_json::from_str(&message.json.unwrap()).unwrap();
+                let frame = control_frame(message);
                 if frame["type"] == "screenshot" {
                     let id = frame["id"].as_u64().unwrap();
                     let _ = reply_state
@@ -4483,8 +4496,7 @@ mod tests {
         let mut from_server = source.to_pages.subscribe();
         let page_state = state.clone();
         let page = tokio::spawn(async move {
-            let message = from_server.recv().await.unwrap();
-            let frame: serde_json::Value = serde_json::from_str(&message.json.unwrap()).unwrap();
+            let frame = control_frame(from_server.recv().await.unwrap());
             assert_eq!(frame["type"], "workspace_changed");
             assert_eq!(frame["action"], "switch");
             let target = page_state
