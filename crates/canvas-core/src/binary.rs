@@ -10,21 +10,30 @@
 //! * enums become a variant index plus positional fields;
 //! * `Option` becomes a presence tag, never an omitted field.
 //!
-//! Field and variant order is the schema: append only in a new version. The
-//! borrowed types encode a live document without cloning; the owned types
-//! decode straight into the model without an intermediate JSON tree.
+//! Every persisted type has its own v1 mirror, including nested types such as
+//! [`Style`], [`Rect`], [`Point`] and the style enums. The conversions are
+//! exhaustive and construct model types without `..`, so adding or removing a
+//! model field, enum variant or element kind (or changing a field type) fails
+//! to compile here instead of silently changing what a version 1 payload
+//! means. Reordering the live model cannot change the payload because the
+//! conversions match by name. Field and variant order in this module is the
+//! schema: append only in a new version. The borrowed types encode a live
+//! document without cloning; the owned types decode straight into the model
+//! without an intermediate JSON tree.
 //!
-//! `SCHEMA_VERSION` 1 is the first binary schema. When the model changes, add a
-//! frozen copy of these types for reading version 1 instead of editing them.
+//! `SCHEMA_VERSION` 1 is the first binary schema. When the model changes, keep
+//! these types as the frozen v1 reader and add a new payload version rather
+//! than editing them.
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
+use serde::ser::SerializeSeq;
+use serde::{Deserialize, Serialize, Serializer};
 
 use crate::geometry::{Point, Rect};
 use crate::model::{
-    Binding, Document, Element, ElementKind, Endpoint, Routing, ShapeKind, Style, TextAlign,
-    SCHEMA_VERSION,
+    Binding, Document, Element, ElementKind, Endpoint, FillPattern, Routing, ShapeKind, StrokeDash,
+    Style, TextAlign, SCHEMA_VERSION,
 };
 
 /// Encode the version 1 payload. The envelope carries the schema version, so
@@ -37,6 +46,146 @@ pub(crate) fn encode(doc: &Document) -> Result<Vec<u8>, postcard::Error> {
 pub(crate) fn decode(payload: &[u8]) -> Result<Document, postcard::Error> {
     let owned: DocumentOwned = postcard::from_bytes(payload)?;
     Ok(owned.into())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+struct PointV1 {
+    x: f64,
+    y: f64,
+}
+
+impl From<Point> for PointV1 {
+    fn from(point: Point) -> Self {
+        Self {
+            x: point.x,
+            y: point.y,
+        }
+    }
+}
+
+impl From<PointV1> for Point {
+    fn from(point: PointV1) -> Self {
+        Self {
+            x: point.x,
+            y: point.y,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+struct RectV1 {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+}
+
+impl From<Rect> for RectV1 {
+    fn from(rect: Rect) -> Self {
+        Self {
+            x: rect.x,
+            y: rect.y,
+            w: rect.w,
+            h: rect.h,
+        }
+    }
+}
+
+impl From<RectV1> for Rect {
+    fn from(rect: RectV1) -> Self {
+        Self {
+            x: rect.x,
+            y: rect.y,
+            w: rect.w,
+            h: rect.h,
+        }
+    }
+}
+
+/// A frozen enum mirror with exhaustive conversions in both directions.
+///
+/// The variant list is the version 1 order. Adding, removing or renaming a
+/// model variant fails to compile until this list is revisited; reordering the
+/// model cannot change the payload because conversions match by name.
+macro_rules! frozen_enum {
+    ($mirror:ident, $model:ident { $($variant:ident),+ $(,)? }) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+        enum $mirror {
+            $($variant),+
+        }
+
+        impl From<$model> for $mirror {
+            fn from(value: $model) -> Self {
+                match value {
+                    $($model::$variant => $mirror::$variant),+
+                }
+            }
+        }
+
+        impl From<$mirror> for $model {
+            fn from(value: $mirror) -> Self {
+                match value {
+                    $($mirror::$variant => $model::$variant),+
+                }
+            }
+        }
+    };
+}
+
+frozen_enum!(
+    ShapeKindV1,
+    ShapeKind {
+        Rectangle,
+        Ellipse,
+        Diamond,
+        Sticky,
+    }
+);
+frozen_enum!(
+    FillPatternV1,
+    FillPattern {
+        Hachure,
+        CrossHatch,
+        Solid,
+    }
+);
+frozen_enum!(
+    StrokeDashV1,
+    StrokeDash {
+        Solid,
+        Dashed,
+        Dotted,
+    }
+);
+frozen_enum!(
+    RoutingV1,
+    Routing {
+        Straight,
+        Elbow,
+        Curved,
+    }
+);
+frozen_enum!(
+    TextAlignV1,
+    TextAlign {
+        Left,
+        Center,
+        Right
+    }
+);
+
+/// A borrowed `[Point]` that encodes the frozen v1 point layout without
+/// allocating a parallel vector.
+struct PointSliceBorrowed<'a>(&'a [Point]);
+
+impl Serialize for PointSliceBorrowed<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for point in self.0 {
+            sequence.serialize_element(&PointV1::from(*point))?;
+        }
+        sequence.end()
+    }
 }
 
 #[derive(Serialize)]
@@ -66,53 +215,66 @@ struct EndpointBorrowed<'a> {
 #[derive(Serialize)]
 struct BindingBorrowed<'a> {
     element_id: &'a str,
-    focus: Option<Point>,
+    focus: Option<PointV1>,
 }
 
-/// Variant and field order is the version 1 schema.
+/// Field order is the version 1 style schema.
+#[derive(Serialize)]
+struct StyleBorrowed<'a> {
+    stroke_color: &'a str,
+    fill_color: &'a str,
+    fill_style: FillPatternV1,
+    stroke_width: f64,
+    roughness: u8,
+    dash: StrokeDashV1,
+    opacity: f64,
+    font_size: f64,
+}
+
+/// Variant and field order is the version 1 element schema.
 #[derive(Serialize)]
 enum KindBorrowed<'a> {
     Shape {
-        shape: ShapeKind,
-        rect: Rect,
-        style: &'a Style,
+        shape: ShapeKindV1,
+        rect: RectV1,
+        style: StyleBorrowed<'a>,
         bound_text_id: Option<&'a str>,
     },
     Freehand {
-        points: &'a [Point],
+        points: PointSliceBorrowed<'a>,
         pressures: &'a [f64],
-        style: &'a Style,
+        style: StyleBorrowed<'a>,
     },
     Glyph {
         glyph: &'a str,
-        rect: Rect,
-        style: &'a Style,
+        rect: RectV1,
+        style: StyleBorrowed<'a>,
         caption_id: Option<&'a str>,
     },
     Arrow {
         start: EndpointBorrowed<'a>,
         end: EndpointBorrowed<'a>,
-        routing: Routing,
+        routing: RoutingV1,
         start_arrowhead: bool,
         end_arrowhead: bool,
-        style: &'a Style,
-        waypoints: &'a [Point],
+        style: StyleBorrowed<'a>,
+        waypoints: PointSliceBorrowed<'a>,
         label_id: Option<&'a str>,
     },
     Text {
-        rect: Rect,
+        rect: RectV1,
         text: &'a str,
-        align: TextAlign,
+        align: TextAlignV1,
         fixed_width: bool,
         container_id: Option<&'a str>,
-        style: &'a Style,
+        style: StyleBorrowed<'a>,
     },
     StickyStack {
-        rect: Rect,
-        style: &'a Style,
+        rect: RectV1,
+        style: StyleBorrowed<'a>,
     },
     Frame {
-        rect: Rect,
+        rect: RectV1,
         name: &'a str,
     },
 }
@@ -158,7 +320,22 @@ impl<'a> From<&'a Binding> for BindingBorrowed<'a> {
     fn from(binding: &'a Binding) -> Self {
         Self {
             element_id: &binding.element_id,
-            focus: binding.focus,
+            focus: binding.focus.map(PointV1::from),
+        }
+    }
+}
+
+impl<'a> From<&'a Style> for StyleBorrowed<'a> {
+    fn from(style: &'a Style) -> Self {
+        Self {
+            stroke_color: &style.stroke_color,
+            fill_color: &style.fill_color,
+            fill_style: style.fill_style.into(),
+            stroke_width: style.stroke_width,
+            roughness: style.roughness,
+            dash: style.dash.into(),
+            opacity: style.opacity,
+            font_size: style.font_size,
         }
     }
 }
@@ -172,9 +349,9 @@ impl<'a> From<&'a ElementKind> for KindBorrowed<'a> {
                 style,
                 bound_text_id,
             } => KindBorrowed::Shape {
-                shape: *shape,
-                rect: *rect,
-                style,
+                shape: (*shape).into(),
+                rect: (*rect).into(),
+                style: StyleBorrowed::from(style),
                 bound_text_id: bound_text_id.as_deref(),
             },
             ElementKind::Freehand {
@@ -182,9 +359,9 @@ impl<'a> From<&'a ElementKind> for KindBorrowed<'a> {
                 pressures,
                 style,
             } => KindBorrowed::Freehand {
-                points,
+                points: PointSliceBorrowed(points),
                 pressures,
-                style,
+                style: StyleBorrowed::from(style),
             },
             ElementKind::Glyph {
                 glyph,
@@ -193,8 +370,8 @@ impl<'a> From<&'a ElementKind> for KindBorrowed<'a> {
                 caption_id,
             } => KindBorrowed::Glyph {
                 glyph,
-                rect: *rect,
-                style,
+                rect: (*rect).into(),
+                style: StyleBorrowed::from(style),
                 caption_id: caption_id.as_deref(),
             },
             ElementKind::Arrow {
@@ -209,11 +386,11 @@ impl<'a> From<&'a ElementKind> for KindBorrowed<'a> {
             } => KindBorrowed::Arrow {
                 start: EndpointBorrowed::from(start),
                 end: EndpointBorrowed::from(end),
-                routing: *routing,
+                routing: (*routing).into(),
                 start_arrowhead: *start_arrowhead,
                 end_arrowhead: *end_arrowhead,
-                style,
-                waypoints,
+                style: StyleBorrowed::from(style),
+                waypoints: PointSliceBorrowed(waypoints),
                 label_id: label_id.as_deref(),
             },
             ElementKind::Text {
@@ -224,17 +401,21 @@ impl<'a> From<&'a ElementKind> for KindBorrowed<'a> {
                 container_id,
                 style,
             } => KindBorrowed::Text {
-                rect: *rect,
+                rect: (*rect).into(),
                 text,
-                align: *align,
+                align: (*align).into(),
                 fixed_width: *fixed_width,
                 container_id: container_id.as_deref(),
-                style,
+                style: StyleBorrowed::from(style),
             },
-            ElementKind::StickyStack { rect, style } => {
-                KindBorrowed::StickyStack { rect: *rect, style }
-            }
-            ElementKind::Frame { rect, name } => KindBorrowed::Frame { rect: *rect, name },
+            ElementKind::StickyStack { rect, style } => KindBorrowed::StickyStack {
+                rect: (*rect).into(),
+                style: StyleBorrowed::from(style),
+            },
+            ElementKind::Frame { rect, name } => KindBorrowed::Frame {
+                rect: (*rect).into(),
+                name,
+            },
         }
     }
 }
@@ -266,53 +447,66 @@ struct EndpointOwned {
 #[derive(Deserialize)]
 struct BindingOwned {
     element_id: String,
-    focus: Option<Point>,
+    focus: Option<PointV1>,
+}
+
+/// Must mirror `StyleBorrowed` field for field.
+#[derive(Deserialize)]
+struct StyleOwned {
+    stroke_color: String,
+    fill_color: String,
+    fill_style: FillPatternV1,
+    stroke_width: f64,
+    roughness: u8,
+    dash: StrokeDashV1,
+    opacity: f64,
+    font_size: f64,
 }
 
 /// Must mirror `KindBorrowed` variant for variant and field for field.
 #[derive(Deserialize)]
 enum KindOwned {
     Shape {
-        shape: ShapeKind,
-        rect: Rect,
-        style: Style,
+        shape: ShapeKindV1,
+        rect: RectV1,
+        style: StyleOwned,
         bound_text_id: Option<String>,
     },
     Freehand {
-        points: Vec<Point>,
+        points: Vec<PointV1>,
         pressures: Vec<f64>,
-        style: Style,
+        style: StyleOwned,
     },
     Glyph {
         glyph: String,
-        rect: Rect,
-        style: Style,
+        rect: RectV1,
+        style: StyleOwned,
         caption_id: Option<String>,
     },
     Arrow {
         start: EndpointOwned,
         end: EndpointOwned,
-        routing: Routing,
+        routing: RoutingV1,
         start_arrowhead: bool,
         end_arrowhead: bool,
-        style: Style,
-        waypoints: Vec<Point>,
+        style: StyleOwned,
+        waypoints: Vec<PointV1>,
         label_id: Option<String>,
     },
     Text {
-        rect: Rect,
+        rect: RectV1,
         text: String,
-        align: TextAlign,
+        align: TextAlignV1,
         fixed_width: bool,
         container_id: Option<String>,
-        style: Style,
+        style: StyleOwned,
     },
     StickyStack {
-        rect: Rect,
-        style: Style,
+        rect: RectV1,
+        style: StyleOwned,
     },
     Frame {
-        rect: Rect,
+        rect: RectV1,
         name: String,
     },
 }
@@ -359,7 +553,22 @@ impl From<BindingOwned> for Binding {
     fn from(binding: BindingOwned) -> Self {
         Self {
             element_id: binding.element_id,
-            focus: binding.focus,
+            focus: binding.focus.map(Point::from),
+        }
+    }
+}
+
+impl From<StyleOwned> for Style {
+    fn from(style: StyleOwned) -> Self {
+        Self {
+            stroke_color: style.stroke_color,
+            fill_color: style.fill_color,
+            fill_style: style.fill_style.into(),
+            stroke_width: style.stroke_width,
+            roughness: style.roughness,
+            dash: style.dash.into(),
+            opacity: style.opacity,
+            font_size: style.font_size,
         }
     }
 }
@@ -373,9 +582,9 @@ impl From<KindOwned> for ElementKind {
                 style,
                 bound_text_id,
             } => ElementKind::Shape {
-                shape,
-                rect,
-                style,
+                shape: shape.into(),
+                rect: rect.into(),
+                style: style.into(),
                 bound_text_id,
             },
             KindOwned::Freehand {
@@ -383,9 +592,9 @@ impl From<KindOwned> for ElementKind {
                 pressures,
                 style,
             } => ElementKind::Freehand {
-                points,
+                points: points.into_iter().map(Point::from).collect(),
                 pressures,
-                style,
+                style: style.into(),
             },
             KindOwned::Glyph {
                 glyph,
@@ -394,8 +603,8 @@ impl From<KindOwned> for ElementKind {
                 caption_id,
             } => ElementKind::Glyph {
                 glyph,
-                rect,
-                style,
+                rect: rect.into(),
+                style: style.into(),
                 caption_id,
             },
             KindOwned::Arrow {
@@ -410,11 +619,11 @@ impl From<KindOwned> for ElementKind {
             } => ElementKind::Arrow {
                 start: start.into(),
                 end: end.into(),
-                routing,
+                routing: routing.into(),
                 start_arrowhead,
                 end_arrowhead,
-                style,
-                waypoints,
+                style: style.into(),
+                waypoints: waypoints.into_iter().map(Point::from).collect(),
                 label_id,
             },
             KindOwned::Text {
@@ -425,15 +634,21 @@ impl From<KindOwned> for ElementKind {
                 container_id,
                 style,
             } => ElementKind::Text {
-                rect,
+                rect: rect.into(),
                 text,
-                align,
+                align: align.into(),
                 fixed_width,
                 container_id,
-                style,
+                style: style.into(),
             },
-            KindOwned::StickyStack { rect, style } => ElementKind::StickyStack { rect, style },
-            KindOwned::Frame { rect, name } => ElementKind::Frame { rect, name },
+            KindOwned::StickyStack { rect, style } => ElementKind::StickyStack {
+                rect: rect.into(),
+                style: style.into(),
+            },
+            KindOwned::Frame { rect, name } => ElementKind::Frame {
+                rect: rect.into(),
+                name,
+            },
         }
     }
 }
@@ -441,8 +656,6 @@ impl From<KindOwned> for ElementKind {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geometry::Rect;
-    use crate::model::{FillPattern, StrokeDash};
 
     fn all_kinds_document() -> Document {
         let mut doc = Document::new();
@@ -542,5 +755,244 @@ mod tests {
     fn empty_payload_round_trips() {
         let doc = Document::new();
         assert_eq!(decode(&encode(&doc).unwrap()).unwrap(), doc);
+    }
+
+    /// Every element kind, every enum variant, every style field and every
+    /// optional reference type.
+    fn golden_document() -> Document {
+        fn style(fill: FillPattern, dash: StrokeDash, roughness: u8) -> Style {
+            Style {
+                stroke_color: "#112233".into(),
+                fill_color: "#aabbcc".into(),
+                fill_style: fill,
+                stroke_width: 3.5,
+                roughness,
+                dash,
+                opacity: 0.85,
+                font_size: 18.0,
+            }
+        }
+        fn element(id: &str, index: &str, kind: ElementKind) -> Element {
+            Element {
+                id: id.into(),
+                version: 7,
+                version_nonce: 42,
+                index: index.into(),
+                is_deleted: false,
+                updated: 1_700_000_000_000,
+                frame_id: None,
+                kind,
+            }
+        }
+        let solid = || style(FillPattern::Hachure, StrokeDash::Solid, 0);
+        let dashed = || style(FillPattern::CrossHatch, StrokeDash::Dashed, 1);
+        let dotted = || style(FillPattern::Solid, StrokeDash::Dotted, 2);
+        let mut doc = Document::new();
+        doc.insert(element(
+            "shape-rect",
+            "a0",
+            ElementKind::Shape {
+                shape: ShapeKind::Rectangle,
+                rect: Rect::new(0.0, 0.0, 100.0, 50.0),
+                style: solid(),
+                bound_text_id: Some("text-center".into()),
+            },
+        ));
+        doc.insert(element(
+            "shape-ellipse",
+            "a1",
+            ElementKind::Shape {
+                shape: ShapeKind::Ellipse,
+                rect: Rect::new(10.0, 10.0, 40.0, 20.0),
+                style: dashed(),
+                bound_text_id: None,
+            },
+        ));
+        doc.insert(element(
+            "shape-diamond",
+            "a2",
+            ElementKind::Shape {
+                shape: ShapeKind::Diamond,
+                rect: Rect::new(-5.0, -5.0, 30.0, 30.0),
+                style: dotted(),
+                bound_text_id: None,
+            },
+        ));
+        let mut sticky = element(
+            "shape-sticky",
+            "a3",
+            ElementKind::Shape {
+                shape: ShapeKind::Sticky,
+                rect: Rect::new(200.0, 200.0, 80.0, 80.0),
+                style: solid(),
+                bound_text_id: Some("text-left".into()),
+            },
+        );
+        sticky.frame_id = Some("frame".into());
+        sticky.is_deleted = true;
+        doc.insert(sticky);
+        doc.insert(element(
+            "freehand",
+            "a4",
+            ElementKind::Freehand {
+                points: vec![Point::new(0.5, 1.25), Point::new(-2.0, 3.75)],
+                pressures: vec![0.25, 0.75],
+                style: dashed(),
+            },
+        ));
+        doc.insert(element(
+            "glyph",
+            "a5",
+            ElementKind::Glyph {
+                glyph: "cloud_run".into(),
+                rect: Rect::new(1.0, 2.0, 64.0, 64.0),
+                style: dotted(),
+                caption_id: Some("text-right".into()),
+            },
+        ));
+        doc.insert(element(
+            "arrow-straight",
+            "a6",
+            ElementKind::Arrow {
+                start: Endpoint {
+                    x: 0.0,
+                    y: 0.0,
+                    binding: Some(Binding {
+                        element_id: "shape-rect".into(),
+                        focus: Some(Point::new(0.25, 0.5)),
+                    }),
+                },
+                end: Endpoint::free(40.0, 20.0),
+                routing: Routing::Straight,
+                start_arrowhead: false,
+                end_arrowhead: true,
+                style: solid(),
+                waypoints: Vec::new(),
+                label_id: None,
+            },
+        ));
+        doc.insert(element(
+            "arrow-elbow",
+            "a7",
+            ElementKind::Arrow {
+                start: Endpoint {
+                    x: 1.0,
+                    y: 2.0,
+                    binding: Some(Binding {
+                        element_id: "shape-ellipse".into(),
+                        focus: None,
+                    }),
+                },
+                end: Endpoint {
+                    x: 3.0,
+                    y: 4.0,
+                    binding: Some(Binding {
+                        element_id: "glyph".into(),
+                        focus: Some(Point::new(1.0, 0.0)),
+                    }),
+                },
+                routing: Routing::Elbow,
+                start_arrowhead: true,
+                end_arrowhead: false,
+                style: dashed(),
+                waypoints: vec![Point::new(20.0, 10.0), Point::new(30.0, 12.5)],
+                label_id: Some("text-right".into()),
+            },
+        ));
+        doc.insert(element(
+            "arrow-curved",
+            "a8",
+            ElementKind::Arrow {
+                start: Endpoint::free(0.0, 5.0),
+                end: Endpoint::free(5.0, 0.0),
+                routing: Routing::Curved,
+                start_arrowhead: true,
+                end_arrowhead: true,
+                style: dotted(),
+                waypoints: Vec::new(),
+                label_id: None,
+            },
+        ));
+        doc.insert(element(
+            "text-left",
+            "a9",
+            ElementKind::Text {
+                rect: Rect::new(0.0, 0.0, 120.0, 24.0),
+                text: "left".into(),
+                align: TextAlign::Left,
+                fixed_width: false,
+                container_id: Some("shape-rect".into()),
+                style: solid(),
+            },
+        ));
+        doc.insert(element(
+            "text-center",
+            "aa",
+            ElementKind::Text {
+                rect: Rect::new(0.0, 30.0, 120.0, 24.0),
+                text: "center".into(),
+                align: TextAlign::Center,
+                fixed_width: true,
+                container_id: None,
+                style: dashed(),
+            },
+        ));
+        doc.insert(element(
+            "text-right",
+            "ab",
+            ElementKind::Text {
+                rect: Rect::new(0.0, 60.0, 120.0, 24.0),
+                text: "right".into(),
+                align: TextAlign::Right,
+                fixed_width: false,
+                container_id: None,
+                style: dotted(),
+            },
+        ));
+        doc.insert(element(
+            "sticky-stack",
+            "ac",
+            ElementKind::StickyStack {
+                rect: Rect::new(300.0, 300.0, 120.0, 120.0),
+                style: dashed(),
+            },
+        ));
+        doc.insert(element(
+            "frame",
+            "ad",
+            ElementKind::Frame {
+                rect: Rect::new(-20.0, -20.0, 400.0, 300.0),
+                name: "us-central1".into(),
+            },
+        ));
+        doc
+    }
+
+    fn fnv1a(bytes: &[u8]) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    /// The exact version 1 payload. If this changes, do not update the golden
+    /// value: bump `SCHEMA_VERSION`, keep a frozen v1 reader and add a v2
+    /// payload. The hash is FNV-1a over the encoded bytes.
+    #[test]
+    fn v1_payload_matches_golden_bytes() {
+        let payload = encode(&golden_document()).unwrap();
+        assert_eq!(payload.len(), 1778, "v1 payload length changed");
+        assert_eq!(
+            fnv1a(&payload),
+            0xdd3b_1358_b292_cc9b,
+            "v1 payload bytes changed; hex: {}",
+            hex(&payload)
+        );
     }
 }

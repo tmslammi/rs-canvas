@@ -35,7 +35,12 @@ fn time<T>(runs: usize, mut f: impl FnMut() -> T) -> (Duration, T) {
 }
 
 fn main() {
-    let doc = benchmark_fixture(10_000);
+    let mut doc = benchmark_fixture(10_000);
+    // The fixture's version nonces are random; pin them so repeated runs print
+    // the same byte counts as well as comparable timings.
+    for (index, element) in doc.elements.values_mut().enumerate() {
+        element.version_nonce = index as u32;
+    }
     let (json_save_ms, json) = time(RUNS, || to_json_pretty(&doc).unwrap());
     let (compact_json_save_ms, compact_json) = time(RUNS, || to_json(&doc).unwrap());
     let (binary_save_ms, binary) = time(RUNS, || to_bytes(&doc).unwrap());

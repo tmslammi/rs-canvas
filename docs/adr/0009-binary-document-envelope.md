@@ -16,20 +16,22 @@ The header is strict: fewer bytes than the header, a payload shorter or longer t
 
 ## Payload codec
 
-The payload uses **postcard** through an explicit v1 schema (`crates/canvas-core/src/binary.rs`) rather than serializing the model directly. The JSON model relies on internally tagged enums, `flatten` and `skip_serializing_if`, which positional binary codecs do not support; direct postcard serialization fails on the flattened `Element`. The explicit schema has positional struct fields, variant indexes plus positional fields for enums, and a presence tag for every `Option`. A borrowed mirror encodes a live document without cloning; an owned mirror decodes straight into the model without an intermediate `Value` tree. Field and variant order is the v1 schema, and the conversion matches are exhaustive, so adding a model field or kind fails to compile until the binary schema is handled.
+The payload uses **postcard** through an explicit v1 schema (`crates/canvas-core/src/binary.rs`) rather than serializing the model directly. The JSON model relies on internally tagged enums, `flatten` and `skip_serializing_if`, which positional binary codecs do not support; direct postcard serialization fails on the flattened `Element`. The explicit schema has positional struct fields, variant indexes plus positional fields for enums, and a presence tag for every `Option`.
 
-Measured alternatives on the 10k-element `benchmark_fixture` (native release, 2026-10-24, `cargo run --release -p canvas-core --example persistence_bench`, median of 9):
+Every persisted type has its own v1 mirror, including nested types: `PointV1`, `RectV1`, `StyleBorrowed`/`StyleOwned`, `ShapeKindV1`, `FillPatternV1`, `StrokeDashV1`, `RoutingV1` and `TextAlignV1`. Conversions are exhaustive and construct the live model without `..`, so adding or removing a model field, enum variant or element kind (or changing a field type) fails to compile here instead of silently changing what a version 1 payload means. Reordering the live model cannot change the payload because conversions match by name. A borrowed mirror encodes a live document without cloning; an owned mirror decodes straight into the model without an intermediate `Value` tree. Field and variant order in this module is the v1 schema, and a golden payload test pins the exact bytes (length plus FNV-1a hash) for a document covering every element kind, enum variant, style field and optional reference.
+
+Measured on the deterministic 10k-element `benchmark_fixture` (native release, 2026-10-24, `cargo run --release -p canvas-core --example persistence_bench`; median of 5 runs, each itself a median of 9):
 
 | Encoding | Bytes | Save | Load |
 | --- | ---: | ---: | ---: |
-| JSON pretty (previous save/export) | 6,452,077 | 9.6 ms | 30.1 ms |
-| JSON compact (previous mirror/wire) | 3,881,065 | 6.1 ms | 29.5 ms |
-| CBOR (`ciborium`, direct model) | 2,842,608 | 3.2 ms | 29.8 ms |
-| MessagePack (`rmp-serde`, direct compact) | 2,378,831 | 2.0 ms | 8.3 ms |
-| MessagePack (`rmp-serde`, named) | 3,270,854 | 3.1 ms | 11.2 ms |
-| **postcard, explicit binary v1 schema** | **1,279,183** | **1.3 ms** | **5.1 ms** |
+| JSON pretty (previous save/export) | 6,393,554 | 10.75 ms | 32.76 ms |
+| JSON compact (previous mirror/wire) | 3,822,542 | 7.02 ms | 30.77 ms |
+| CBOR (`ciborium`, direct model) | 2,822,328 | 3.2 ms | 29.8 ms |
+| MessagePack (`rmp-serde`, direct compact) | 2,358,447 | 2.0 ms | 8.3 ms |
+| MessagePack (`rmp-serde`, named) | 3,250,470 | 3.1 ms | 11.2 ms |
+| **postcard, explicit binary v1 schema** | **1,249,684** | **1.39 ms** | **5.58 ms** |
 
-The CBOR and MessagePack rows are payload-only probe timings; the JSON rows are the previous save/load paths and the final row includes the envelope, schema checks and sanitizing. Against the previous pretty save/export path the binary format is **7.3x faster to save, 5.9x faster to load and 80.2% smaller**; against compact JSON it is **4.6x faster to save, 5.8x faster to load and 67.0% smaller**. That clears the acceptance target of 3x faster and at least 50% smaller against either JSON baseline.
+The CBOR and MessagePack rows are payload-only probe timings; the JSON rows are the previous save/load paths and the final row includes the envelope, schema checks and sanitizing. Against the previous pretty save/export path the binary format is **7.7x faster to save, 5.9x faster to load and 80.5% smaller**; against compact JSON it is **5.1x faster to save, 5.5x faster to load and 67.3% smaller**. That clears the acceptance target of 3x faster and at least 50% smaller against either JSON baseline.
 
 ## Versioning and migration rules
 
