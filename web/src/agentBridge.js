@@ -206,8 +206,12 @@ export function connectAgentBridge(editor, hooks = {}) {
       lastHint = "";
       binarySync = false;
       window.__rsAgentConnected = true;
-      // The upload happens on hello, once the server has advertised whether
-      // it speaks the binary wire.
+      // Register this page and its view immediately, before hello decides the
+      // document encoding: the agent's current-workspace resolution follows
+      // page activity. Hints are control frames and stay JSON.
+      publishHint(true);
+      // The document upload happens on hello, once the server has advertised
+      // whether it speaks the binary wire.
     });
 
     socket.addEventListener("message", (event) => {
