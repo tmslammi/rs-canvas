@@ -40,15 +40,16 @@ export function connectAgentBridge(editor, hooks = {}) {
   };
 
   // Deltas committed since the last drain travel as one patch per gesture.
-  // Drained even when disconnected so the outbox cannot grow; the snapshot
-  // sent on reconnect catches the server up.
+  // Drain even when disconnected or when the server disabled sync, so the
+  // wasm outbox cannot grow; the snapshot sent on reconnect catches the
+  // server up.
   const publishChanges = () => {
-    if (!syncEnabled) return;
-    const frame = editor.take_outbound_frame();
-    if (!frame) return;
-    if (socket && socket.readyState === WebSocket.OPEN) {
-      socket.send(frame);
+    if (!syncEnabled || !socket || socket.readyState !== WebSocket.OPEN) {
+      editor.discard_outbound();
+      return;
     }
+    const frame = editor.take_outbound_frame();
+    if (frame) socket.send(frame);
   };
 
   const sendPresentDone = (id, cancelled) => {

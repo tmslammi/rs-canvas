@@ -4,9 +4,19 @@
 //! only pushed onto the history when committed. Consecutive updates to the
 //! same element inside one transaction coalesce, so a drag is one undo step.
 
-use crate::delta::{Delta, EditError};
+use std::mem::size_of;
+
+use crate::delta::{Delta, EditError, Tombstone};
+use crate::geometry::Point;
 use crate::id::new_version_nonce;
-use crate::model::{Document, Element, ElementId};
+use crate::model::{Binding, Document, Element, ElementId, ElementKind, Endpoint, Style};
+
+/// Undo history defaults: at most this many gestures, dropping the oldest
+/// first. The byte ceiling keeps a few large boards from holding hundreds of
+/// megabytes of element clones; a single gesture larger than the ceiling is
+/// dropped rather than allowed to blow the budget.
+pub const DEFAULT_HISTORY_TRANSACTIONS: usize = 64;
+pub const DEFAULT_HISTORY_BYTES: usize = 64 * 1024 * 1024;
 
 /// A recorded, closed group of deltas: one user gesture.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -78,16 +88,20 @@ impl Transaction {
         self.push_applied(doc, Delta::Add { element })
     }
 
-    /// Tombstone an element.
+    /// Tombstone an element. The delta keeps one full copy plus a compact
+    /// marker; the deleted element is derived when it is applied or projected.
     pub fn remove(&mut self, doc: &mut Document, id: &str, now_ms: u64) -> Result<(), EditError> {
         let before = doc
             .element(id)
             .ok_or_else(|| EditError::UnknownElement(id.to_string()))?
             .clone();
-        let mut tombstoned = before.clone();
-        tombstoned.is_deleted = true;
-        tombstoned.touch(now_ms);
-        self.push_applied(doc, Delta::Remove { before, tombstoned })
+        let tombstone = Tombstone::fresh(&before, now_ms);
+        self.push_applied(doc, Delta::Remove { before, tombstone })
+    }
+
+    /// Approximate heap bytes retained by this transaction's deltas.
+    pub fn retained_bytes(&self) -> usize {
+        self.deltas.iter().map(delta_retained_bytes).sum()
     }
 
     /// Mutate an element and bump its version.
@@ -120,12 +134,97 @@ impl Transaction {
             history.outbox.extend(self.deltas.iter().cloned());
             history.undo_stack.push(self);
             history.redo_stack.clear();
+            history.enforce_limits();
         }
     }
 }
 
+/// Approximate heap cost of one delta, used to bound retained history.
+fn delta_retained_bytes(delta: &Delta) -> usize {
+    match delta {
+        Delta::Add { element } | Delta::Purge { element } => element_retained_bytes(element),
+        Delta::Update { before, after } => {
+            element_retained_bytes(before) + element_retained_bytes(after)
+        }
+        Delta::Remove { before, .. } => element_retained_bytes(before) + size_of::<Tombstone>(),
+    }
+}
+
+fn element_retained_bytes(element: &Element) -> usize {
+    size_of::<Element>()
+        + element.id.capacity()
+        + element.index.capacity()
+        + element.frame_id.as_ref().map_or(0, String::capacity)
+        + kind_retained_bytes(&element.kind)
+}
+
+fn kind_retained_bytes(kind: &ElementKind) -> usize {
+    match kind {
+        ElementKind::Shape {
+            style,
+            bound_text_id,
+            ..
+        } => style_retained_bytes(style) + bound_text_id.as_ref().map_or(0, String::capacity),
+        ElementKind::Freehand {
+            points,
+            pressures,
+            style,
+        } => {
+            points.capacity() * size_of::<Point>()
+                + pressures.capacity() * size_of::<f64>()
+                + style_retained_bytes(style)
+        }
+        ElementKind::Glyph {
+            glyph,
+            style,
+            caption_id,
+            ..
+        } => {
+            glyph.capacity()
+                + style_retained_bytes(style)
+                + caption_id.as_ref().map_or(0, String::capacity)
+        }
+        ElementKind::Arrow {
+            start,
+            end,
+            style,
+            waypoints,
+            label_id,
+            ..
+        } => {
+            endpoint_retained_bytes(start)
+                + endpoint_retained_bytes(end)
+                + style_retained_bytes(style)
+                + waypoints.capacity() * size_of::<Point>()
+                + label_id.as_ref().map_or(0, String::capacity)
+        }
+        ElementKind::Text {
+            text,
+            style,
+            container_id,
+            ..
+        } => {
+            text.capacity()
+                + style_retained_bytes(style)
+                + container_id.as_ref().map_or(0, String::capacity)
+        }
+        ElementKind::StickyStack { style, .. } => style_retained_bytes(style),
+        ElementKind::Frame { name, .. } => name.capacity(),
+    }
+}
+
+fn endpoint_retained_bytes(endpoint: &Endpoint) -> usize {
+    endpoint.binding.as_ref().map_or(0, |binding| {
+        size_of::<Binding>() + binding.element_id.capacity()
+    })
+}
+
+fn style_retained_bytes(style: &Style) -> usize {
+    size_of::<Style>() + style.stroke_color.capacity() + style.fill_color.capacity()
+}
+
 /// Undo/redo stacks of committed transactions.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct History {
     undo_stack: Vec<Transaction>,
     redo_stack: Vec<Transaction>,
@@ -133,11 +232,34 @@ pub struct History {
     /// undos and redos all land here; the page bridge projects them into wire
     /// patches so peers see every change, not just the document snapshots.
     outbox: Vec<Delta>,
+    max_transactions: usize,
+    max_bytes: usize,
+}
+
+impl Default for History {
+    fn default() -> Self {
+        Self {
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            outbox: Vec::new(),
+            max_transactions: DEFAULT_HISTORY_TRANSACTIONS,
+            max_bytes: DEFAULT_HISTORY_BYTES,
+        }
+    }
 }
 
 impl History {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A history bounded by transaction count and retained heap bytes.
+    pub fn with_limits(max_transactions: usize, max_bytes: usize) -> Self {
+        Self {
+            max_transactions,
+            max_bytes,
+            ..Self::default()
+        }
     }
 
     /// Commit a transaction without going through `Transaction::commit`.
@@ -155,6 +277,28 @@ impl History {
 
     pub fn undo_depth(&self) -> usize {
         self.undo_stack.len()
+    }
+
+    /// Approximate heap bytes currently retained by undoable transactions.
+    pub fn retained_bytes(&self) -> usize {
+        self.undo_stack
+            .iter()
+            .map(Transaction::retained_bytes)
+            .sum()
+    }
+
+    /// Drop the oldest undoable transactions until both caps hold. A single
+    /// gesture larger than the byte cap is dropped too: a hard budget is the
+    /// point, and a partial transaction could not be undone safely.
+    fn enforce_limits(&mut self) {
+        let excess = self.undo_stack.len().saturating_sub(self.max_transactions);
+        if excess > 0 {
+            self.undo_stack.drain(..excess);
+        }
+        let mut bytes = self.retained_bytes();
+        while bytes > self.max_bytes && !self.undo_stack.is_empty() {
+            bytes -= self.undo_stack.remove(0).retained_bytes();
+        }
     }
 
     /// Stamp a freshly written element: strictly newer than both the copy
@@ -260,14 +404,14 @@ impl History {
                         after: Self::freshen(Some(&current), after.clone(), now_ms),
                     }
                 }
-                Delta::Remove { tombstoned, .. } => {
+                Delta::Remove { before, tombstone } => {
                     let current = doc
-                        .element(&tombstoned.id)
+                        .element(&before.id)
                         .cloned()
-                        .ok_or_else(|| EditError::UnknownElement(tombstoned.id.clone()))?;
+                        .ok_or_else(|| EditError::UnknownElement(before.id.clone()))?;
                     Delta::Remove {
                         before: current.clone(),
-                        tombstoned: Self::freshen(Some(&current), tombstoned.clone(), now_ms),
+                        tombstone: tombstone.freshened(Some(&current), now_ms),
                     }
                 }
                 Delta::Purge { .. } => {
@@ -286,6 +430,12 @@ impl History {
     /// Take every delta applied since the last drain.
     pub fn drain_outbox(&mut self) -> Vec<Delta> {
         std::mem::take(&mut self.outbox)
+    }
+
+    /// Drop every delta applied since the last drain. Used when the bridge is
+    /// disabled or disconnected: its reconnect snapshot carries the state.
+    pub fn discard_outbox(&mut self) {
+        self.outbox.clear();
     }
 }
 
@@ -388,6 +538,174 @@ mod tests {
             restored.version > before.version,
             "undo is a new edit: the version advances"
         );
+    }
+
+    #[test]
+    fn removal_undo_redo_restores_content_and_metadata_exactly() {
+        let mut doc = Document::new();
+        let mut history = History::new();
+        let id = doc.add(shape(1.0, 2.0), 1);
+        let before = doc.element(&id).unwrap().clone();
+
+        let mut tx = Transaction::begin();
+        tx.remove(&mut doc, &id, 10).unwrap();
+        let stored = tx.deltas()[0].clone();
+        let Delta::Remove {
+            before: kept,
+            tombstone,
+        } = &stored
+        else {
+            panic!("a removal records a Remove delta");
+        };
+        assert_eq!(kept, &before, "one full pre-delete copy is kept");
+        assert_eq!(tombstone.version, before.version + 1);
+        assert_eq!(tombstone.updated, 10);
+        tx.commit(&mut history);
+
+        let deleted = doc.element(&id).unwrap().clone();
+        assert!(deleted.is_deleted);
+        assert_eq!(deleted.kind, before.kind);
+        assert_eq!(deleted.index, before.index);
+        assert_eq!(deleted.frame_id, before.frame_id);
+        let mut expected = before.clone();
+        expected.is_deleted = true;
+        expected.version = tombstone.version;
+        expected.version_nonce = tombstone.version_nonce;
+        expected.updated = tombstone.updated;
+        assert_eq!(deleted, expected);
+        assert_eq!(
+            crate::patch::Patch::from_deltas(&history.drain_outbox(), 11).put,
+            vec![deleted.clone()],
+            "the wire sees the full tombstone"
+        );
+
+        history.undo(&mut doc, 20).unwrap();
+        let restored = doc.element(&id).unwrap().clone();
+        assert!(restored.content_eq(&before));
+        assert!(!restored.is_deleted);
+        assert!(restored.version > deleted.version, "undo is a new edit");
+        assert_eq!(
+            crate::patch::Patch::from_deltas(&history.drain_outbox(), 21).put,
+            vec![restored.clone()]
+        );
+
+        history.redo(&mut doc, 30).unwrap();
+        let again = doc.element(&id).unwrap().clone();
+        assert!(again.is_deleted);
+        assert_eq!(again.kind, before.kind);
+        assert_eq!(again.index, before.index);
+        assert_eq!(again.frame_id, before.frame_id);
+        assert!(again.version > restored.version, "redo is a new edit");
+        assert_eq!(again.updated, 30);
+        assert_eq!(
+            crate::patch::Patch::from_deltas(&history.drain_outbox(), 31).put,
+            vec![again],
+            "redoing a removal projects its derived tombstone"
+        );
+    }
+
+    #[test]
+    fn transaction_cap_evicts_oldest_and_undo_redo_stay_correct() {
+        let mut doc = Document::new();
+        let mut history = History::with_limits(2, usize::MAX);
+        for i in 0..4 {
+            let mut tx = Transaction::begin();
+            tx.add(
+                &mut doc,
+                Element::new(shape(i as f64 * 20.0, 0.0), "a0".into(), i).with_id(format!("e{i}")),
+            )
+            .unwrap();
+            tx.commit(&mut history);
+        }
+
+        assert_eq!(history.undo_depth(), 2, "only the newest gestures are kept");
+        assert_eq!(doc.ordered_live().len(), 4);
+
+        assert!(!history.undo(&mut doc, 10).unwrap().is_empty());
+        assert!(!history.undo(&mut doc, 11).unwrap().is_empty());
+        assert_eq!(doc.ordered_live().len(), 2, "the evicted adds stay applied");
+        assert!(history.undo(&mut doc, 12).unwrap().is_empty());
+
+        assert!(!history.redo(&mut doc, 13).unwrap().is_empty());
+        assert!(!history.redo(&mut doc, 14).unwrap().is_empty());
+        assert_eq!(
+            doc.ordered_live().len(),
+            4,
+            "redo replays the kept gestures"
+        );
+        assert!(history.redo(&mut doc, 15).unwrap().is_empty());
+    }
+
+    #[test]
+    fn eviction_leaves_the_outbound_patch_stream_intact() {
+        let mut doc = Document::new();
+        let mut history = History::with_limits(1, usize::MAX);
+        for i in 0..2 {
+            let mut tx = Transaction::begin();
+            tx.add(
+                &mut doc,
+                Element::new(shape(i as f64 * 20.0, 0.0), "a0".into(), i).with_id(format!("e{i}")),
+            )
+            .unwrap();
+            tx.commit(&mut history);
+        }
+        assert_eq!(history.undo_depth(), 1, "the first gesture was evicted");
+
+        let patch = crate::patch::Patch::from_deltas(&history.drain_outbox(), 9);
+        let ids: Vec<&str> = patch
+            .put
+            .iter()
+            .map(|element| element.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["e0", "e1"],
+            "eviction must not drop deltas already queued for peers"
+        );
+    }
+
+    #[test]
+    fn byte_cap_evicts_oldest_until_retention_fits() {
+        let element = Element::new(shape(0.0, 0.0), "a0".into(), 1).with_id("one");
+        let one = delta_retained_bytes(&Delta::Add {
+            element: element.clone(),
+        });
+        let mut doc = Document::new();
+        let mut history = History::with_limits(usize::MAX, one + one / 2);
+
+        let mut tx = Transaction::begin();
+        tx.add(&mut doc, element).unwrap();
+        tx.commit(&mut history);
+        assert_eq!(history.undo_depth(), 1);
+        assert!(history.retained_bytes() <= one + one / 2);
+
+        let mut tx = Transaction::begin();
+        tx.add(
+            &mut doc,
+            Element::new(shape(20.0, 0.0), "a1".into(), 2).with_id("two"),
+        )
+        .unwrap();
+        tx.commit(&mut history);
+        assert_eq!(history.undo_depth(), 1, "the oldest gesture is evicted");
+        assert!(history.retained_bytes() <= one + one / 2);
+
+        assert!(!history.undo(&mut doc, 9).unwrap().is_empty());
+        assert_eq!(doc.ordered_live().len(), 1);
+        assert_eq!(
+            doc.ordered_live()[0].id,
+            "one",
+            "the kept undo is the newest"
+        );
+
+        let mut tx = Transaction::begin();
+        tx.add(
+            &mut doc,
+            Element::new(shape(40.0, 0.0), "a2".into(), 3).with_id("three"),
+        )
+        .unwrap();
+        tx.commit(&mut history);
+        assert_eq!(history.undo_depth(), 1);
+        assert_eq!(doc.ordered_live().len(), 2);
     }
 
     #[test]
