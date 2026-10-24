@@ -21,7 +21,9 @@ use rmcp::{schemars, tool, tool_handler, tool_router, ErrorData as McpError, Ser
 use crate::doc_ops;
 use crate::render;
 use crate::script::{self, ScriptBeat};
-use crate::state::{AppState, PageMessage, Workspace, WorkspaceManagementError};
+use crate::state::{
+    AppState, ChangeKind, ChangedElement, PageMessage, Workspace, WorkspaceManagementError,
+};
 use crate::verbs;
 
 const INSTRUCTIONS: &str =
@@ -533,26 +535,63 @@ fn describe_changes(
             record.source,
             record.changed.len()
         ));
+        let counts: Vec<String> = record
+            .kind_counts()
+            .into_iter()
+            .map(|(kind, count)| format!("{count} {}", kind.label()))
+            .collect();
+        if !counts.is_empty() {
+            text.push_str(&format!(" ({})", counts.join(", ")));
+        }
     }
-    let mut seen = std::collections::HashSet::new();
-    let mut changed_ids: Vec<String> = Vec::new();
+    // One current-state line per id, with the union of the kinds seen for it
+    // across the whole window.
+    let mut changes: Vec<ChangedElement> = Vec::new();
+    let mut positions: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for record in records {
-        for id in &record.changed {
-            if seen.insert(id.clone()) {
-                changed_ids.push(id.clone());
+        for change in &record.changed {
+            match positions.get(&change.id) {
+                Some(&position) => {
+                    let existing = &mut changes[position];
+                    for kind in &change.kinds {
+                        if !existing.kinds.contains(kind) {
+                            existing.kinds.push(*kind);
+                        }
+                    }
+                }
+                None => {
+                    positions.insert(change.id.clone(), changes.len());
+                    changes.push(change.clone());
+                }
             }
         }
     }
     let mut live = Vec::new();
     let mut removed = Vec::new();
-    for id in &changed_ids {
-        match doc.element(id).filter(|element| !element.is_deleted) {
+    for change in &mut changes {
+        change.kinds.sort_unstable();
+        change.kinds.dedup();
+        let kinds = kind_list(&change.kinds);
+        match doc
+            .element(&change.id)
+            .filter(|element| !element.is_deleted)
+        {
             Some(element) => {
-                live.push(canvas_core::describe::describe_element_with(
-                    doc, element, ids,
-                ));
+                let line = canvas_core::describe::describe_element_with(doc, element, ids);
+                if kinds.is_empty() {
+                    live.push(line);
+                } else {
+                    live.push(format!("{line} ({kinds})"));
+                }
             }
-            None => removed.push(ids.map(id)),
+            None => {
+                let handle = ids.map(&change.id);
+                if kinds.is_empty() {
+                    removed.push(handle);
+                } else {
+                    removed.push(format!("{handle} ({kinds})"));
+                }
+            }
         }
     }
     if !live.is_empty() {
@@ -566,6 +605,14 @@ fn describe_changes(
         text.push_str(&format!("removed: {}\n", removed.join(" ")));
     }
     text
+}
+
+fn kind_list(kinds: &[ChangeKind]) -> String {
+    kinds
+        .iter()
+        .map(|kind| kind.label())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[derive(Clone)]
@@ -2270,6 +2317,133 @@ mod tests {
         assert!(report.contains("(page)"), "{report}");
         assert!(report.contains("changed now:"), "{report}");
         assert!(report.contains(&handle), "{report}");
+    }
+
+    #[test]
+    fn change_reports_count_kinds_and_label_elements() {
+        let mut doc = Document::new();
+        let moved = doc.add(
+            canvas_core::model::ElementKind::Shape {
+                shape: canvas_core::model::ShapeKind::Rectangle,
+                rect: canvas_core::geometry::Rect::new(0.0, 0.0, 100.0, 60.0),
+                style: canvas_core::model::Style::default(),
+                bound_text_id: None,
+            },
+            1,
+        );
+        let records = vec![
+            crate::state::ChangeRecord {
+                revision: 13,
+                source: "agent".into(),
+                changed: vec![ChangedElement {
+                    id: moved.clone(),
+                    kinds: vec![ChangeKind::Moved],
+                }],
+            },
+            crate::state::ChangeRecord {
+                revision: 14,
+                source: "page".into(),
+                changed: vec![
+                    ChangedElement {
+                        id: moved.clone(),
+                        kinds: vec![ChangeKind::Restyled],
+                    },
+                    ChangedElement {
+                        id: "gone".into(),
+                        kinds: vec![ChangeKind::Removed],
+                    },
+                ],
+            },
+        ];
+        let mut ids = crate::aliases::Aliases::default();
+        let report = describe_changes(&doc, &records, 12, 14, &mut ids);
+
+        assert!(
+            report.contains("- rev 13 (agent): 1 changed (1 moved)"),
+            "{report}"
+        );
+        assert!(
+            report.contains("- rev 14 (page): 2 changed (1 removed, 1 restyled)"),
+            "{report}"
+        );
+        assert!(
+            report.contains("(moved, restyled)"),
+            "kinds are unioned across the window: {report}"
+        );
+        assert!(report.contains("(removed)"), "{report}");
+        assert!(report.contains("removed: "), "{report}");
+    }
+
+    #[tokio::test]
+    async fn canvas_read_since_reports_kinds_per_revision_and_element() {
+        let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
+        let workspace = state.workspace(crate::state::DEFAULT_WORKSPACE).await;
+        let server = CanvasServer::new(state.clone());
+        let draw = |kind: &str| DrawArgs {
+            kind: kind.into(),
+            text: None,
+            name: None,
+            glyph: None,
+            x: None,
+            y: None,
+            w: None,
+            h: None,
+            near: None,
+            side: None,
+        };
+        server
+            .canvas_draw(Parameters(draw("rectangle")))
+            .await
+            .unwrap();
+        server
+            .canvas_draw(Parameters(draw("ellipse")))
+            .await
+            .unwrap();
+        let revision = workspace.revision.load(Ordering::SeqCst);
+        assert_eq!(revision, 2);
+
+        {
+            let mut doc = workspace.doc.lock().await;
+            let ids: Vec<String> = doc
+                .ordered_live()
+                .iter()
+                .map(|element| element.id.clone())
+                .collect();
+            let before = doc.clone();
+            let moved = doc.element_mut(&ids[0]).unwrap();
+            if let canvas_core::model::ElementKind::Shape { rect, .. } = &mut moved.kind {
+                rect.x += 30.0;
+            }
+            moved.touch(now_ms());
+            let removed = doc.element_mut(&ids[1]).unwrap();
+            removed.is_deleted = true;
+            removed.touch(now_ms());
+            workspace.record_change(&before, &doc, "page").await;
+        }
+
+        let report = error_text(
+            &server
+                .canvas_read(Parameters(ReadArgs {
+                    since: Some(revision),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap(),
+        );
+        assert!(
+            report.contains("- rev 3 (page): 2 changed (1 removed, 1 moved)"),
+            "{report}"
+        );
+        assert!(report.contains("changed now:"), "{report}");
+        assert!(
+            report.contains("(moved)"),
+            "live element carries its kind: {report}"
+        );
+        assert!(
+            report.contains("(removed)"),
+            "removed element carries its kind: {report}"
+        );
+        assert!(report.contains("removed: "), "{report}");
     }
 
     fn bulk_shape(k: &str, x: f64, y: f64) -> BulkShape {
