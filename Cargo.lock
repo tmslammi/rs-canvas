@@ -186,7 +186,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "canvas-core"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -195,7 +195,7 @@ dependencies = [
 
 [[package]]
 name = "canvas-server"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -214,7 +214,7 @@ dependencies = [
 
 [[package]]
 name = "canvas-wasm"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "canvas-core",
  "console_error_panic_hook",
