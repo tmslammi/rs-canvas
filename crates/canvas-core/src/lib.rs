@@ -37,6 +37,7 @@ pub mod scene;
 pub mod serialization;
 pub mod spatial;
 pub mod svg;
+pub mod sync;
 pub mod text;
 pub mod tool;
 pub mod wire;
@@ -61,7 +62,7 @@ pub use history::{freshen_element, inverse_for_replay, History, Transaction};
 pub use hit::{
     elements_in_rect, elements_in_rect_indexed, hit_test, hit_test_indexed, hit_test_raw_indexed,
 };
-pub use merge::reconcile;
+pub use merge::{merge_elements, reconcile, ElementChange, MergeOutcome, ReconcileOutcome};
 pub use model::{
     Binding, Document, Element, ElementId, ElementKind, Endpoint, FillPattern, Routing, ShapeKind,
     StrokeDash, Style, StylePatch, TextAlign, SCHEMA_VERSION,
@@ -71,5 +72,6 @@ pub use patch::{merge_element, Patch};
 pub use scene::{Scene, SceneLayer};
 pub use spatial::HitIndex;
 pub use spatial::ObstacleIndex;
+pub use sync::{PageFrame, PurgeLedger};
 pub use text::{layout_text, ApproxMeasurer, TextLayout, TextMeasurer};
 pub use tool::Tool;

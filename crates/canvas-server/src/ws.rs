@@ -2,9 +2,12 @@
 //!
 //! Steady state carries element-granular patches both ways: a page's gesture
 //! becomes one patch, an agent edit becomes one patch, and each is merged by
-//! `canvas-core`'s per-element LWW rules. Full snapshots remain for connect
-//! and for resync after a broadcast gap. View commands and presentation
-//! frames ride the same socket.
+//! `canvas-core`'s per-element LWW rules. A page uploads a snapshot on connect
+//! with the server revision it was based on and its explicit purge ledger;
+//! the workspace returns any elements the upload lost or omitted as a
+//! correction patch. Full snapshots remain for a lagged broadcast or a client
+//! that never uploads. View commands and presentation frames ride the same
+//! socket.
 //!
 //! A connection belongs to exactly one workspace, named by the `?ws=` query
 //! parameter (ADR-0007); without one it lands on `default`.
@@ -19,11 +22,11 @@ use axum::response::{IntoResponse, Response};
 use serde_json::Value;
 use tokio::sync::broadcast::error::RecvError;
 
-use canvas_core::model::Element;
+use canvas_core::sync::PageFrame;
 use canvas_core::wire;
 
 use crate::state::{
-    now_ms, valid_workspace_name, AppState, PageMessage, Workspace, DEFAULT_WORKSPACE,
+    valid_workspace_name, AppState, PageFrameOutcome, PageMessage, Workspace, DEFAULT_WORKSPACE,
 };
 
 /// `wire=json` suppresses the binary capability advertisement so a test (or a
@@ -99,7 +102,6 @@ async fn connected(
     let ready = socket.send(Message::Text(hello.into())).await.is_ok();
 
     if ready {
-        let mut page_sync = crate::state::PageSync::default();
         // The connection starts on the JSON path; its first binary document
         // frame promotes it. New pages wait for hello before uploading, so
         // this happens before any document frame the server sends them.
@@ -149,21 +151,14 @@ async fn connected(
                         if workspace.retired.load(Ordering::SeqCst) { break; }
                         if let Ok(frame) = serde_json::from_str::<Value>(&text) {
                             workspace.note_page_activity();
-                            let synced = handle_frame(&state, &workspace, &mut page_sync, id, &frame).await;
-                            if first_sync_pending {
-                                if let Some(mirror_leads) = synced {
+                            let synced = handle_frame(&state, &workspace, id, &frame).await;
+                            if let Some(outcome) = synced {
+                                if first_sync_pending {
                                     first_sync_pending = false;
                                     fallback_armed = false;
-                                    if mirror_leads {
-                                        // The page lacks live elements the
-                                        // server kept while it was away: the
-                                        // upload just merged in, so one
-                                        // snapshot covers both worlds. A
-                                        // converged page gets no download.
-                                        if !send_snapshot(&mut socket, &workspace, binary_wire).await {
-                                            break;
-                                        }
-                                    }
+                                }
+                                if !send_revision_ack(&mut socket, outcome.revision).await {
+                                    break;
                                 }
                             }
                         }
@@ -181,17 +176,14 @@ async fn connected(
                             binary_guard = Some(workspace.promote_binary_page());
                         }
                         workspace.note_page_activity();
-                        let synced =
-                            handle_binary_frame(&workspace, &mut page_sync, id, &bytes).await;
-                        if first_sync_pending {
-                            if let Some(mirror_leads) = synced {
+                        let synced = handle_binary_frame(&workspace, id, &bytes).await;
+                        if let Some(outcome) = synced {
+                            if first_sync_pending {
                                 first_sync_pending = false;
                                 fallback_armed = false;
-                                if mirror_leads
-                                    && !send_snapshot(&mut socket, &workspace, binary_wire).await
-                                {
-                                    break;
-                                }
+                            }
+                            if !send_revision_ack(&mut socket, outcome.revision).await {
+                                break;
                             }
                         }
                     }
@@ -248,30 +240,27 @@ async fn send_snapshot(socket: &mut WebSocket, workspace: &Workspace, binary: bo
     socket.send(Message::Text(snapshot.into())).await.is_ok()
 }
 
-/// One incoming binary frame. Returns `Some(mirror_leads)` for snapshots, with
-/// the same meaning as the JSON handler.
+/// Acknowledge an applied snapshot upload with the mirror revision, so the
+/// page's next snapshot carries an accurate base even when no correction was
+/// needed (and therefore no document frame was sent back).
+async fn send_revision_ack(socket: &mut WebSocket, revision: u64) -> bool {
+    let frame = serde_json::json!({ "type": "synced", "rev": revision }).to_string();
+    socket.send(Message::Text(frame.into())).await.is_ok()
+}
+
+/// One incoming binary frame. Snapshot uploads return their outcome so the
+/// connection can finish first-sync bookkeeping; the workspace itself has
+/// already broadcast any corrections.
 async fn handle_binary_frame(
     workspace: &Arc<Workspace>,
-    page_sync: &mut crate::state::PageSync,
     id: u64,
     bytes: &[u8],
-) -> Option<bool> {
-    match wire::kind(bytes) {
-        Ok(wire::FrameKind::Snapshot) => {
-            let Ok((_, incoming)) = wire::decode_snapshot(bytes) else {
-                tracing::warn!("ignoring malformed binary snapshot frame");
-                return None;
-            };
-            Some(absorb_page_snapshot(workspace, page_sync, id, incoming).await)
-        }
-        Ok(wire::FrameKind::Patch) => {
-            match wire::decode_patch(bytes) {
-                Ok((_, put)) => {
-                    workspace.absorb_patch(put, id).await;
-                }
-                Err(error) => tracing::warn!(%error, "ignoring malformed binary patch frame"),
-            }
-            None
+) -> Option<PageFrameOutcome> {
+    match PageFrame::from_binary(bytes) {
+        Ok(frame) => {
+            let snapshot = frame.is_snapshot();
+            let outcome = workspace.apply_page_frame(id, frame).await;
+            snapshot.then_some(outcome)
         }
         Err(error) => {
             tracing::warn!(%error, "ignoring malformed binary frame");
@@ -280,68 +269,22 @@ async fn handle_binary_frame(
     }
 }
 
-/// Merge one page snapshot into the mirror and update the per-connection
-/// purge base. Returns whether the mirror holds live elements the page lacks,
-/// which means the page needs a download.
-async fn absorb_page_snapshot(
-    workspace: &Arc<Workspace>,
-    page_sync: &mut crate::state::PageSync,
-    id: u64,
-    mut incoming: canvas_core::Document,
-) -> bool {
-    // The page's doc as it actually is: purged elements are absent, so
-    // diffing against the previous snapshot is what makes a deletion
-    // expressible on the wire.
-    let page_document = incoming.clone();
-    // Does the mirror hold any live element the page lacks? It does when the
-    // page left with content and the server carried on (agent edits with no
-    // page connected) — such a page must catch up with a download. An
-    // in-sync boot already holds everything and stays silent; deletions made
-    // while the page was away reach it through the patch-correction path.
-    let mirror_leads = {
-        let mirror = workspace.doc.lock().await;
-        mirror
-            .elements
-            .values()
-            .filter(|element| !element.is_deleted)
-            .any(|element| page_document.element(&element.id).is_none())
-    };
-    page_sync.prepare(&mut incoming, now_ms());
-    workspace.absorb_document(&incoming, Some(id)).await;
-    page_sync.commit(page_document);
-    mirror_leads
-}
-
-/// One incoming page frame. Patches merge per element; snapshots go through
-/// the full reconcile, with `PageSync` synthesizing tombstones for elements
-/// the page purged (undo of a creation).
-///
-/// Returns `Some(mirror_leads)` for snapshot frames — whether the mirror
-/// holds live elements the page's upload lacks — so the connection can skip
-/// the initial download when the page is already in sync; `None` for
-/// everything else.
+/// One incoming page frame. Both document frames route through
+/// `Workspace::apply_page_frame`, the same seam tests drive without a socket.
+/// Snapshot uploads return their outcome so first-sync bookkeeping can finish;
+/// control frames return `None`.
 async fn handle_frame(
     state: &Arc<AppState>,
     workspace: &Arc<Workspace>,
-    page_sync: &mut crate::state::PageSync,
     id: u64,
     frame: &Value,
-) -> Option<bool> {
+) -> Option<PageFrameOutcome> {
+    if let Some(page_frame) = PageFrame::from_json(frame) {
+        let snapshot = page_frame.is_snapshot();
+        let outcome = workspace.apply_page_frame(id, page_frame).await;
+        return snapshot.then_some(outcome);
+    }
     match frame.get("type").and_then(|value| value.as_str()) {
-        Some("snapshot") => {
-            let doc = frame.get("doc")?;
-            let Ok(incoming) = canvas_core::serialization::from_value(doc.clone()) else {
-                return None;
-            };
-            Some(absorb_page_snapshot(workspace, page_sync, id, incoming).await)
-        }
-        Some("patch") => {
-            let put = frame.get("put")?;
-            if let Ok(elements) = serde_json::from_value::<Vec<Element>>(put.clone()) {
-                workspace.absorb_patch(elements, id).await;
-            }
-            None
-        }
         Some("present_done") => {
             if let Some(id) = frame.get("id").and_then(|v| v.as_u64()) {
                 let cancelled = frame

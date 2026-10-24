@@ -28,6 +28,7 @@ declare global {
       save_bytes(): Uint8Array;
       snapshot_json(): string;
       snapshot_frame_bytes(): Uint8Array;
+      set_wire_revision(revision: number): void;
       take_outbound_frame_bytes(): Uint8Array;
       reconcile_bytes(bytes: Uint8Array): boolean;
       merge_patch_bytes(bytes: Uint8Array): boolean;

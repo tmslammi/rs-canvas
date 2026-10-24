@@ -2,7 +2,9 @@
 //!
 //! Implements ADR-0002's merge-ready model: a pure `reconcile(local, remote)`
 //! with documented last-writer-wins rules that a CRDT can later replace
-//! without touching the document model.
+//! without touching the document model. Snapshots and patches share the same
+//! element policy ([`merge_elements`]); a snapshot is only a complete set of
+//! elements, not an authoritative statement that absent elements were deleted.
 //!
 //! Rules:
 //! - The result is the union of element IDs; absence is *not* deletion —
@@ -11,32 +13,139 @@
 //!   `versionNonce` wins; still tied, the lexicographically smaller JSON wins
 //!   (a symmetric tiebreak so every peer converges on the same element).
 //! - Collided order keys are regenerated deterministically from the sorted
-//!   (index, id) order, so peers converge on the same z-order.
+//!   (index, id) order, so peers converge on the same z-order. Patches run
+//!   the same pass, so a collision resolves identically whichever path
+//!   carried the elements.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 use crate::index;
-use crate::model::{Document, Element};
+use crate::model::{Document, Element, ElementId};
+
+/// One element changed by a merge, with the copy it replaced on the receiver.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ElementChange {
+    pub before: Option<Element>,
+    pub after: Element,
+}
+
+/// The result of merging incoming elements into a document.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MergeOutcome {
+    /// Stored elements that changed, with the receiver's previous copy.
+    pub changed: Vec<ElementChange>,
+    /// Incoming copies that lost to a stored copy, as the stored winner.
+    /// A sender applies these to catch up instead of overwriting the winner.
+    pub corrections: Vec<Element>,
+    /// Incoming IDs whose copy is the stored winner.
+    pub accepted: Vec<ElementId>,
+}
+
+/// The result of reconciling a complete remote snapshot into a local document.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ReconcileOutcome {
+    pub document: Document,
+    /// Stored elements that changed, with the local previous copy.
+    pub changed: Vec<ElementChange>,
+    /// Elements the snapshot uploader must apply to match the merged document:
+    /// stored live elements it omitted, or stored winners where its copy lost.
+    pub corrections: Vec<Element>,
+    /// Incoming IDs whose copy is the stored winner.
+    pub accepted: Vec<ElementId>,
+}
 
 /// Merge two documents into one deterministic result.
 pub fn reconcile(local: &Document, remote: &Document) -> Document {
-    let mut out = Document::new();
-    let ids: BTreeSet<&String> = local
-        .elements
-        .keys()
-        .chain(remote.elements.keys())
-        .collect();
-    for id in ids {
-        let element = match (local.elements.get(id), remote.elements.get(id)) {
-            (Some(l), Some(r)) => pick_winner(l, r),
-            (Some(l), None) => l.clone(),
-            (None, Some(r)) => r.clone(),
-            (None, None) => unreachable!("id collected from one of the two documents"),
-        };
-        out.elements.insert(id.clone(), element);
+    reconcile_document(local, remote).document
+}
+
+/// Merge a complete remote snapshot and report what the receiver changed and
+/// what the remote side still needs. Absence in `remote` never deletes.
+pub fn reconcile_document(local: &Document, remote: &Document) -> ReconcileOutcome {
+    let mut document = local.clone();
+    let merged = merge_elements(&mut document, remote.elements.values());
+    let mut corrections = Vec::new();
+    for (id, stored) in &document.elements {
+        match remote.elements.get(id) {
+            Some(uploaded) if uploaded == stored => {}
+            Some(_) => corrections.push(stored.clone()),
+            // A page does not need a tombstone it never had; a live element
+            // the page omitted is a re-download, not a deletion.
+            None if !stored.is_deleted => corrections.push(stored.clone()),
+            None => {}
+        }
     }
-    dedupe_indices(&mut out);
-    out
+    ReconcileOutcome {
+        document,
+        changed: merged.changed,
+        corrections,
+        accepted: merged.accepted,
+    }
+}
+
+/// Merge incoming full elements (patch or snapshot members) into `doc` by the
+/// same last-writer-wins and index-collision rules. This is the one policy
+/// seam both wire paths use.
+pub fn merge_elements<'a>(
+    doc: &mut Document,
+    incoming: impl IntoIterator<Item = &'a Element>,
+) -> MergeOutcome {
+    let incoming: Vec<&Element> = incoming.into_iter().collect();
+    // Capture the receiver's copy before any change so the outcome can carry
+    // before/after pairs for change reporting.
+    let mut before: BTreeMap<ElementId, Option<Element>> = BTreeMap::new();
+    for element in &incoming {
+        before
+            .entry(element.id.clone())
+            .or_insert_with(|| doc.elements.get(&element.id).cloned());
+    }
+    for element in &incoming {
+        match doc.elements.get(&element.id) {
+            Some(current) => {
+                let winner = pick_winner(current, element);
+                if winner != *current {
+                    doc.elements.insert(element.id.clone(), winner);
+                }
+            }
+            None => {
+                doc.elements.insert(element.id.clone(), (*element).clone());
+            }
+        }
+    }
+    dedupe_indices(doc, &mut before);
+
+    let mut changed = Vec::new();
+    for (id, previous) in &before {
+        if let Some(after) = doc.elements.get(id) {
+            if Some(after) != previous.as_ref() {
+                changed.push(ElementChange {
+                    before: previous.clone(),
+                    after: after.clone(),
+                });
+            }
+        }
+    }
+
+    // A repeated id is decided by its last incoming copy, matching
+    // `Patch::from_deltas` and wire decode order.
+    let mut final_incoming: BTreeMap<&str, &Element> = BTreeMap::new();
+    for element in &incoming {
+        final_incoming.insert(element.id.as_str(), element);
+    }
+    let mut accepted = Vec::new();
+    let mut corrections = Vec::new();
+    for (id, element) in final_incoming {
+        match doc.elements.get(id) {
+            Some(stored) if stored == element => accepted.push(id.to_string()),
+            Some(stored) => corrections.push(stored.clone()),
+            None => {}
+        }
+    }
+    MergeOutcome {
+        changed,
+        corrections,
+        accepted,
+    }
 }
 
 /// Pick the winning side for an element present in both documents.
@@ -65,8 +174,9 @@ pub fn pick_winner(a: &Element, b: &Element) -> Element {
 }
 
 /// Regenerate order keys that collided, deterministically from sorted
-/// (index, id) order.
-fn dedupe_indices(doc: &mut Document) {
+/// (index, id) order. Local-only elements touched by the pass are recorded in
+/// `before` so the caller reports them as changed too.
+fn dedupe_indices(doc: &mut Document, before: &mut BTreeMap<ElementId, Option<Element>>) {
     let mut ordered: Vec<(String, String)> = doc
         .elements
         .values()
@@ -87,6 +197,9 @@ fn dedupe_indices(doc: &mut Document) {
             for (_, id) in ordered.iter().take(j).skip(i + 1) {
                 let regenerated = index::key_between(Some(&last), next.as_deref())
                     .expect("index space exhausted while resolving collisions");
+                before
+                    .entry(id.clone())
+                    .or_insert_with(|| doc.elements.get(id).cloned());
                 if let Some(element) = doc.elements.get_mut(id) {
                     element.index = regenerated.clone();
                 }
@@ -100,6 +213,8 @@ fn dedupe_indices(doc: &mut Document) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
     use crate::geometry::Rect;
     use crate::model::{ElementKind, ShapeKind, Style};
 
@@ -292,5 +407,90 @@ mod tests {
             let merged: BTreeSet<&String> = ab.elements.keys().collect();
             assert_eq!(union, merged, "merge keeps the id union");
         }
+    }
+
+    #[test]
+    fn reconcile_reports_missing_live_elements_as_corrections() {
+        let mut local = Document::new();
+        local.insert(element("kept", "a0", 4, 1, 0.0));
+        let mut remote = Document::new();
+        remote.insert(element("new", "a1", 1, 1, 5.0));
+
+        let outcome = reconcile_document(&local, &remote);
+        assert!(outcome.document.elements.contains_key("kept"));
+        assert!(outcome.document.elements.contains_key("new"));
+        assert_eq!(
+            outcome
+                .corrections
+                .iter()
+                .map(|element| element.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["kept"],
+            "an omitted live element is re-downloaded, never deleted"
+        );
+        assert_eq!(outcome.accepted, vec!["new".to_string()]);
+    }
+
+    #[test]
+    fn reconcile_reports_a_stale_upload_as_a_correction() {
+        let mut local = Document::new();
+        local.insert(element("one", "a0", 5, 1, 10.0));
+        let mut remote = Document::new();
+        remote.insert(element("one", "a0", 2, 1, 0.0));
+
+        let outcome = reconcile_document(&local, &remote);
+        assert_eq!(outcome.document.element("one").unwrap().version, 5);
+        assert_eq!(outcome.corrections.len(), 1);
+        assert_eq!(outcome.corrections[0].version, 5);
+        assert_eq!(outcome.accepted, Vec::<String>::new());
+        assert!(outcome.changed.is_empty(), "the receiver was not changed");
+    }
+
+    #[test]
+    fn snapshot_and_patch_paths_resolve_index_collisions_identically() {
+        let first = element("aaa", "a0", 1, 1, 0.0);
+        let second = element("bbb", "a0", 1, 1, 5.0);
+
+        let mut remote = Document::new();
+        remote.insert(first.clone());
+        remote.insert(second.clone());
+        let snapshot = reconcile(&Document::new(), &remote);
+
+        let mut patched = Document::new();
+        merge_elements(&mut patched, [&first]);
+        merge_elements(&mut patched, [&second]);
+
+        assert_eq!(patched, snapshot);
+        assert_ne!(
+            patched.element("aaa").unwrap().index,
+            patched.element("bbb").unwrap().index
+        );
+    }
+
+    #[test]
+    fn merge_reports_accepted_lost_and_reindexed_incoming_elements() {
+        let mut doc = Document::new();
+        doc.insert(element("one", "a0", 5, 1, 10.0));
+        doc.insert(element("two", "a1", 1, 1, 20.0));
+
+        let mut stale = element("one", "a0", 2, 1, 0.0);
+        stale.version = 2;
+        let mut colliding = element("three", "a1", 1, 1, 30.0);
+        colliding.version = 1;
+
+        let outcome = merge_elements(&mut doc, [&stale, &colliding]);
+        assert_eq!(outcome.accepted, vec!["three".to_string()]);
+        assert_eq!(outcome.corrections.len(), 1);
+        assert_eq!(outcome.corrections[0].id, "one");
+        assert_eq!(outcome.corrections[0].version, 5);
+        // The new element collided with `two`; both paths keep distinct keys.
+        assert_ne!(
+            doc.element("two").unwrap().index,
+            doc.element("three").unwrap().index
+        );
+        assert!(outcome
+            .changed
+            .iter()
+            .any(|change| change.after.id == "three"));
     }
 }

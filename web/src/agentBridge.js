@@ -108,6 +108,11 @@ export function connectAgentBridge(editor, hooks = {}) {
   };
 
   const handle = (message) => {
+    // JSON document frames carry the server revision; wasm echoes it as the
+    // base revision of its next snapshot. Binary frames update it themselves.
+    if (Number.isSafeInteger(message.rev) && message.rev >= 0) {
+      editor.set_wire_revision(message.rev);
+    }
     if (message.type === "workspace_changed") {
       void hooks.onWorkspaceChange?.(message);
       return;

@@ -16,7 +16,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use canvas_core::model::{Document, Element, ElementKind, Style};
+use canvas_core::model::{Document, Element, ElementId, ElementKind, Style};
+use canvas_core::sync::PageFrame;
 use canvas_core::{serialization, Delta};
 use tokio::sync::{broadcast, Mutex, Notify};
 
@@ -377,42 +378,23 @@ pub struct ViewHint {
     pub selection: Vec<String>,
 }
 
-/// Per-connection sync state for one page: remembers the last snapshot the
-/// page sent, so elements it removes without a tombstone (undo purges them)
-/// become real deletions on the wire instead of resurrecting from the mirror.
-#[derive(Default)]
-pub struct PageSync {
-    last: Option<Document>,
+/// What applying one page frame did to the mirror.
+#[derive(Clone, Debug, Default)]
+pub struct PageFrameOutcome {
+    /// The mirror changed.
+    pub changed: bool,
+    /// The mirror's revision after the frame.
+    pub revision: u64,
+    /// The page's base revision for snapshots; `None` for patches.
+    pub base_revision: Option<u64>,
+    /// Elements the page must apply to match the merged mirror: live elements
+    /// its snapshot omitted, or winners its stale copies lost to.
+    pub corrections: Vec<Element>,
+    /// Incoming IDs whose copy won the merge.
+    pub accepted: Vec<ElementId>,
 }
 
-impl PageSync {
-    /// Fold tombstones for disappeared elements into `incoming` (the page's
-    /// snapshot about to be absorbed). Returns how many were synthesized.
-    pub fn prepare(&self, incoming: &mut Document, now_ms: u64) -> usize {
-        let Some(previous) = &self.last else {
-            return 0;
-        };
-        let mut synthesized = 0;
-        for (id, element) in &previous.elements {
-            if element.is_deleted || incoming.elements.contains_key(id) {
-                continue;
-            }
-            let mut tombstone = element.clone();
-            tombstone.is_deleted = true;
-            tombstone.touch(now_ms);
-            incoming.elements.insert(id.clone(), tombstone);
-            synthesized += 1;
-        }
-        synthesized
-    }
-
-    /// Remember the page's document as it actually is (before synthesis), so
-    /// the next disappearance is detectable and tombstones don't pile up.
-    pub fn commit(&mut self, page_document: Document) {
-        self.last = Some(page_document);
-    }
-}
-
+#[cfg(test)]
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -726,126 +708,138 @@ impl Workspace {
             .send(PageMessage::document(json, binary, except));
     }
 
-    /// Merge an already-parsed page document into the mirror. Returns whether
-    /// the mirror changed. Connect-time path: the merged result is broadcast
-    /// as a full snapshot, because the page may be missing server-side edits.
-    /// `origin` excludes the uploading page from that broadcast: it already
-    /// holds the state it just sent.
-    pub async fn absorb_document(&self, remote: &Document, origin: Option<u64>) -> bool {
+    /// Merge an already-parsed page snapshot into the mirror. The page's
+    /// `base_revision` is recorded and returned; element-level LWW still
+    /// decides the merge. Absence never deletes: only explicit tombstones in
+    /// the snapshot do. The outcome names every winner the upload lost and
+    /// every live server element it omitted, so the caller can correct the
+    /// page instead of guessing from a previous snapshot.
+    pub async fn absorb_document(
+        &self,
+        remote: &Document,
+        base_revision: u64,
+        origin: Option<u64>,
+    ) -> PageFrameOutcome {
         let mut doc = self.doc.lock().await;
-        let before = doc.clone();
-        let merged = canvas_core::merge::reconcile(&doc, remote);
-        if merged == *doc {
-            return false;
-        }
-        *doc = merged;
-        let (revision, _) = self.record_change(&before, &doc, "page").await;
+        let result = canvas_core::merge::reconcile_document(&doc, remote);
+        let changed = !result.changed.is_empty();
+        let (revision, winners) = if changed {
+            let (revision, winners) = self.record_change(&doc, &result.document, "page").await;
+            *doc = result.document;
+            (revision, winners)
+        } else {
+            (self.revision.load(Ordering::SeqCst), Vec::new())
+        };
+        let corrections = result.corrections;
+        let accepted = result.accepted;
         drop(doc);
-        self.broadcast_snapshot_except(revision, origin).await;
-        true
+        self.broadcast_merge(revision, &winners, &corrections, origin)
+            .await;
+        if changed {
+            self.schedule_persist().await;
+        }
+        PageFrameOutcome {
+            changed,
+            revision,
+            base_revision: Some(base_revision),
+            corrections,
+            accepted,
+        }
     }
 
     /// Merge a page patch into the mirror. Changed elements broadcast to the
     /// other pages; elements whose copy lost to a newer mirror version come
     /// back to the origin as corrections, so a concurrent agent edit cannot
-    /// leave the page stale. Returns whether the mirror changed.
-    pub async fn absorb_patch(&self, put: Vec<Element>, origin: u64) -> bool {
-        let mut changes: Vec<ChangedElement> = Vec::new();
-        let mut corrections: Vec<Element> = Vec::new();
-        {
+    /// leave the page stale. Returns the same outcome shape as a snapshot.
+    async fn absorb_patch_outcome(&self, put: Vec<Element>, origin: u64) -> PageFrameOutcome {
+        let canvas_core::merge::MergeOutcome {
+            changed,
+            corrections,
+            accepted,
+        } = {
             let mut doc = self.doc.lock().await;
-            for element in &put {
-                // Capture the mirror's copy before merge_element mutates it,
-                // so the diff describes this patch rather than last-write-wins.
-                let before = doc.element(&element.id).cloned();
-                if canvas_core::merge_element(&mut doc, element) {
-                    changes.push(ChangedElement {
-                        id: element.id.clone(),
-                        kinds: classify_change(before.as_ref(), doc.element(&element.id)),
-                    });
-                } else if let Some(stored) = doc.elements.get(&element.id) {
-                    if stored != element && !corrections.iter().any(|e| e.id == element.id) {
-                        corrections.push(stored.clone());
-                    }
-                }
-            }
-        }
-        if changes.is_empty() && corrections.is_empty() {
-            return false;
-        }
-
-        let changed_ids: Vec<String> = changes.iter().map(|change| change.id.clone()).collect();
-        let revision = if changes.is_empty() {
-            self.revision.load(Ordering::SeqCst)
-        } else {
+            canvas_core::merge::merge_elements(&mut doc, &put)
+        };
+        let changes: Vec<ChangedElement> = changed
+            .iter()
+            .map(|change| ChangedElement {
+                id: change.after.id.clone(),
+                kinds: classify_change(change.before.as_ref(), Some(&change.after)),
+            })
+            .collect();
+        let winners: Vec<Element> = changed.into_iter().map(|change| change.after).collect();
+        let changed = !changes.is_empty();
+        let revision = if changed {
             self.record_ids(changes, "page").await
-        };
-        let winners: Vec<Element> = {
-            let doc = self.doc.lock().await;
-            changed_ids
-                .iter()
-                .filter_map(|id| doc.element(id).cloned())
-                .collect()
-        };
-
-        if changed_ids.is_empty() {
-            // Nothing moved in the mirror; only the origin needs the truth.
-            self.broadcast_patch(revision, &corrections, None).await;
-        } else if corrections.is_empty() {
-            // Normal case: the origin already holds these changes.
-            self.broadcast_patch(revision, &winners, Some(origin)).await;
         } else {
-            // The page's copy lost to a concurrent edit; converge everyone.
-            let mut all = winners;
-            all.extend(corrections);
-            self.broadcast_patch(revision, &all, None).await;
-        }
-        if !changed_ids.is_empty() {
+            self.revision.load(Ordering::SeqCst)
+        };
+        self.broadcast_merge(revision, &winners, &corrections, Some(origin))
+            .await;
+        if changed {
             self.schedule_persist().await;
         }
-        !changed_ids.is_empty()
+        PageFrameOutcome {
+            changed,
+            revision,
+            base_revision: None,
+            corrections,
+            accepted,
+        }
+    }
+
+    /// Apply one decoded page frame, whether it came from a binary or JSON
+    /// frame. This is the WebSocket-free seam: connection code only decodes
+    /// transport bytes, and tests can drive the same sequence directly.
+    pub async fn apply_page_frame(&self, origin: u64, frame: PageFrame) -> PageFrameOutcome {
+        let outcome = match frame {
+            PageFrame::Snapshot { base_revision, doc } => {
+                self.absorb_document(&doc, base_revision, Some(origin))
+                    .await
+            }
+            PageFrame::Patch { put } => self.absorb_patch_outcome(put, origin).await,
+        };
+        tracing::debug!(
+            changed = outcome.changed,
+            revision = outcome.revision,
+            base_revision = outcome.base_revision,
+            corrections = outcome.corrections.len(),
+            accepted = outcome.accepted.len(),
+            "applied page frame"
+        );
+        outcome
+    }
+
+    /// Broadcast merge winners and/or corrections. The origin is skipped when
+    /// it already holds every winner; corrections always reach it.
+    async fn broadcast_merge(
+        &self,
+        revision: u64,
+        winners: &[Element],
+        corrections: &[Element],
+        origin: Option<u64>,
+    ) {
+        if winners.is_empty() && corrections.is_empty() {
+            return;
+        }
+        if winners.is_empty() {
+            self.broadcast_patch(revision, corrections, None).await;
+        } else if corrections.is_empty() {
+            self.broadcast_patch(revision, winners, origin).await;
+        } else {
+            let mut all = winners.to_vec();
+            for correction in corrections {
+                if !all.iter().any(|element| element.id == correction.id) {
+                    all.push(correction.clone());
+                }
+            }
+            self.broadcast_patch(revision, &all, None).await;
+        }
     }
 
     /// Broadcast an agent-side edit as a patch and queue the persist.
     pub async fn publish_patch(&self, revision: u64, put: Vec<Element>) {
         self.broadcast_patch(revision, &put, None).await;
-        self.schedule_persist().await;
-    }
-
-    /// Broadcast the whole mirror to every page but `except` (the uploader
-    /// already holds what it sent) and queue the persist.
-    pub async fn broadcast_snapshot_except(&self, revision: u64, except: Option<u64>) {
-        // Hold the gate through encoding and send: a page joining meanwhile
-        // must be counted before we decide to skip the JSON encoding. The
-        // document lock is acquired after the gate everywhere, never before.
-        let _gate = self.wire_gate.lock().await;
-        let pages = self.pages.load(Ordering::SeqCst);
-        if pages > 0 {
-            let binary_pages = self.binary_pages();
-            let doc = self.doc.lock().await;
-            let json = (binary_pages < pages).then(|| {
-                #[derive(serde::Serialize)]
-                struct Snapshot<'a> {
-                    #[serde(rename = "type")]
-                    kind: &'static str,
-                    rev: u64,
-                    doc: &'a Document,
-                }
-                serde_json::to_string(&Snapshot {
-                    kind: "snapshot",
-                    rev: revision,
-                    doc: &doc,
-                })
-                .unwrap_or_default()
-            });
-            let binary = (binary_pages > 0)
-                .then(|| canvas_core::wire::encode_snapshot(revision, &doc).ok())
-                .flatten();
-            drop(doc);
-            let _ = self
-                .to_pages
-                .send(PageMessage::document(json, binary, except));
-        }
         self.schedule_persist().await;
     }
 
@@ -1548,6 +1542,31 @@ mod tests {
         Element::new(shape_at(x), index.into(), 1).with_id(id)
     }
 
+    fn versioned_shape(id: &str, index: &str, x: f64, version: u64) -> Element {
+        let mut element = shape_element(id, index, x);
+        element.version = version;
+        element.version_nonce = 1;
+        element
+    }
+
+    fn snapshot(base_revision: u64, elements: impl IntoIterator<Item = Element>) -> PageFrame {
+        let mut doc = Document::new();
+        for element in elements {
+            doc.insert(element);
+        }
+        PageFrame::Snapshot { base_revision, doc }
+    }
+
+    fn patch(put: Vec<Element>) -> PageFrame {
+        PageFrame::Patch { put }
+    }
+
+    fn patch_put(message: PageMessage) -> Vec<Element> {
+        let frame: serde_json::Value =
+            serde_json::from_str(message.json.as_deref().unwrap_or_default()).unwrap();
+        serde_json::from_value(frame["put"].clone()).unwrap()
+    }
+
     fn text_kind(text: &str, x: f64) -> ElementKind {
         ElementKind::Text {
             rect: canvas_core::geometry::Rect::new(x, 0.0, 100.0, 20.0),
@@ -1786,7 +1805,12 @@ mod tests {
         let mut beta_pages = beta.to_pages.subscribe();
 
         let element = Element::new(shape_at(0.0), "a0".into(), 1).with_id("one");
-        assert!(alpha.absorb_patch(vec![element], 7).await);
+        assert!(
+            alpha
+                .apply_page_frame(7, patch(vec![element]))
+                .await
+                .changed
+        );
 
         assert_eq!(alpha.doc.lock().await.live_count(), 1);
         assert_eq!(beta.doc.lock().await.live_count(), 0);
@@ -2032,7 +2056,11 @@ mod tests {
         let mut from_server = ws.to_pages.subscribe();
         let element = Element::new(shape_at(0.0), "a0".into(), 1).with_id("one");
 
-        assert!(ws.absorb_patch(vec![element.clone()], 7).await);
+        assert!(
+            ws.apply_page_frame(7, patch(vec![element.clone()]))
+                .await
+                .changed
+        );
         let message = from_server.recv().await.unwrap();
         assert_eq!(message.except, Some(7), "the origin page is skipped");
         let frame: serde_json::Value = serde_json::from_str(&message.json.unwrap()).unwrap();
@@ -2041,7 +2069,7 @@ mod tests {
         assert_eq!(ws.revision.load(Ordering::SeqCst), 1);
 
         assert!(
-            !ws.absorb_patch(vec![element], 7).await,
+            !ws.apply_page_frame(7, patch(vec![element])).await.changed,
             "replaying a patch is a no-op"
         );
         assert_eq!(ws.revision.load(Ordering::SeqCst), 1);
@@ -2054,11 +2082,11 @@ mod tests {
         ws.pages.store(1, Ordering::SeqCst);
         let mut newer = Element::new(shape_at(5.0), "a0".into(), 1).with_id("one");
         newer.version = 4;
-        ws.absorb_patch(vec![newer], 1).await;
+        ws.apply_page_frame(1, patch(vec![newer])).await;
 
         let mut from_server = ws.to_pages.subscribe();
         let older = Element::new(shape_at(0.0), "a0".into(), 1).with_id("one");
-        assert!(!ws.absorb_patch(vec![older], 1).await);
+        assert!(!ws.apply_page_frame(1, patch(vec![older])).await.changed);
         assert_eq!(
             ws.doc.lock().await.element("one").unwrap().kind,
             shape_at(5.0)
@@ -2093,7 +2121,11 @@ mod tests {
         let mut from_server = ws.to_pages.subscribe();
         let element = Element::new(shape_at(0.0), "a0".into(), 1).with_id("one");
 
-        assert!(ws.absorb_patch(vec![element.clone()], 9).await);
+        assert!(
+            ws.apply_page_frame(9, patch(vec![element.clone()]))
+                .await
+                .changed
+        );
         let message = from_server.recv().await.unwrap();
         assert!(
             message.json.is_none(),
@@ -2113,7 +2145,7 @@ mod tests {
         let mut from_server = ws.to_pages.subscribe();
         let element = Element::new(shape_at(0.0), "a0".into(), 1).with_id("one");
 
-        assert!(ws.absorb_patch(vec![element], 9).await);
+        assert!(ws.apply_page_frame(9, patch(vec![element])).await.changed);
         let message = from_server.recv().await.unwrap();
         assert!(
             message.binary.is_none(),
@@ -2132,7 +2164,7 @@ mod tests {
         let mut from_server = ws.to_pages.subscribe();
         let element = Element::new(shape_at(0.0), "a0".into(), 1).with_id("one");
 
-        assert!(ws.absorb_patch(vec![element], 9).await);
+        assert!(ws.apply_page_frame(9, patch(vec![element])).await.changed);
         let message = from_server.recv().await.unwrap();
         assert!(message.json.is_some(), "the legacy page needs JSON");
         assert!(message.binary.is_some(), "the binary page needs bytes");
@@ -2140,26 +2172,6 @@ mod tests {
         assert_eq!(frame["type"], "patch");
         let (_, put) = canvas_core::wire::decode_patch(&message.binary.unwrap()).unwrap();
         assert_eq!(put.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn binary_snapshot_broadcasts_carry_the_document_envelope_only() {
-        let state = AppState::new(PathBuf::from("."), None, true);
-        let ws = state.workspace(DEFAULT_WORKSPACE).await;
-        add_shape(&mut *ws.doc.lock().await, 3.0, 1);
-        ws.pages.store(1, Ordering::SeqCst);
-        let _binary = ws.promote_binary_page();
-        let mut from_server = ws.to_pages.subscribe();
-
-        ws.broadcast_snapshot_except(42, None).await;
-        let message = from_server.recv().await.unwrap();
-        assert!(
-            message.json.is_none(),
-            "a binary-only page mix must not pay the JSON snapshot encoding"
-        );
-        let (revision, doc) = canvas_core::wire::decode_snapshot(&message.binary.unwrap()).unwrap();
-        assert_eq!(revision, 42);
-        assert_eq!(doc.live_count(), 1);
     }
 
     #[tokio::test]
@@ -2348,7 +2360,12 @@ mod tests {
         let workspace = state.workspace(DEFAULT_WORKSPACE).await;
         let element = shape_element("one", "a0", 0.0);
 
-        assert!(workspace.absorb_patch(vec![element.clone()], 1).await);
+        assert!(
+            workspace
+                .apply_page_frame(1, patch(vec![element.clone()]))
+                .await
+                .changed
+        );
         let record = workspace.changes_since(0).await.pop().unwrap();
         assert_eq!(kinds_of(&record.changed, "one"), vec![ChangeKind::Added]);
 
@@ -2358,7 +2375,12 @@ mod tests {
             rect.x += 50.0;
             style.stroke_width = 5.0;
         }
-        assert!(workspace.absorb_patch(vec![moved.clone()], 1).await);
+        assert!(
+            workspace
+                .apply_page_frame(1, patch(vec![moved.clone()]))
+                .await
+                .changed
+        );
         let record = workspace.changes_since(1).await.pop().unwrap();
         assert_eq!(
             kinds_of(&record.changed, "one"),
@@ -2369,7 +2391,12 @@ mod tests {
         tombstone.version = 3;
         tombstone.is_deleted = true;
         tombstone.touch(3);
-        assert!(workspace.absorb_patch(vec![tombstone], 1).await);
+        assert!(
+            workspace
+                .apply_page_frame(1, patch(vec![tombstone]))
+                .await
+                .changed
+        );
         let record = workspace.changes_since(2).await.pop().unwrap();
         assert_eq!(kinds_of(&record.changed, "one"), vec![ChangeKind::Removed]);
     }
@@ -2424,50 +2451,180 @@ mod tests {
         );
     }
 
-    #[test]
-    fn page_sync_tombstones_elements_the_page_purged() {
-        let mut first = Document::new();
-        let id = first.add(shape_at(0.0), 1);
-        let mut sync = PageSync::default();
-        sync.commit(first.clone());
+    #[tokio::test]
+    async fn a_stale_reconnect_cannot_overwrite_a_newer_mirror_element() {
+        let state = AppState::new(PathBuf::from("."), None, true);
+        let ws = state.workspace(DEFAULT_WORKSPACE).await;
+        ws.pages.store(1, Ordering::SeqCst);
+        let mut messages = ws.to_pages.subscribe();
 
-        // Undo of a creation purges the entry: it is absent, not tombstoned.
-        let mut second = Document::new();
-        assert_eq!(sync.prepare(&mut second, 2), 1);
-        let tombstone = second.element(&id).expect("synthesized tombstone");
-        assert!(tombstone.is_deleted);
-        assert!(tombstone.version > first.element(&id).unwrap().version);
+        let newer = versioned_shape("one", "a0", 50.0, 5);
+        ws.apply_page_frame(1, patch(vec![newer.clone()])).await;
+        let _ = messages.recv().await.unwrap(); // the origin patch broadcast
 
-        // Once committed, the base forgets it: no repeated tombstones.
-        sync.commit(second);
-        let mut third = Document::new();
-        assert_eq!(sync.prepare(&mut third, 3), 0);
-        assert!(third.element(&id).is_none());
+        let stale = versioned_shape("one", "a0", 0.0, 2);
+        let outcome = ws.apply_page_frame(2, snapshot(1, [stale])).await;
+        assert!(!outcome.changed, "the stale upload lost");
+        assert_eq!(outcome.base_revision, Some(1));
+        assert_eq!(
+            ws.doc.lock().await.element("one").unwrap().version,
+            5,
+            "the newer mirror copy survived"
+        );
+        assert_eq!(outcome.corrections.len(), 1);
+        assert_eq!(outcome.corrections[0].kind, newer.kind);
+
+        let correction = patch_put(messages.recv().await.unwrap());
+        assert_eq!(correction, vec![newer]);
     }
 
-    #[test]
-    fn page_sync_leaves_tombstones_and_new_elements_alone() {
-        let mut previous = Document::new();
-        let kept = previous.add(shape_at(0.0), 1);
-        let mut sync = PageSync::default();
-        sync.commit(previous);
+    #[tokio::test]
+    async fn an_explicit_purge_while_disconnected_cannot_revive() {
+        let state = AppState::new(PathBuf::from("."), None, true);
+        let ws = state.workspace(DEFAULT_WORKSPACE).await;
+        let live = versioned_shape("one", "a0", 0.0, 3);
+        ws.apply_page_frame(1, patch(vec![live.clone()])).await;
 
-        let mut incoming = Document::new();
-        let mut deleted =
-            canvas_core::model::Element::new(shape_at(0.0), "a1".into(), 2).with_id(kept.clone());
-        deleted.is_deleted = true;
-        incoming.insert(deleted);
-        let fresh = incoming.add(shape_at(20.0), 2);
+        // Undo of a creation purges the entry locally; the page ledger keeps
+        // the explicit tombstone and sends it with the reconnect snapshot.
+        let mut tombstone = live.clone();
+        tombstone.is_deleted = true;
+        tombstone.version = 4;
+        let outcome = ws
+            .apply_page_frame(2, snapshot(1, [tombstone.clone()]))
+            .await;
+        assert!(outcome.changed, "the explicit ledger record deletes");
+        assert!(outcome.corrections.is_empty());
+        assert!(ws.doc.lock().await.element("one").unwrap().is_deleted);
 
-        assert_eq!(sync.prepare(&mut incoming, 3), 0);
-        assert!(incoming.element(&kept).unwrap().is_deleted);
-        assert!(incoming.element(&fresh).is_some());
+        // A later reconnect that only carries the old live copy cannot revive
+        // the element: absence is irrelevant and the tombstone wins by LWW.
+        let outcome = ws
+            .apply_page_frame(2, snapshot(outcome.revision, [live]))
+            .await;
+        assert!(!outcome.changed);
+        assert_eq!(outcome.corrections, vec![tombstone]);
+        assert!(ws.doc.lock().await.element("one").unwrap().is_deleted);
     }
 
-    #[test]
-    fn first_page_snapshot_never_tombstones() {
-        let mut incoming = Document::new();
-        incoming.add(shape_at(0.0), 1);
-        assert_eq!(PageSync::default().prepare(&mut incoming, 2), 0);
+    #[tokio::test]
+    async fn absence_without_a_ledger_record_is_not_a_deletion() {
+        let state = AppState::new(PathBuf::from("."), None, true);
+        let ws = state.workspace(DEFAULT_WORKSPACE).await;
+        let live = versioned_shape("one", "a0", 0.0, 2);
+        ws.apply_page_frame(1, patch(vec![live.clone()])).await;
+        let revision = ws.revision.load(Ordering::SeqCst);
+
+        let outcome = ws.apply_page_frame(2, snapshot(revision, [])).await;
+        assert!(!outcome.changed, "absence alone must not delete");
+        assert_eq!(ws.doc.lock().await.element("one"), Some(&live));
+        assert_eq!(
+            outcome.corrections,
+            vec![live],
+            "the omitted live element is sent back, not removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_and_patch_paths_resolve_index_collisions_identically() {
+        let state = AppState::new(PathBuf::from("."), None, true);
+        let via_snapshot = state.workspace("snapshot").await;
+        let via_patch = state.workspace("patch").await;
+        let first = versioned_shape("aaa", "a0", 0.0, 1);
+        let second = versioned_shape("bbb", "a0", 5.0, 1);
+
+        via_snapshot
+            .apply_page_frame(1, snapshot(0, [first.clone(), second.clone()]))
+            .await;
+        via_patch.apply_page_frame(1, patch(vec![first])).await;
+        via_patch.apply_page_frame(1, patch(vec![second])).await;
+
+        assert_eq!(
+            *via_snapshot.doc.lock().await,
+            *via_patch.doc.lock().await,
+            "one collision policy for snapshots and patches"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_page_frame_drives_connect_upload_edit_and_reconnect() {
+        let state = AppState::new(PathBuf::from("."), None, true);
+        let ws = state.workspace(DEFAULT_WORKSPACE).await;
+
+        // Connect with an empty page, then upload its first element.
+        let mut page = Document::new();
+        let id = page.add(shape_at(0.0), 1);
+        let connected = ws
+            .apply_page_frame(
+                10,
+                PageFrame::Snapshot {
+                    base_revision: 0,
+                    doc: page.clone(),
+                },
+            )
+            .await;
+        assert!(connected.changed);
+        assert_eq!(connected.revision, 1);
+        assert_eq!(connected.accepted, vec![id.clone()]);
+
+        // A local drag reaches the mirror as a patch.
+        let mut moved = page.element(&id).unwrap().clone();
+        if let ElementKind::Shape { rect, .. } = &mut moved.kind {
+            rect.x += 25.0;
+        }
+        moved.touch(2);
+        let edited = ws.apply_page_frame(10, patch(vec![moved.clone()])).await;
+        assert!(edited.changed);
+        assert_eq!(edited.revision, 2);
+        page.insert(moved.clone());
+
+        // While the page is away an agent edits the same element.
+        let mut agent = moved.clone();
+        if let ElementKind::Shape { rect, .. } = &mut agent.kind {
+            rect.x += 50.0;
+        }
+        agent.touch(3);
+        let away = ws.apply_page_frame(99, patch(vec![agent.clone()])).await;
+        assert!(away.changed);
+        assert_eq!(away.revision, 3);
+
+        // Reconnect: the page uploads its stale copy and base revision. The
+        // mirror keeps the agent's newer copy and returns the correction.
+        let reconnected = ws
+            .apply_page_frame(
+                10,
+                PageFrame::Snapshot {
+                    base_revision: 2,
+                    doc: page.clone(),
+                },
+            )
+            .await;
+        assert!(!reconnected.changed);
+        assert_eq!(reconnected.base_revision, Some(2));
+        assert_eq!(reconnected.corrections, vec![agent.clone()]);
+
+        let correction = canvas_core::Patch {
+            put: reconnected.corrections.clone(),
+        };
+        correction.apply_to(&mut page);
+        assert_eq!(*ws.doc.lock().await, page);
+        assert_eq!(
+            ws.revision.load(Ordering::SeqCst),
+            3,
+            "a pure correction does not invent a revision"
+        );
+
+        // A genuinely in-sync reconnect downloads nothing.
+        let in_sync = ws
+            .apply_page_frame(
+                10,
+                PageFrame::Snapshot {
+                    base_revision: 3,
+                    doc: page.clone(),
+                },
+            )
+            .await;
+        assert!(!in_sync.changed);
+        assert!(in_sync.corrections.is_empty());
     }
 }
