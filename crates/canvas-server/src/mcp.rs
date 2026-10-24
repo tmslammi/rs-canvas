@@ -12,8 +12,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
-use canvas_core::geometry::Point;
-use canvas_core::model::Document;
+use canvas_core::camera::Camera;
+use canvas_core::geometry::{Point, Rect};
+use canvas_core::model::{Document, Element, ElementKind, ShapeKind};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
 use rmcp::{schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
@@ -351,6 +352,12 @@ struct ReadArgs {
     /// hundred tokens at any scale. Ignores scope and pagination.
     #[serde(default)]
     summary: bool,
+    /// Read what the user is looking at: the view rect and zoom, selected
+    /// handles, visible elements, elements just outside the view and an
+    /// off-screen summary. Needs a page reporting view state; cannot be
+    /// combined with ids, frame, query, selected or since.
+    #[serde(default)]
+    attention: bool,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -613,6 +620,178 @@ fn kind_list(kinds: &[ChangeKind]) -> String {
         .map(|kind| kind.label())
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// How many visible and nearby element lines an attention read prints.
+const ATTENTION_VISIBLE_CAP: usize = 100;
+const ATTENTION_NEARBY_CAP: usize = 25;
+const ATTENTION_NEARBY_MARGIN: f64 = 0.1;
+
+#[derive(serde::Deserialize)]
+struct HintCamera {
+    x: f64,
+    y: f64,
+    zoom: f64,
+}
+
+#[derive(serde::Deserialize)]
+struct HintViewport {
+    w: f64,
+    h: f64,
+}
+
+/// The camera and viewport from a page hint, or `None` when the hint is
+/// missing, malformed or cannot produce a finite world view.
+fn hint_view(hint: &crate::state::ViewHint) -> Option<(Camera, (f64, f64))> {
+    let camera: HintCamera = serde_json::from_value(hint.camera.clone()?).ok()?;
+    let viewport: HintViewport = serde_json::from_value(hint.viewport.clone()?).ok()?;
+    if !camera.x.is_finite()
+        || !camera.y.is_finite()
+        || !camera.zoom.is_finite()
+        || camera.zoom <= 0.0
+        || !viewport.w.is_finite()
+        || !viewport.h.is_finite()
+        || viewport.w <= 0.0
+        || viewport.h <= 0.0
+    {
+        return None;
+    }
+    let camera = Camera {
+        scroll: Point::new(camera.x, camera.y),
+        zoom: camera.zoom,
+    };
+    Some((camera, (viewport.w, viewport.h)))
+}
+
+fn attention_kind_name(element: &Element) -> &'static str {
+    match &element.kind {
+        ElementKind::Shape { shape, .. } => match shape {
+            ShapeKind::Rectangle => "rect",
+            ShapeKind::Ellipse => "ellipse",
+            ShapeKind::Diamond => "diamond",
+            ShapeKind::Sticky => "sticky",
+        },
+        ElementKind::Freehand { .. } => "stroke",
+        ElementKind::Glyph { .. } => "glyph",
+        ElementKind::Arrow { .. } => "arrow",
+        ElementKind::Text { .. } => "text",
+        ElementKind::StickyStack { .. } => "stack",
+        ElementKind::Frame { .. } => "frame",
+    }
+}
+
+/// The `canvas_read(attention)` report: the user's current world view, the
+/// selected handles, visible and barely-off-screen element lines, and a
+/// summary of everything outside the view. All names go through `ids`.
+fn describe_attention(
+    doc: &Document,
+    hint: &crate::state::ViewHint,
+    live_page: bool,
+    revision: u64,
+    ids: &mut dyn canvas_core::describe::IdMap,
+) -> Option<String> {
+    let (camera, viewport) = hint_view(hint)?;
+    let view = camera.viewport(viewport.0, viewport.1);
+    let margin_x = view.w * ATTENTION_NEARBY_MARGIN;
+    let margin_y = view.h * ATTENTION_NEARBY_MARGIN;
+    let around = Rect::new(
+        view.x - margin_x,
+        view.y - margin_y,
+        view.w + 2.0 * margin_x,
+        view.h + 2.0 * margin_y,
+    );
+
+    let live: Vec<&Element> = doc.ordered_live();
+    let visible: Vec<&Element> = live
+        .iter()
+        .copied()
+        .filter(|element| element.bounds().intersects(&view))
+        .collect();
+    let nearby: Vec<&Element> = live
+        .iter()
+        .copied()
+        .filter(|element| {
+            let bounds = element.bounds();
+            !bounds.intersects(&view) && bounds.intersects(&around)
+        })
+        .collect();
+    let offscreen: Vec<&Element> = live
+        .iter()
+        .copied()
+        .filter(|element| !element.bounds().intersects(&view))
+        .collect();
+
+    let selected: Vec<String> = hint.selection.iter().map(|id| ids.map(id)).collect();
+    let mut text = format!(
+        "revision {revision}\nview {:.0},{:.0} {:.0}x{:.0} zoom={} page={}\n",
+        view.x,
+        view.y,
+        view.w,
+        view.h,
+        camera.zoom,
+        if live_page { "live" } else { "none" }
+    );
+    text.push_str(&format!(
+        "selected {}\n",
+        if selected.is_empty() {
+            "none".to_string()
+        } else {
+            selected.join(" ")
+        }
+    ));
+    text.push_str(&format!(
+        "visible {} showing {}\n",
+        visible.len(),
+        visible.len().min(ATTENTION_VISIBLE_CAP)
+    ));
+    for element in visible.iter().take(ATTENTION_VISIBLE_CAP) {
+        text.push_str(&canvas_core::describe::describe_element_with(
+            doc, element, ids,
+        ));
+        text.push('\n');
+    }
+    text.push_str(&format!(
+        "nearby {} showing {}\n",
+        nearby.len(),
+        nearby.len().min(ATTENTION_NEARBY_CAP)
+    ));
+    for element in nearby.iter().take(ATTENTION_NEARBY_CAP) {
+        text.push_str(&canvas_core::describe::describe_element_with(
+            doc, element, ids,
+        ));
+        text.push('\n');
+    }
+    if offscreen.is_empty() {
+        text.push_str("offscreen 0\n");
+    } else {
+        let bounds = offscreen
+            .iter()
+            .map(|element| element.bounds())
+            .reduce(|acc, rect| acc.union(&rect))
+            .unwrap_or(Rect::ZERO);
+        let mut kinds: std::collections::BTreeMap<&'static str, usize> =
+            std::collections::BTreeMap::new();
+        for element in &offscreen {
+            *kinds.entry(attention_kind_name(element)).or_default() += 1;
+        }
+        let mut top: Vec<(&str, usize)> = kinds.into_iter().collect();
+        top.sort_by_key(|(name, count)| (std::cmp::Reverse(*count), *name));
+        let kinds: Vec<String> = top
+            .into_iter()
+            .take(6)
+            .map(|(name, count)| format!("{name}:{count}"))
+            .collect();
+        text.push_str(&format!(
+            "offscreen {} bounds={:.0},{:.0} {:.0}x{:.0} kinds={}\n",
+            offscreen.len(),
+            bounds.x,
+            bounds.y,
+            bounds.w,
+            bounds.h,
+            kinds.join(" ")
+        ));
+    }
+    Some(text)
 }
 
 #[derive(Clone)]
@@ -886,6 +1065,10 @@ impl CanvasServer {
                        detail adds exact element JSON, including full stroke points. \
                        summary returns whole-document counts by kind, bounds and top fills \
                        in a few hundred tokens at any scale: start there on large boards. \
+                       attention reads what the user is looking at: the view rect and zoom, \
+                       selected handles, visible elements, elements just outside the view \
+                       and an off-screen summary; it needs a page reporting view state and \
+                       cannot be combined with ids, frame, query, selected or since. \
                        This is the primary way to understand the workspace; a screenshot \
                        adds only rendered appearance."
     )]
@@ -896,6 +1079,35 @@ impl CanvasServer {
         let workspace = self.current().await;
         let doc = workspace.doc.lock().await;
         let revision = workspace.revision.load(Ordering::SeqCst);
+        let failure = |message: &str| Ok(CallToolResult::error(vec![ContentBlock::text(message)]));
+        if args.attention {
+            if args.ids.is_some() || args.frame.is_some() || args.query.is_some() || args.selected {
+                return failure(
+                    "attention cannot be combined with ids, frame, query or selected; it reads the current view as a whole",
+                );
+            }
+            if args.since.is_some() {
+                return failure(
+                    "attention cannot be combined with since; read the current view or the change log, not both",
+                );
+            }
+            let hint = workspace.view_hint.lock().await.clone();
+            let live_page = workspace.pages.load(Ordering::SeqCst) > 0;
+            let mut aliases = workspace.aliases.lock().await;
+            let Some(text) = hint.as_ref().and_then(|hint| {
+                describe_attention(&doc, hint, live_page, revision, &mut *aliases)
+            }) else {
+                return failure(
+                    "no_view: no page is reporting view state; connect a page or read without attention",
+                );
+            };
+            *self.observed.lock().await = Some(workspace.context());
+            return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                "{text}\nworkspace {:?} context {:?}",
+                workspace.name,
+                workspace.context()
+            ))]));
+        }
         if args.summary {
             let mut body = canvas_core::bulk::summarize(&doc);
             body["revision"] = serde_json::json!(revision);
@@ -904,7 +1116,6 @@ impl CanvasServer {
                 body.to_string(),
             )]));
         }
-        let failure = |message: &str| Ok(CallToolResult::error(vec![ContentBlock::text(message)]));
         if args.since.is_some()
             && args.context.is_none()
             && self
@@ -2609,6 +2820,220 @@ mod tests {
         assert!(body["bounds"].is_array(), "{summary}");
         assert!(body["revision"].is_u64(), "{summary}");
         assert!(workspace.doc.lock().await.live_count() > 0);
+    }
+
+    fn attention_rect(doc: &mut Document, x: f64, y: f64, w: f64, h: f64) -> String {
+        doc.add(
+            ElementKind::Shape {
+                shape: ShapeKind::Rectangle,
+                rect: Rect::new(x, y, w, h),
+                style: canvas_core::model::Style::default(),
+                bound_text_id: None,
+            },
+            0,
+        )
+    }
+
+    #[tokio::test]
+    async fn canvas_read_attention_reports_the_view_and_nearby_elements() {
+        let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
+        let workspace = state.workspace(crate::state::DEFAULT_WORKSPACE).await;
+        workspace.pages.store(1, Ordering::SeqCst);
+        let (inside, nearby) = {
+            let mut doc = workspace.doc.lock().await;
+            (
+                attention_rect(&mut doc, 20.0, 20.0, 20.0, 20.0),
+                attention_rect(&mut doc, 105.0, 20.0, 10.0, 10.0),
+            )
+        };
+        {
+            let mut doc = workspace.doc.lock().await;
+            attention_rect(&mut doc, 400.0, 400.0, 10.0, 10.0);
+        }
+        *workspace.view_hint.lock().await = Some(crate::state::ViewHint {
+            camera: Some(serde_json::json!({ "x": 0.0, "y": 0.0, "zoom": 1.0 })),
+            viewport: Some(serde_json::json!({ "w": 100.0, "h": 100.0 })),
+            selection: vec![inside.clone()],
+        });
+        let server = CanvasServer::new(state);
+        let text = error_text(
+            &server
+                .canvas_read(Parameters(ReadArgs {
+                    attention: true,
+                    ..Default::default()
+                }))
+                .await
+                .unwrap(),
+        );
+        let (inside_handle, nearby_handle) = {
+            let mut aliases = workspace.aliases.lock().await;
+            (aliases.handle(&inside), aliases.handle(&nearby))
+        };
+        assert!(text.contains("view 0,0 100x100 zoom=1 page=live"), "{text}");
+        assert!(
+            text.contains(&format!("selected {inside_handle}")),
+            "{text}"
+        );
+        assert!(text.contains("visible 1 showing 1"), "{text}");
+        assert!(
+            text.contains(&format!("{inside_handle} rect 20,20 20x20")),
+            "{text}"
+        );
+        assert!(text.contains("nearby 1 showing 1"), "{text}");
+        assert!(
+            text.contains(&format!("{nearby_handle} rect 105,20 10x10")),
+            "{text}"
+        );
+        assert!(
+            text.contains("offscreen 2 bounds=105,20 305x390 kinds=rect:2"),
+            "{text}"
+        );
+        assert!(!text.contains("rect 400,400"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn canvas_read_attention_caps_visible_and_nearby_lines() {
+        let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
+        let workspace = state.workspace(crate::state::DEFAULT_WORKSPACE).await;
+        {
+            let mut doc = workspace.doc.lock().await;
+            for i in 0..101 {
+                attention_rect(&mut doc, (i % 10) as f64, (i / 10) as f64, 1.0, 1.0);
+            }
+            for i in 0..30 {
+                attention_rect(&mut doc, 105.0, i as f64, 1.0, 1.0);
+            }
+        }
+        *workspace.view_hint.lock().await = Some(crate::state::ViewHint {
+            camera: Some(serde_json::json!({ "x": 0.0, "y": 0.0, "zoom": 1.0 })),
+            viewport: Some(serde_json::json!({ "w": 100.0, "h": 100.0 })),
+            selection: Vec::new(),
+        });
+        let server = CanvasServer::new(state);
+        let text = error_text(
+            &server
+                .canvas_read(Parameters(ReadArgs {
+                    attention: true,
+                    ..Default::default()
+                }))
+                .await
+                .unwrap(),
+        );
+        assert!(text.contains("visible 101 showing 100"), "{text}");
+        assert!(text.contains("nearby 30 showing 25"), "{text}");
+        assert_eq!(
+            text.matches("rect 105,").count(),
+            25,
+            "nearby is capped at 25 lines: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn canvas_read_attention_without_a_view_hint_is_a_tool_error() {
+        let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
+        let workspace = state.workspace(crate::state::DEFAULT_WORKSPACE).await;
+        let server = CanvasServer::new(state);
+        let args = ReadArgs {
+            attention: true,
+            ..Default::default()
+        };
+        let missing = server
+            .canvas_read(Parameters(args))
+            .await
+            .expect("a missing hint must not panic");
+        assert_eq!(missing.is_error, Some(true));
+        assert_eq!(
+            error_text(&missing),
+            "no_view: no page is reporting view state; connect a page or read without attention"
+        );
+
+        *workspace.view_hint.lock().await = Some(crate::state::ViewHint {
+            camera: None,
+            viewport: Some(serde_json::json!({ "w": 100.0, "h": 100.0 })),
+            selection: Vec::new(),
+        });
+        let incomplete = server
+            .canvas_read(Parameters(ReadArgs {
+                attention: true,
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert_eq!(incomplete.is_error, Some(true));
+        assert!(
+            error_text(&incomplete).starts_with("no_view:"),
+            "{incomplete:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn canvas_read_attention_rejects_scopes_and_since() {
+        let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
+        let workspace = state.workspace(crate::state::DEFAULT_WORKSPACE).await;
+        *workspace.view_hint.lock().await = Some(crate::state::ViewHint {
+            camera: Some(serde_json::json!({ "x": 0.0, "y": 0.0, "zoom": 1.0 })),
+            viewport: Some(serde_json::json!({ "w": 100.0, "h": 100.0 })),
+            selection: Vec::new(),
+        });
+        let server = CanvasServer::new(state);
+        let attention = || ReadArgs {
+            attention: true,
+            ..Default::default()
+        };
+        let cases = [
+            ReadArgs {
+                ids: Some(vec!["e1".into()]),
+                ..attention()
+            },
+            ReadArgs {
+                frame: Some("e1".into()),
+                ..attention()
+            },
+            ReadArgs {
+                query: Some("api".into()),
+                ..attention()
+            },
+            ReadArgs {
+                selected: true,
+                ..attention()
+            },
+            ReadArgs {
+                since: Some(0),
+                ..attention()
+            },
+        ];
+        for args in cases {
+            let result = server.canvas_read(Parameters(args)).await.unwrap();
+            assert_eq!(result.is_error, Some(true));
+            let text = error_text(&result);
+            assert!(text.contains("attention cannot be combined"), "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn canvas_read_without_attention_has_no_view_section() {
+        let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
+        let workspace = state.workspace(crate::state::DEFAULT_WORKSPACE).await;
+        {
+            let mut doc = workspace.doc.lock().await;
+            attention_rect(&mut doc, 0.0, 0.0, 10.0, 10.0);
+        }
+        *workspace.view_hint.lock().await = Some(crate::state::ViewHint {
+            camera: Some(serde_json::json!({ "x": 0.0, "y": 0.0, "zoom": 1.0 })),
+            viewport: Some(serde_json::json!({ "w": 100.0, "h": 100.0 })),
+            selection: Vec::new(),
+        });
+        let server = CanvasServer::new(state);
+        let text = error_text(
+            &server
+                .canvas_read(Parameters(ReadArgs::default()))
+                .await
+                .unwrap(),
+        );
+        assert!(text.contains("rect 0,0 10x10"), "{text}");
+        for marker in ["view 0,0", "selected", "visible ", "nearby ", "offscreen "] {
+            assert!(!text.contains(marker), "unexpected {marker:?} in {text}");
+        }
     }
 
     #[tokio::test]
