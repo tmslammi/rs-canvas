@@ -7,14 +7,19 @@ pub mod benchmark;
 mod binary;
 pub mod bulk;
 pub mod camera;
+pub mod commands;
 pub mod connector;
 pub mod delta;
 pub mod demo;
 pub mod describe;
 pub mod display;
-pub mod edit;
 pub mod editor;
 pub mod envelope;
+/// Compatibility alias for the pre-commands module name.
+#[doc(hidden)]
+pub mod edit {
+    pub use crate::commands::*;
+}
 pub mod geometry;
 pub mod glyphs;
 pub mod history;
@@ -52,7 +57,7 @@ pub use editor::{
 };
 pub use geometry::{Affine, Point, Rect};
 pub use glyphs::{catalog as glyph_catalog, lookup as glyph_lookup, GlyphCategory, GlyphInfo};
-pub use history::{History, Transaction};
+pub use history::{freshen_element, inverse_for_replay, History, Transaction};
 pub use hit::{
     elements_in_rect, elements_in_rect_indexed, hit_test, hit_test_indexed, hit_test_raw_indexed,
 };

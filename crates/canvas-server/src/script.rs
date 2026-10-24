@@ -7,11 +7,13 @@
 
 use std::collections::HashMap;
 
+use canvas_core::commands::{self, owned_label};
 use canvas_core::geometry::{Point, Rect};
 use canvas_core::model::{
     Binding, Document, ElementId, ElementKind, Endpoint, Routing, Style, TextAlign,
 };
-use canvas_core::{connector, ObstacleIndex};
+use canvas_core::text::ApproxMeasurer;
+use canvas_core::{connector, ObstacleIndex, Transaction};
 use rmcp::schemars;
 
 use crate::doc_ops::{self, DrawRequest};
@@ -172,6 +174,7 @@ impl UpdateBeat {
     fn apply(
         &self,
         doc: &mut Document,
+        tx: &mut Transaction,
         handles: &HashMap<String, ElementId>,
         now: u64,
     ) -> Result<(), String> {
@@ -209,7 +212,7 @@ impl UpdateBeat {
                 ..Default::default()
             }),
         };
-        canvas_core::edit::update_element(doc, &id, &update, now)?;
+        commands::update_element(doc, tx, &id, &update, now, &ApproxMeasurer)?;
         Ok(())
     }
 }
@@ -261,8 +264,14 @@ pub struct ScriptOutcome {
 const DEFAULT_HOLD_MS: u64 = 900;
 
 /// Run `beats` against `doc`; on any failure the document is untouched.
+///
+/// The beats build on a private clone so a failed middle beat cannot leave a
+/// half-built drawing. On success the recorded journal is replayed into the
+/// caller's transaction, which is what makes the edit a normal undoable,
+/// revertible change rather than a second mutation path.
 pub fn execute(
     doc: &mut Document,
+    tx: &mut Transaction,
     beats: &[ScriptBeat],
     now_ms: u64,
 ) -> Result<ScriptOutcome, String> {
@@ -277,6 +286,7 @@ pub fn execute(
     });
 
     let mut working = doc.clone();
+    let mut local = Transaction::begin();
     let mut handles: HashMap<String, ElementId> = HashMap::new();
     let mut created: Vec<(String, ElementId)> = Vec::new();
     let mut steps: Vec<BeatOutcome> = Vec::new();
@@ -314,10 +324,12 @@ pub fn execute(
         }
 
         if let Some(update) = &beat.update {
-            update.apply(&mut working, &handles, now_ms).map_err(fail)?;
+            update
+                .apply(&mut working, &mut local, &handles, now_ms)
+                .map_err(fail)?;
         } else if let Some(connect) = &beat.connect {
             let (id, label_id) =
-                run_connect(&mut working, &handles, connect, now_ms).map_err(fail)?;
+                run_connect(&mut working, &mut local, &handles, connect, now_ms).map_err(fail)?;
             created.push((format!("connect{position}"), id.clone()));
             step.created.push(id);
             if let Some(label_id) = label_id {
@@ -325,8 +337,9 @@ pub fn execute(
             }
         } else if let Some(annotate) = &beat.annotate {
             let target = resolve(&handles, &working, &annotate.target).map_err(fail)?;
-            let ids = crate::verbs::annotate(&mut working, &target, &annotate.mark, now_ms)
-                .map_err(fail)?;
+            let ids =
+                crate::verbs::annotate(&mut working, &mut local, &target, &annotate.mark, now_ms)
+                    .map_err(fail)?;
             for id in ids {
                 step.created.push(id);
             }
@@ -337,21 +350,22 @@ pub fn execute(
                 .map(|reference| resolve(&handles, &working, reference))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(fail)?;
-            crate::verbs::emphasis(&mut working, &targets, &emphasis.mode, now_ms).map_err(fail)?;
+            crate::verbs::emphasis(&mut working, &mut local, &targets, &emphasis.mode, now_ms)
+                .map_err(fail)?;
         } else if let Some(tidy) = &beat.tidy {
             let targets = tidy
                 .iter()
                 .map(|reference| resolve(&handles, &working, reference))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(fail)?;
-            crate::verbs::tidy(&mut working, &targets, now_ms).map_err(fail)?;
+            crate::verbs::tidy(&mut working, &mut local, &targets, now_ms).map_err(fail)?;
         } else if let Some(clear) = &beat.clear {
             let targets = clear
                 .iter()
                 .map(|reference| resolve(&handles, &working, reference))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(fail)?;
-            crate::verbs::clear(&mut working, &targets, now_ms).map_err(fail)?;
+            crate::verbs::clear(&mut working, &mut local, &targets, now_ms).map_err(fail)?;
         } else if let Some(draw) = &beat.draw {
             if let Some(handle) = &draw.handle {
                 if handle.strip_prefix('e').is_some_and(|digits| {
@@ -391,17 +405,19 @@ pub fn execute(
                 request.w = Some(rect.w);
                 request.h = Some(rect.h);
             }
-            let id = doc_ops::draw(&mut working, &request, now_ms).map_err(fail)?;
+            let id = doc_ops::draw(&mut working, &mut local, &request, now_ms).map_err(fail)?;
             if let Some(frame) = &draw.frame {
                 let frame = resolve(&handles, &working, frame).map_err(fail)?;
-                canvas_core::edit::update_element(
+                commands::update_element(
                     &mut working,
+                    &mut local,
                     &id,
-                    &canvas_core::edit::ElementUpdate {
+                    &commands::ElementUpdate {
                         frame: Some(Some(frame)),
                         ..Default::default()
                     },
                     now_ms,
+                    &ApproxMeasurer,
                 )
                 .map_err(fail)?;
             }
@@ -410,14 +426,16 @@ pub fn execute(
                 if let Some(around) = &draw.around {
                     for child in around {
                         let child = resolve(&handles, &working, child).map_err(fail)?;
-                        canvas_core::edit::update_element(
+                        commands::update_element(
                             &mut working,
+                            &mut local,
                             &child,
-                            &canvas_core::edit::ElementUpdate {
+                            &commands::ElementUpdate {
                                 frame: Some(Some(id.clone())),
                                 ..Default::default()
                             },
                             now_ms,
+                            &ApproxMeasurer,
                         )
                         .map_err(fail)?;
                     }
@@ -430,7 +448,7 @@ pub fn execute(
                 created.push((format!("beat{position}"), id.clone()));
             }
             step.created.push(id.clone());
-            if let Some(label_id) = linked_text(&working, &id) {
+            if let Some(label_id) = owned_label(&working, &id) {
                 step.created.push(label_id);
             }
         } else if step.focus.is_none()
@@ -460,7 +478,10 @@ pub fn execute(
     }
 
     let elements = working.live_count();
-    *doc = working;
+    for delta in local.deltas() {
+        tx.push_applied(doc, delta.clone())
+            .map_err(|error| error.to_string())?;
+    }
     Ok(ScriptOutcome {
         created,
         steps,
@@ -469,18 +490,9 @@ pub fn execute(
     })
 }
 
-/// The label/caption element a container links to, if any.
-fn linked_text(doc: &Document, id: &str) -> Option<ElementId> {
-    match &doc.element(id)?.kind {
-        ElementKind::Shape { bound_text_id, .. } => bound_text_id.clone(),
-        ElementKind::Glyph { caption_id, .. } => caption_id.clone(),
-        ElementKind::Arrow { label_id, .. } => label_id.clone(),
-        _ => None,
-    }
-}
-
 fn run_connect(
     doc: &mut Document,
+    tx: &mut Transaction,
     handles: &HashMap<String, ElementId>,
     beat: &ConnectBeat,
     now_ms: u64,
@@ -526,19 +538,17 @@ fn run_connect(
     end.x = end_point.x;
     end.y = end_point.y;
 
-    let id = doc.add(
-        ElementKind::Arrow {
-            start: start.clone(),
-            end: end.clone(),
-            routing,
-            start_arrowhead: false,
-            end_arrowhead: arrow,
-            style: Style::default(),
-            waypoints: Vec::new(),
-            label_id: None,
-        },
+    let id = commands::add_arrow(
+        doc,
+        tx,
+        start.clone(),
+        end.clone(),
+        routing,
+        false,
+        arrow,
+        Style::default(),
         now_ms,
-    );
+    )?;
 
     let mut linked_label = None;
     if let Some(label) = beat
@@ -551,28 +561,32 @@ fn run_connect(
         obstacles.rebuild(doc);
         let route = connector::route_avoiding(&start, &end, routing, &[], doc, &obstacles);
         let midpoint = polyline_midpoint(&route).unwrap_or_else(|| source_bounds.center());
-        let text_id = doc_ops::add_text(doc, label, TextAlign::Center, "#ece4d6", now_ms);
-        if let Some(text_rect) = doc.element(&text_id).map(|element| element.bounds()) {
-            if let Some(element) = doc.element_mut(&text_id) {
-                if let ElementKind::Text {
-                    rect, container_id, ..
-                } = &mut element.kind
-                {
-                    *rect = Rect::new(
-                        midpoint.x - text_rect.w / 2.0,
-                        midpoint.y - text_rect.h / 2.0,
-                        text_rect.w,
-                        text_rect.h,
-                    );
-                    *container_id = Some(id.clone());
-                }
+        let style = Style {
+            stroke_color: commands::DEFAULT_INK.into(),
+            ..Style::default()
+        };
+        let layout = canvas_core::text::layout_text(label, style.font_size, None, &ApproxMeasurer);
+        let text_id = commands::add_text(
+            doc,
+            tx,
+            label,
+            Rect::new(
+                midpoint.x - layout.width / 2.0 - commands::LABEL_PADDING,
+                midpoint.y - layout.height / 2.0,
+                (layout.width + 2.0 * commands::LABEL_PADDING).max(20.0),
+                layout.height,
+            ),
+            TextAlign::Center,
+            style,
+            now_ms,
+        )?;
+        tx.update(doc, &text_id, now_ms, |element| {
+            if let ElementKind::Text { container_id, .. } = &mut element.kind {
+                *container_id = Some(id.clone());
             }
-        }
-        if let Some(element) = doc.element_mut(&id) {
-            if let ElementKind::Arrow { label_id, .. } = &mut element.kind {
-                *label_id = Some(text_id.clone());
-            }
-        }
+        })
+        .map_err(|error| error.to_string())?;
+        commands::link_label(doc, tx, &id, &text_id, now_ms)?;
         linked_label = Some(text_id);
     }
     Ok((id, linked_label))
@@ -683,6 +697,10 @@ mod tests {
     use super::*;
     use canvas_core::describe::describe;
 
+    fn run(doc: &mut Document, beats: &[ScriptBeat], now: u64) -> Result<ScriptOutcome, String> {
+        execute(doc, &mut Transaction::begin(), beats, now)
+    }
+
     fn beat(json: serde_json::Value) -> ScriptBeat {
         serde_json::from_value(json).expect("valid beat")
     }
@@ -706,7 +724,7 @@ mod tests {
     #[test]
     fn a_script_builds_a_small_architecture_in_one_pass() {
         let mut doc = Document::new();
-        let outcome = execute(
+        let outcome = run(
             &mut doc,
             &[
                 labelled_draw("client", "sticky", "Client"),
@@ -728,8 +746,7 @@ mod tests {
     #[test]
     fn handles_resolve_across_beats_and_return_in_order() {
         let mut doc = Document::new();
-        let outcome =
-            execute(&mut doc, &[draw("a", "rectangle"), draw("b", "ellipse")], 1).unwrap();
+        let outcome = run(&mut doc, &[draw("a", "rectangle"), draw("b", "ellipse")], 1).unwrap();
         assert_eq!(outcome.created[0].0, "a");
         assert_eq!(outcome.created[1].0, "b");
         assert!(doc.element(&outcome.created[0].1).is_some());
@@ -738,7 +755,7 @@ mod tests {
     #[test]
     fn frame_around_children_contains_them() {
         let mut doc = Document::new();
-        let outcome = execute(
+        let outcome = run(
             &mut doc,
             &[
                 labelled_draw("a", "sticky", "A"),
@@ -775,7 +792,7 @@ mod tests {
         ];
         let layout = |beats: &[ScriptBeat]| {
             let mut doc = Document::new();
-            execute(&mut doc, beats, 1).unwrap();
+            run(&mut doc, beats, 1).unwrap();
             let mut rects: Vec<(f64, f64, f64, f64)> = doc
                 .ordered_live()
                 .iter()
@@ -803,7 +820,7 @@ mod tests {
     fn a_failed_beat_leaves_the_document_untouched() {
         let mut doc = Document::new();
         let before = doc.live_count();
-        let error = execute(
+        let error = run(
             &mut doc,
             &[
                 draw("a", "sticky"),
@@ -823,13 +840,13 @@ mod tests {
         let mut doc = Document::new();
         let mut bad = draw("a", "hexagon");
         bad.draw.as_mut().unwrap().handle = Some("a".into());
-        let error = execute(&mut doc, &[bad], 1).unwrap_err();
+        let error = run(&mut doc, &[bad], 1).unwrap_err();
         assert!(
             error.contains("beat 1") && error.contains("hexagon"),
             "{error}"
         );
 
-        let error = execute(&mut doc, &[draw("a", "sticky"), draw("a", "sticky")], 1).unwrap_err();
+        let error = run(&mut doc, &[draw("a", "sticky"), draw("a", "sticky")], 1).unwrap_err();
         assert!(error.contains("duplicate handle"), "{error}");
     }
 
@@ -838,6 +855,7 @@ mod tests {
         let mut doc = Document::new();
         let existing = doc_ops::draw(
             &mut doc,
+            &mut Transaction::begin(),
             &DrawRequest {
                 kind: "rectangle".into(),
                 text: None,
@@ -853,7 +871,7 @@ mod tests {
             1,
         )
         .unwrap();
-        let outcome = execute(
+        let outcome = run(
             &mut doc,
             &[draw("new", "sticky"), connect("new", &existing, None)],
             2,
@@ -867,7 +885,7 @@ mod tests {
     #[test]
     fn empty_scripts_are_rejected() {
         let mut doc = Document::new();
-        assert!(execute(&mut doc, &[], 1).is_err());
+        assert!(run(&mut doc, &[], 1).is_err());
     }
 
     #[test]
@@ -885,7 +903,7 @@ mod tests {
         }));
 
         let mut doc = Document::new();
-        let outcome = execute(&mut doc, &[first, second, walk], 1).unwrap();
+        let outcome = run(&mut doc, &[first, second, walk], 1).unwrap();
         assert!(outcome.presentation);
         assert_eq!(outcome.steps.len(), 3);
         assert_eq!(outcome.steps[0].created.len(), 2, "sticky plus its label");
@@ -907,7 +925,7 @@ mod tests {
     #[test]
     fn pure_draw_scripts_have_no_playback_pacing() {
         let mut doc = Document::new();
-        let outcome = execute(&mut doc, &[draw("a", "sticky"), draw("b", "sticky")], 1).unwrap();
+        let outcome = run(&mut doc, &[draw("a", "sticky"), draw("b", "sticky")], 1).unwrap();
         assert!(!outcome.presentation);
         assert!(outcome.steps.iter().all(|step| step.hold_ms.is_none()));
     }
@@ -916,14 +934,14 @@ mod tests {
     fn standalone_presentation_beats_need_a_target_or_caption() {
         let mut doc = Document::new();
         let empty = beat(serde_json::json!({}));
-        let error = execute(&mut doc, &[empty], 1).unwrap_err();
+        let error = run(&mut doc, &[empty], 1).unwrap_err();
         assert!(error.contains("beat 1"), "{error}");
     }
 
     #[test]
     fn discussion_verbs_are_expressible_as_beats() {
         let mut doc = Document::new();
-        let outcome = execute(
+        let outcome = run(
             &mut doc,
             &[
                 labelled_draw("a", "sticky", "A"),
@@ -965,7 +983,7 @@ mod tests {
             "draw": { "as": "a", "kind": "sticky" },
             "tidy": ["a"]
         }));
-        let error = execute(&mut doc, &[double], 1).unwrap_err();
+        let error = run(&mut doc, &[double], 1).unwrap_err();
         assert!(error.contains("one action per beat"), "{error}");
         assert_eq!(doc.live_count(), 0);
     }

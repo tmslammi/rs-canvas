@@ -1,11 +1,393 @@
-//! Semantic revisions shared by native callers and the browser's document model.
-//! Updates preserve identity and return reversible deltas, including followers.
+//! Document commands: the one committed-mutation path shared by the page and
+//! the agent server.
+//!
+//! Every command records reversible `Delta`s through a `Transaction`; undo,
+//! revert and the wire patch all project that same journal. Gesture previews
+//! stay in `Editor` — only committed semantics live here.
 
 use std::collections::BTreeSet;
 
-use crate::model::{Binding, Document, ElementId, ElementKind, StylePatch, TextAlign};
-use crate::text::{layout_text, ApproxMeasurer};
-use crate::{connector, element_style_mut, translate_element, Delta, ObstacleIndex, Point, Rect};
+use crate::geometry::{Point, Rect};
+use crate::history::Transaction;
+use crate::index::key_between;
+use crate::model::{
+    Binding, Document, Element, ElementId, ElementKind, FillPattern, ShapeKind, Style, StylePatch,
+    TextAlign,
+};
+use crate::text::{layout_text, TextMeasurer};
+use crate::{connector, element_style_mut, translate_element, Delta, ObstacleIndex};
+
+/// Default geometry shared by interactive and agent-created elements.
+pub const SHAPE_W: f64 = 160.0;
+pub const SHAPE_H: f64 = 100.0;
+pub const STICKY_SIZE: f64 = 140.0;
+pub const FRAME_W: f64 = 360.0;
+pub const FRAME_H: f64 = 240.0;
+pub const GLYPH_SIZE: f64 = 96.0;
+/// Inner padding for a bound label.
+pub const LABEL_PADDING: f64 = 10.0;
+/// Sticky notes are closed paths, so the text padding is a little wider.
+pub const STICKY_LABEL_PADDING: f64 = 14.0;
+pub const STICKY_FILL: &str = "#ffec99";
+pub const STICKY_INK: &str = "#3b2f1c";
+pub const DEFAULT_INK: &str = "#ece4d6";
+
+/// The style every new sticky inherits: solid pastel fill and dark ink so the
+/// text reads on the note. Interactive and agent-created stickies agree here.
+pub fn sticky_style(base: Style) -> Style {
+    let mut style = base;
+    style.fill_style = FillPattern::Solid;
+    if style.fill_color == "transparent" {
+        style.fill_color = STICKY_FILL.into();
+    }
+    style.stroke_color = STICKY_INK.into();
+    style
+}
+
+/// Default footprint for a freshly created shape.
+pub fn default_shape_size(shape: ShapeKind) -> (f64, f64) {
+    match shape {
+        ShapeKind::Sticky => (STICKY_SIZE, STICKY_SIZE),
+        _ => (SHAPE_W, SHAPE_H),
+    }
+}
+
+/// Where a bound label sits relative to its container.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LabelSpot {
+    Centre,
+    Below,
+}
+
+fn next_index(doc: &Document) -> Result<String, String> {
+    key_between(doc.top_index().as_deref(), None).map_err(|error| error.to_string())
+}
+
+fn insert_element(
+    doc: &mut Document,
+    tx: &mut Transaction,
+    kind: ElementKind,
+    now: u64,
+) -> Result<ElementId, String> {
+    let index = next_index(doc)?;
+    let element = Element::new(kind, index, now);
+    let id = element.id.clone();
+    tx.add(doc, element).map_err(|error| error.to_string())?;
+    Ok(id)
+}
+
+/// Create one shape and, optionally, its bound label.
+///
+/// The caller owns placement policy; this command owns the element's shape
+/// defaults, sticky style, label geometry and the owner/label link.
+#[allow(clippy::too_many_arguments)]
+pub fn add_shape(
+    doc: &mut Document,
+    tx: &mut Transaction,
+    shape: ShapeKind,
+    rect: Rect,
+    style: Style,
+    label: Option<&str>,
+    spot: LabelSpot,
+    now: u64,
+    measure: &dyn TextMeasurer,
+) -> Result<ElementId, String> {
+    let style = if shape == ShapeKind::Sticky {
+        sticky_style(style)
+    } else {
+        style
+    };
+    let id = insert_element(
+        doc,
+        tx,
+        ElementKind::Shape {
+            shape,
+            rect,
+            style: style.clone(),
+            bound_text_id: None,
+        },
+        now,
+    )?;
+    if let Some(text) = label.map(str::trim).filter(|text| !text.is_empty()) {
+        add_bound_label(doc, tx, &id, text, spot, &style, now, measure)?;
+    }
+    Ok(id)
+}
+
+/// Create a free-standing text element at `rect`.
+pub fn add_text(
+    doc: &mut Document,
+    tx: &mut Transaction,
+    text: &str,
+    rect: Rect,
+    align: TextAlign,
+    style: Style,
+    now: u64,
+) -> Result<ElementId, String> {
+    insert_element(
+        doc,
+        tx,
+        ElementKind::Text {
+            rect,
+            text: text.to_string(),
+            align,
+            fixed_width: false,
+            container_id: None,
+            style,
+        },
+        now,
+    )
+}
+
+/// Create a frame.
+pub fn add_frame(
+    doc: &mut Document,
+    tx: &mut Transaction,
+    rect: Rect,
+    name: &str,
+    now: u64,
+) -> Result<ElementId, String> {
+    insert_element(
+        doc,
+        tx,
+        ElementKind::Frame {
+            rect,
+            name: name.to_string(),
+        },
+        now,
+    )
+}
+
+/// Create a shape-library glyph, with an optional caption below it.
+#[allow(clippy::too_many_arguments)]
+pub fn add_glyph(
+    doc: &mut Document,
+    tx: &mut Transaction,
+    glyph: &str,
+    rect: Rect,
+    style: Style,
+    caption: Option<&str>,
+    now: u64,
+    measure: &dyn TextMeasurer,
+) -> Result<ElementId, String> {
+    let id = insert_element(
+        doc,
+        tx,
+        ElementKind::Glyph {
+            glyph: glyph.to_string(),
+            rect,
+            style: style.clone(),
+            caption_id: None,
+        },
+        now,
+    )?;
+    if let Some(text) = caption.map(str::trim).filter(|text| !text.is_empty()) {
+        add_bound_label(doc, tx, &id, text, LabelSpot::Below, &style, now, measure)?;
+    }
+    Ok(id)
+}
+
+/// Create a freehand stroke.
+pub fn add_freehand(
+    doc: &mut Document,
+    tx: &mut Transaction,
+    points: Vec<Point>,
+    pressures: Vec<f64>,
+    style: Style,
+    now: u64,
+) -> Result<ElementId, String> {
+    insert_element(
+        doc,
+        tx,
+        ElementKind::Freehand {
+            points,
+            pressures,
+            style,
+        },
+        now,
+    )
+}
+
+/// Create a connector. Binding and routing stay the caller's policy; the
+/// command owns insertion and the transaction record.
+#[allow(clippy::too_many_arguments)]
+pub fn add_arrow(
+    doc: &mut Document,
+    tx: &mut Transaction,
+    start: crate::model::Endpoint,
+    end: crate::model::Endpoint,
+    routing: crate::model::Routing,
+    start_arrowhead: bool,
+    end_arrowhead: bool,
+    style: Style,
+    now: u64,
+) -> Result<ElementId, String> {
+    insert_element(
+        doc,
+        tx,
+        ElementKind::Arrow {
+            start,
+            end,
+            routing,
+            start_arrowhead,
+            end_arrowhead,
+            style,
+            waypoints: Vec::new(),
+            label_id: None,
+        },
+        now,
+    )
+}
+
+/// Create and link the label owned by `container`.
+#[allow(clippy::too_many_arguments)]
+pub fn add_bound_label(
+    doc: &mut Document,
+    tx: &mut Transaction,
+    container: &str,
+    text: &str,
+    spot: LabelSpot,
+    container_style: &Style,
+    now: u64,
+    measure: &dyn TextMeasurer,
+) -> Result<ElementId, String> {
+    let Some(bounds) = doc.framing_bounds(container) else {
+        return Err(format!("unknown element {container:?}"));
+    };
+    let sticky = doc.element(container).is_some_and(Element::is_sticky);
+    let padding = if sticky {
+        STICKY_LABEL_PADDING
+    } else {
+        LABEL_PADDING
+    };
+    let ink = if sticky {
+        STICKY_INK
+    } else {
+        container_style.stroke_color.as_str()
+    };
+    let style = Style {
+        stroke_color: ink.to_string(),
+        font_size: container_style.font_size,
+        ..Style::default()
+    };
+    let layout = layout_text(text, style.font_size, None, measure);
+    let (rect, align) = match spot {
+        LabelSpot::Centre => (
+            Rect::new(
+                bounds.x + padding,
+                bounds.y + (bounds.h - layout.height) / 2.0,
+                (bounds.w - 2.0 * padding).max(20.0),
+                layout.height.max(style.font_size * 1.3),
+            ),
+            TextAlign::Center,
+        ),
+        LabelSpot::Below => (
+            Rect::new(
+                bounds.x,
+                bounds.max_y() + 4.0,
+                bounds.w,
+                layout.height.max(style.font_size * 1.3),
+            ),
+            TextAlign::Center,
+        ),
+    };
+    let label = insert_element(
+        doc,
+        tx,
+        ElementKind::Text {
+            rect,
+            text: text.to_string(),
+            align,
+            fixed_width: false,
+            container_id: Some(container.to_string()),
+            style,
+        },
+        now,
+    )?;
+    link_label(doc, tx, container, &label, now)?;
+    Ok(label)
+}
+
+/// Point a container at its label.
+pub fn link_label(
+    doc: &mut Document,
+    tx: &mut Transaction,
+    container: &str,
+    label: &str,
+    now: u64,
+) -> Result<(), String> {
+    tx.update(doc, container, now, |element| match &mut element.kind {
+        ElementKind::Shape { bound_text_id, .. } => *bound_text_id = Some(label.to_string()),
+        ElementKind::Glyph { caption_id, .. } => *caption_id = Some(label.to_string()),
+        ElementKind::Arrow { label_id, .. } => *label_id = Some(label.to_string()),
+        _ => {}
+    })
+    .map_err(|error| error.to_string())
+}
+
+/// Delete a set of elements. Frames take their children, containers take
+/// their labels, and connectors bound to a doomed element go with it.
+pub fn delete(
+    doc: &mut Document,
+    tx: &mut Transaction,
+    ids: &[ElementId],
+    now: u64,
+) -> Result<Vec<ElementId>, String> {
+    if ids.is_empty() {
+        return Err("clear needs at least one element".into());
+    }
+    for id in ids {
+        if doc
+            .element(id)
+            .filter(|element| !element.is_deleted)
+            .is_none()
+        {
+            return Err(format!("unknown element {id:?}"));
+        }
+    }
+    let mut queue: Vec<ElementId> = ids.to_vec();
+    let mut doomed: Vec<ElementId> = Vec::new();
+    while let Some(id) = queue.pop() {
+        if doomed.contains(&id) {
+            continue;
+        }
+        let Some(element) = doc.element(&id).filter(|element| !element.is_deleted) else {
+            continue;
+        };
+        if element.is_frame() {
+            let children: Vec<ElementId> = doc
+                .ordered_live()
+                .iter()
+                .filter(|child| child.frame_id.as_deref() == Some(id.as_str()))
+                .map(|child| child.id.clone())
+                .collect();
+            queue.extend(children);
+        }
+        if let Some(label) = owned_label(doc, &id) {
+            queue.push(label);
+        }
+        doomed.push(id);
+    }
+    // A bound connector whose endpoint is gone would otherwise linger on
+    // stale coordinates. Arrows can never be bind targets, so one pass closes
+    // the set.
+    let attached: Vec<ElementId> = doc
+        .ordered_live()
+        .iter()
+        .filter(|element| {
+            !doomed.contains(&element.id)
+                && matches!(&element.kind, ElementKind::Arrow { start, end, .. }
+                    if start.binding.as_ref().is_some_and(|b| doomed.contains(&b.element_id))
+                        || end.binding.as_ref().is_some_and(|b| doomed.contains(&b.element_id)))
+        })
+        .map(|element| element.id.clone())
+        .collect();
+    doomed.extend(attached);
+    for id in &doomed {
+        tx.remove(doc, id, now).map_err(|error| error.to_string())?;
+    }
+    Ok(doomed)
+}
 
 #[derive(Default)]
 pub struct ElementUpdate {
@@ -25,9 +407,11 @@ pub struct ElementUpdate {
 /// Revise one live element atomically. Invalid fields leave the document untouched.
 pub fn update_element(
     doc: &mut Document,
+    tx: &mut Transaction,
     id: &str,
     update: &ElementUpdate,
     now: u64,
+    measure: &dyn TextMeasurer,
 ) -> Result<Vec<Delta>, String> {
     let original = doc
         .element(id)
@@ -217,7 +601,7 @@ pub fn update_element(
         refresh_connector(&mut working, arrow);
     }
     for owner in followers.iter().chain(arrows.iter()) {
-        reflow_label(&mut working, owner);
+        reflow_label(&mut working, owner, measure);
     }
     // Editing a bound text directly must keep it placed with its owner.
     if let ElementKind::Text {
@@ -226,9 +610,9 @@ pub fn update_element(
     } = &working.element(id).unwrap().kind
     {
         let owner = owner.clone();
-        reflow_label(&mut working, &owner);
+        reflow_label(&mut working, &owner, measure);
     } else if matches!(working.element(id).unwrap().kind, ElementKind::Text { .. }) {
-        reflow_label(&mut working, id);
+        reflow_label(&mut working, id, measure);
     }
     if let Some(height) = update.h {
         if let ElementKind::Text {
@@ -256,10 +640,13 @@ pub fn update_element(
             _ => {}
         }
     }
-    for delta in &deltas {
-        doc.apply(delta).map_err(|e| e.to_string())?;
+    let mut applied = Vec::with_capacity(deltas.len());
+    for delta in deltas {
+        tx.push_applied(doc, delta.clone())
+            .map_err(|e| e.to_string())?;
+        applied.push(delta);
     }
-    Ok(deltas)
+    Ok(applied)
 }
 
 pub fn owned_label(doc: &Document, id: &str) -> Option<ElementId> {
@@ -329,7 +716,7 @@ fn refresh_connector(doc: &mut Document, id: &str) {
     }
 }
 
-fn reflow_label(doc: &mut Document, owner: &str) {
+fn reflow_label(doc: &mut Document, owner: &str, measure: &dyn TextMeasurer) {
     let Some(element) = doc.element(owner).cloned() else {
         return;
     };
@@ -365,7 +752,7 @@ fn reflow_label(doc: &mut Document, owner: &str) {
         ElementKind::Text { .. } if *fixed_width => Some(text_rect.w),
         _ => None,
     };
-    let layout = layout_text(text, style.font_size, wrap, &ApproxMeasurer);
+    let layout = layout_text(text, style.font_size, wrap, measure);
     let w = if matches!(element.kind, ElementKind::Shape { .. }) {
         // The browser measures the real font. Give it the owner's complete
         // text area rather than the heuristic's narrower longest-line width.
@@ -437,6 +824,16 @@ mod tests {
         )
     }
 
+    fn update(
+        doc: &mut Document,
+        id: &str,
+        update: &ElementUpdate,
+        now: u64,
+    ) -> Result<Vec<Delta>, String> {
+        let mut tx = Transaction::begin();
+        update_element(doc, &mut tx, id, update, now, &crate::text::ApproxMeasurer)
+    }
+
     fn connect(doc: &mut Document, from: &str, to: &str) -> String {
         doc.add(
             ElementKind::Arrow {
@@ -471,7 +868,7 @@ mod tests {
     fn rename_resize_and_move_preserve_owner_and_label_identity() {
         let mut doc = Document::new();
         let id = shape(&mut doc, 0.0);
-        update_element(
+        update(
             &mut doc,
             &id,
             &ElementUpdate {
@@ -483,7 +880,7 @@ mod tests {
         .unwrap();
         let label = owned_label(&doc, &id).unwrap();
         let before = doc.clone();
-        let deltas = update_element(
+        let deltas = update(
             &mut doc,
             &id,
             &ElementUpdate {
@@ -530,7 +927,7 @@ mod tests {
         let a = shape(&mut doc, 0.0);
         let b = shape(&mut doc, 400.0);
         doc.element_mut(&a).unwrap().frame_id = Some(frame.clone());
-        update_element(
+        update(
             &mut doc,
             &a,
             &ElementUpdate {
@@ -541,7 +938,7 @@ mod tests {
         )
         .unwrap();
         let arrow = connect(&mut doc, &a, &b);
-        update_element(
+        update(
             &mut doc,
             &arrow,
             &ElementUpdate {
@@ -556,7 +953,7 @@ mod tests {
             .element(&owned_label(&doc, &arrow).unwrap())
             .unwrap()
             .bounds();
-        update_element(
+        update(
             &mut doc,
             &frame,
             &ElementUpdate {
@@ -591,7 +988,7 @@ mod tests {
         let b = shape(&mut doc, 300.0);
         let c = shape(&mut doc, 700.0);
         let arrow = connect(&mut doc, &a, &b);
-        update_element(
+        update(
             &mut doc,
             &arrow,
             &ElementUpdate {
@@ -603,7 +1000,7 @@ mod tests {
         .unwrap();
         let label = owned_label(&doc, &arrow).unwrap();
         let old = doc.element(&label).unwrap().bounds();
-        update_element(
+        update(
             &mut doc,
             &arrow,
             &ElementUpdate {
@@ -619,6 +1016,52 @@ mod tests {
         };
         assert_eq!(end.binding.as_ref().unwrap().element_id, c);
         assert_ne!(doc.element(&label).unwrap().bounds(), old);
+    }
+
+    #[test]
+    fn sticky_creation_uses_the_shared_solid_style_and_links_its_label() {
+        let mut doc = Document::new();
+        let mut tx = Transaction::begin();
+        let id = add_shape(
+            &mut doc,
+            &mut tx,
+            ShapeKind::Sticky,
+            Rect::new(10.0, 20.0, 140.0, 140.0),
+            Style::default(),
+            Some("Cache"),
+            LabelSpot::Centre,
+            1,
+            &crate::text::ApproxMeasurer,
+        )
+        .unwrap();
+        let sticky = doc.element(&id).unwrap();
+        let ElementKind::Shape {
+            style,
+            bound_text_id,
+            ..
+        } = &sticky.kind
+        else {
+            panic!("expected a sticky shape");
+        };
+        assert_eq!(style.fill_style, crate::model::FillPattern::Solid);
+        assert_eq!(style.fill_color, STICKY_FILL);
+        assert_eq!(style.stroke_color, STICKY_INK);
+        let label = bound_text_id.as_ref().expect("bound label");
+        assert_eq!(
+            crate::describe::text_of(&doc, label).as_deref(),
+            Some("Cache")
+        );
+        assert_eq!(
+            tx.len(),
+            3,
+            "shape, label and the owner link replay as one reversible journal"
+        );
+        tx.rollback(&mut doc).unwrap();
+        assert_eq!(
+            doc.live_count(),
+            0,
+            "the journal reverses the whole command"
+        );
     }
 
     #[test]
@@ -655,7 +1098,17 @@ mod tests {
                 ..Default::default()
             },
         ] {
-            assert!(update_element(&mut doc, &frame, &update, 2).is_err());
+            let mut tx = Transaction::begin();
+            assert!(update_element(
+                &mut doc,
+                &mut tx,
+                &frame,
+                &update,
+                2,
+                &crate::text::ApproxMeasurer
+            )
+            .is_err());
+            assert!(tx.is_empty(), "a rejected command records nothing");
             assert_eq!(doc, before);
         }
     }

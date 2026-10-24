@@ -252,7 +252,7 @@ async fn creation_revert_tombstones_and_rejects_new_dependencies() {
         }))
         .await
         .unwrap();
-    assert_ne!(reverted.is_error, Some(true));
+    assert_ne!(reverted.is_error, Some(true), "{reverted:?}");
     assert!(!text(&read(&server, json!({})).await).contains("Temporary"));
 }
 

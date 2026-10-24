@@ -108,8 +108,6 @@ const MIN_RESIZE_PX: f64 = 4.0;
 /// Default edge length of a sticky note (and of a sticky stack's pile).
 const STICKY_SIZE: f64 = 140.0;
 const STICKY_DEFAULT_COLOR: &str = "#ffec99";
-/// Sticky text is inked in the note's own outline colour.
-const STICKY_INK: &str = "#3b2f1c";
 /// How far outside an element's edge its connection nodes float, in screen px.
 const CONNECTION_NODE_PX: f64 = 16.0;
 /// The border ring of a sticky stack that drags the pile rather than pulling
@@ -3262,13 +3260,7 @@ impl Editor {
     /// The style new sticky notes and stacks inherit: a solid pastel fill and
     /// dark ink, so text reads on the note.
     fn sticky_style(&self) -> Style {
-        let mut style = self.style.clone();
-        style.fill_style = crate::model::FillPattern::Solid;
-        if style.fill_color == "transparent" {
-            style.fill_color = STICKY_DEFAULT_COLOR.into();
-        }
-        style.stroke_color = STICKY_INK.into();
-        style
+        crate::commands::sticky_style(self.style.clone())
     }
 
     /// The sticky tool: pull a note off a stack under the pointer, otherwise
@@ -6397,7 +6389,7 @@ mod tests {
             ElementKind::Shape { style, .. } => {
                 assert_eq!(style.fill_style, crate::model::FillPattern::Solid);
                 assert_ne!(style.fill_color, "transparent");
-                assert_eq!(style.stroke_color, STICKY_INK);
+                assert_eq!(style.stroke_color, crate::commands::STICKY_INK);
             }
             other => panic!("expected a sticky, got {other:?}"),
         }
@@ -6427,7 +6419,7 @@ mod tests {
             } => {
                 assert_eq!(text, "hello");
                 assert_eq!(container_id.as_ref(), Some(&note.id));
-                assert_eq!(style.stroke_color, STICKY_INK);
+                assert_eq!(style.stroke_color, crate::commands::STICKY_INK);
             }
             other => panic!("expected bound text, got {other:?}"),
         }

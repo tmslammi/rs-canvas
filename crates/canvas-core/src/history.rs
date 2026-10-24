@@ -48,7 +48,10 @@ impl Transaction {
         Ok(())
     }
 
-    /// Record an already-applied delta (used for coalescing-friendly flows).
+    /// Record an already-applied delta, coalescing consecutive writes to the
+    /// same element (a drag is one undo step). Interleaved writes stay in the
+    /// journal; revert compares the final state per id, and the wire patch
+    /// keeps the last entry per id.
     pub fn push(&mut self, delta: Delta) {
         if let Some(last) = self.deltas.last_mut() {
             let coalesces = match (&mut *last, &delta) {
@@ -126,6 +129,16 @@ impl Transaction {
         }
         after.touch(now_ms);
         self.push_applied(doc, Delta::Update { before, after })
+    }
+
+    /// Undo every applied delta in reverse order without touching history.
+    /// Used by the server to roll back a failed command batch atomically.
+    pub fn rollback(&mut self, doc: &mut Document) -> Result<(), EditError> {
+        for delta in self.deltas.iter().rev() {
+            doc.apply(&delta.invert())?;
+        }
+        self.deltas.clear();
+        Ok(())
     }
 
     /// Close the transaction and push it onto the history.
@@ -223,6 +236,45 @@ fn style_retained_bytes(style: &Style) -> usize {
     size_of::<Style>() + style.stroke_color.capacity() + style.fill_color.capacity()
 }
 
+/// Stamp a replayed element strictly newer than both the current document
+/// copy and the historical copy being replayed, so undo/revert wins the merge.
+pub fn freshen_element(current: Option<&Element>, mut target: Element, now_ms: u64) -> Element {
+    let base = current
+        .map(|element| element.version)
+        .unwrap_or(0)
+        .max(target.version);
+    target.version = base + 1;
+    target.version_nonce = new_version_nonce();
+    target.updated = now_ms;
+    target
+}
+
+/// The inverse of `delta`, freshly stamped for replay against `doc`.
+///
+/// This is the same rule undo uses: a revert is a new edit, not a rewind of
+/// the clock. `Purge` and `Add` are handled as a pair so reverting the revert
+/// restores the exact element.
+pub fn inverse_for_replay(doc: &Document, delta: &Delta, now_ms: u64) -> Delta {
+    match delta {
+        Delta::Add { element } => Delta::Purge {
+            element: doc
+                .element(&element.id)
+                .cloned()
+                .unwrap_or_else(|| element.clone()),
+        },
+        Delta::Purge { element } => Delta::Add {
+            element: freshen_element(doc.element(&element.id), element.clone(), now_ms),
+        },
+        Delta::Update { before, .. } | Delta::Remove { before, .. } => {
+            let current = doc.element(&before.id).cloned();
+            Delta::Update {
+                before: current.clone().unwrap_or_else(|| before.clone()),
+                after: freshen_element(current.as_ref(), before.clone(), now_ms),
+            }
+        }
+    }
+}
+
 /// Undo/redo stacks of committed transactions.
 #[derive(Clone, Debug)]
 pub struct History {
@@ -306,15 +358,8 @@ impl History {
     /// replayed. An undo or redo is a new edit, not a rewind of the clock —
     /// without this the merge rules read the replayed copy as stale and a
     /// synced peer "corrects" it back to the pre-undo state.
-    fn freshen(current: Option<&Element>, mut target: Element, now_ms: u64) -> Element {
-        let base = current
-            .map(|element| element.version)
-            .unwrap_or(0)
-            .max(target.version);
-        target.version = base + 1;
-        target.version_nonce = new_version_nonce();
-        target.updated = now_ms;
-        target
+    fn freshen(current: Option<&Element>, target: Element, now_ms: u64) -> Element {
+        freshen_element(current, target, now_ms)
     }
 
     /// Undo the most recent transaction; returns the ids it touched so the
@@ -755,6 +800,52 @@ mod tests {
         } else {
             panic!("expected shape");
         }
+    }
+
+    #[test]
+    fn rollback_restores_the_pre_transaction_document() {
+        let mut doc = Document::new();
+        let base = doc.add(shape(0.0, 0.0), 1);
+        let before = doc.clone();
+
+        let mut tx = Transaction::begin();
+        tx.update(&mut doc, &base, 2, |element| {
+            if let ElementKind::Shape { rect, .. } = &mut element.kind {
+                rect.x = 40.0;
+            }
+        })
+        .unwrap();
+        tx.add(&mut doc, Element::new(shape(100.0, 0.0), "a1".into(), 2))
+            .unwrap();
+        assert_ne!(doc, before);
+
+        tx.rollback(&mut doc).unwrap();
+        assert_eq!(doc, before, "rollback restores the exact prior state");
+        assert!(tx.is_empty(), "the journal is cleared after rollback");
+    }
+
+    #[test]
+    fn inverse_for_replay_freshens_the_restored_copy() {
+        let mut doc = Document::new();
+        let id = doc.add(shape(0.0, 0.0), 1);
+        let before = doc.element(&id).unwrap().clone();
+        let mut after = before.clone();
+        after.touch(2);
+        let delta = Delta::Update {
+            before: before.clone(),
+            after: after.clone(),
+        };
+        doc.apply(&delta).unwrap();
+
+        let inverse = inverse_for_replay(&doc, &delta, 3);
+        doc.apply(&inverse).unwrap();
+        let restored = doc.element(&id).unwrap();
+        assert!(restored.content_eq(&before));
+        assert!(
+            restored.version > after.version,
+            "a revert must win the merge against the copy it replaces"
+        );
+        assert_eq!(restored.updated, 3);
     }
 
     #[test]

@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use canvas_core::model::{Document, Element, ElementKind, Style};
-use canvas_core::serialization;
+use canvas_core::{serialization, Delta};
 use tokio::sync::{broadcast, Mutex, Notify};
 
 use crate::aliases::Aliases;
@@ -47,7 +47,9 @@ pub struct DiscussionRecord {
 #[derive(Clone)]
 pub struct AgentTransaction {
     pub id: String,
-    pub changes: Vec<(Option<Element>, Element)>,
+    /// The exact committed journal. Revert replays its inverse instead of
+    /// retaining full before/after snapshots of every touched element.
+    pub deltas: Vec<Delta>,
 }
 
 /// How many recent changes `canvas_read(since)` can recall.
@@ -883,6 +885,44 @@ impl Workspace {
         }
         let revision = self.record_ids(changed, source).await;
         (revision, put)
+    }
+
+    /// Record a committed delta journal: bump the revision and change log
+    /// from the elements the commands actually touched. The classification is
+    /// derived from the deltas' before/after copies, so delta-native commits
+    /// keep the same rich `canvas_read(since)` report as page snapshots.
+    pub async fn record_deltas(&self, deltas: &[Delta], source: &str) -> u64 {
+        let mut changed: Vec<ChangedElement> = Vec::new();
+        for delta in deltas {
+            let (id, kinds) = match delta {
+                Delta::Add { element } => {
+                    (element.id.clone(), classify_change(None, Some(element)))
+                }
+                Delta::Purge { element } => {
+                    (element.id.clone(), classify_change(Some(element), None))
+                }
+                Delta::Remove { before, tombstone } => {
+                    let after = tombstone.materialize(before);
+                    (
+                        before.id.clone(),
+                        classify_change(Some(before), Some(&after)),
+                    )
+                }
+                Delta::Update { before, after } => {
+                    (after.id.clone(), classify_change(Some(before), Some(after)))
+                }
+            };
+            if let Some(existing) = changed.iter_mut().find(|entry| entry.id == id) {
+                for kind in kinds {
+                    if !existing.kinds.contains(&kind) {
+                        existing.kinds.push(kind);
+                    }
+                }
+            } else {
+                changed.push(ChangedElement { id, kinds });
+            }
+        }
+        self.record_ids(changed, source).await
     }
 
     /// Record an additions-only bulk commit: bump the revision and change log
