@@ -43,15 +43,22 @@ jobs:
         with:
           toolchain: "1.94.0"
           targets: wasm32-unknown-unknown
+      - name: Read the wasm-bindgen version
+        id: wasm-bindgen
+        run: |
+          version=$(awk '/^name = "wasm-bindgen"$/{getline; gsub(/version = |"/,""); print; exit}' Cargo.lock)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
       - uses: taiki-e/install-action@v2
         with:
-          tool: wasm-bindgen@0.2.129
+          tool: wasm-bindgen@${{ steps.wasm-bindgen.outputs.version }}
       - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: npm
           cache-dependency-path: web/package-lock.json
       - run: npm ci
+        working-directory: web
+      - run: npm run typecheck
         working-directory: web
       - run: npx playwright install --with-deps chromium
         working-directory: web

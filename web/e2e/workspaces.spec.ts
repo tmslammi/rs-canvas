@@ -4,20 +4,22 @@ import os from "node:os";
 import path from "node:path";
 import { expect, test, type Page } from "@playwright/test";
 import { mcpClient } from "./mcp-client";
+import { testBase, testPort } from "./server-address";
 
 // Workspace management gets its own persisted server. Its focus changes and
 // destructive operations must not affect the existing agent specs' documents.
 test.describe.configure({ mode: "serial" });
-const BASE = "http://localhost:4177";
+const PORT = String(testPort(4));
+const BASE = testBase(4);
 let server: ChildProcess;
 let directory: string;
 
 test.beforeAll(async () => {
   const occupied = await fetch(BASE).then(() => true, () => false);
-  if (occupied) throw new Error("Workspace test port 4177 is already in use");
+  if (occupied) throw new Error(`Workspace test port ${PORT} is already in use`);
   directory = fs.mkdtempSync(path.join(os.tmpdir(), "rs-canvas-workspaces-"));
   server = spawn(path.resolve("../target/debug/canvas-server"), [
-    "--web", ".", "--port", "4177", "--doc", path.join(directory, "current.json"),
+    "--web", ".", "--port", PORT, "--doc", path.join(directory, "current.json"),
   ], { cwd: process.cwd(), stdio: "ignore" });
   for (let attempt = 0; attempt < 100; attempt++) {
     if (server.exitCode !== null) throw new Error("Workspace test server exited before startup");

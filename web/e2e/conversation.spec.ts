@@ -79,7 +79,7 @@ test("explore, revise, back out and revisit an engineering discussion", async ({
         questions: ["How should workers deduplicate repeated jobs?"],
       },
     });
-    await page.getByRole("button", { name: "◎", exact: true }).click();
+    await page.getByRole("button", { name: "Agent settings" }).click();
     const panel = page.getByRole("dialog", { name: "Agent settings" });
     await expect(panel).toContainText("At-least-once delivery");
     await expect(panel).toContainText("worker crash");
@@ -95,7 +95,7 @@ test("explore, revise, back out and revisit an engineering discussion", async ({
     await ready();
     await page.reload();
     await page.waitForFunction(() => window.__rsReady && window.__rsAgentConnected);
-    await page.getByRole("button", { name: "◎", exact: true }).click();
+    await page.getByRole("button", { name: "Agent settings" }).click();
     await expect(panel).toContainText("Ack after processing so a worker crash");
     const resumed = mcpClient(request, base);
     const resumedStatus = toolJson(await resumed.call("canvas_status", {}));

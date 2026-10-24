@@ -137,11 +137,10 @@ export function createWorkspacePanel(host, { current, onSwitch, onDuplicate, onR
   host.append(root);
 
   let names = new Set(["default", current]);
-  const browserNames = workspaceCatalogue;
   const remember = (name) => {
     names.add(name);
     try {
-      localStorage.setItem(CATALOGUE_KEY, JSON.stringify([...new Set([...browserNames(), name])]));
+      localStorage.setItem(CATALOGUE_KEY, JSON.stringify([...new Set([...workspaceCatalogue(), name])]));
     } catch {
       // IndexedDB saves and the server listing can still recover the name.
     }
@@ -167,7 +166,7 @@ export function createWorkspacePanel(host, { current, onSwitch, onDuplicate, onR
   let request = 0;
   const refresh = async () => {
     const generation = ++request;
-    names = new Set(["default", current, ...browserNames()]);
+    names = new Set(["default", current, ...workspaceCatalogue()]);
     render();
     status.textContent = "Checking for other workspaces…";
     const local = Promise.resolve().then(() => localSavedNames?.()).catch(() => []);

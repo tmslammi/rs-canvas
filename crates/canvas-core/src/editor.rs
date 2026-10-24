@@ -448,8 +448,7 @@ impl Editor {
     }
 
     /// Select a tool (single-shot: reverts to Select after one use). The
-    /// freehand brush is the exception: it stays armed for repeated strokes,
-    /// like Excalidraw's freedraw and Miro's pen.
+    /// freehand brush is the exception: it stays armed for repeated strokes.
     ///
     /// Switching tools abandons an in-flight gesture: without this a mid-drag
     /// tool switch would commit a half-drawn element on pointer-up.
@@ -461,19 +460,6 @@ impl Editor {
         };
         self.tool = tool;
         self.tool_locked = tool == Tool::Freehand;
-        effects.overlay_changed = true;
-        effects
-    }
-
-    /// Select a tool and keep it armed for repeated use.
-    pub fn set_tool_locked(&mut self, tool: Tool) -> Effects {
-        let mut effects = if self.is_interacting() {
-            self.cancel()
-        } else {
-            Effects::default()
-        };
-        self.tool = tool;
-        self.tool_locked = true;
         effects.overlay_changed = true;
         effects
     }
@@ -2263,44 +2249,6 @@ impl Editor {
         }
     }
 
-    /// Discard the open text edit, restoring the prior state.
-    pub fn cancel_text(&mut self) -> Effects {
-        if !matches!(self.interaction, Interaction::TextEditing { .. }) {
-            return Effects::default();
-        }
-        let interaction = std::mem::replace(&mut self.interaction, Interaction::Idle);
-        let Interaction::TextEditing { id, original } = interaction else {
-            unreachable!("checked above");
-        };
-        let original = *original;
-        let mut changed: BTreeSet<ElementId> = [id.clone()].into_iter().collect();
-        match original {
-            Some(orig) => {
-                self.tx = None;
-                if let Some(current) = self.doc.element(&id).cloned() {
-                    let _ = self.doc.apply(&Delta::Update {
-                        before: current,
-                        after: orig,
-                    });
-                }
-            }
-            None => match self.tx.take() {
-                Some(tx) => changed.extend(self.revert_transaction(&tx)),
-                None => {
-                    if let Some(element) = self.doc.element(&id).cloned() {
-                        let _ = self.doc.apply(&Delta::Purge { element });
-                    }
-                    self.unlink_dead_reference(&id);
-                }
-            },
-        }
-        Effects {
-            changed,
-            overlay_changed: true,
-            ..Effects::default()
-        }
-    }
-
     /// Revert an abandoned transaction against the live document, returning
     /// the ids it touched. Drafts are thrown away this way so every element
     /// they created or modified is restored together.
@@ -2759,7 +2707,7 @@ impl Editor {
             }
         }
         // Resize handles win over connection nodes: the nodes float outside
-        // the element, so a sloppy grab at the edge must still resize.
+        // the element, so a near-miss grab at the edge must still resize.
         if let Some(bounds) = self.selection_bounds() {
             if let Some(handle) = self.handle_at(screen, bounds) {
                 let originals: Vec<Element> = self
@@ -2782,7 +2730,7 @@ impl Editor {
         }
         if !mods.shift {
             // A connection node floating outside a hovered element starts a
-            // bound arrow, Miro-style.
+            // bound arrow.
             if let Some((id, side)) = self.connection_node_at(world) {
                 return self.begin_connector_from(id, side, now);
             }
@@ -2818,8 +2766,7 @@ impl Editor {
             }
             None => {
                 // Dragging from empty space inside the selection's bounding
-                // box moves the whole selection (Figma, Excalidraw and Miro
-                // all work this way); only a click clears it.
+                // box moves the whole selection; only a click clears it.
                 if !mods.shift && !self.selection.is_empty() {
                     if let Some(bounds) = self.selection_bounds() {
                         if bounds.contains(world) {
@@ -5653,22 +5600,6 @@ mod tests {
     }
 
     #[test]
-    fn escape_cancels_text_editing() {
-        let mut e = editor();
-        let mods = Modifiers::default();
-        press(&mut e, "t", mods, 1);
-        {
-            let fx = e.pointer_down(Point::new(50.0, 50.0), 0, mods, 2);
-            pump(&mut e, &fx);
-        }
-        {
-            let fx = e.cancel_text();
-            pump(&mut e, &fx);
-        }
-        assert!(e.doc.is_empty());
-    }
-
-    #[test]
     fn style_patch_applies_to_selection_and_undoes() {
         use crate::model::{FillPattern, StylePatch};
         let mut e = editor();
@@ -6560,8 +6491,7 @@ mod tests {
             "clicking the pile is a no-op"
         );
 
-        // Select-drag from the middle pulls a note too (Miro-style), the
-        // pile staying put.
+        // Select-drag from the middle pulls a note too, the pile staying put.
         press(&mut e, "v", mods, 11);
         {
             let fx = e.pointer_down(Point::new(300.0, 300.0), 0, mods, 12);

@@ -98,11 +98,6 @@ test("double-click a shape to add bound text that moves with it", async ({ page 
   await page.keyboard.press("Escape");
   expect(await count(page)).toBe(2);
 
-  const textBoundsBefore = await page.evaluate(() => {
-    const editor = window.__rsEditor!;
-    return editor.selection_bounds() ? Array.from(editor.selection_bounds()!) : undefined;
-  });
-
   // Select and move the shape by dragging its edge, then select the text.
   await page.mouse.move(210, 210);
   await page.mouse.down();

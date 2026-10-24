@@ -1,6 +1,6 @@
 //! Snapshot reconciliation: merge two documents deterministically.
 //!
-//! This is the insurance ADR-0002 bought: a pure `reconcile(local, remote)`
+//! Implements ADR-0002's merge-ready model: a pure `reconcile(local, remote)`
 //! with documented last-writer-wins rules that a CRDT can later replace
 //! without touching the document model.
 //!

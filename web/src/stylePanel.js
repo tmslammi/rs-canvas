@@ -40,6 +40,7 @@ export function createStylePanel(container, editor) {
     const el = document.createElement("button");
     el.textContent = glyph;
     el.title = title;
+    el.setAttribute("aria-label", title);
     el.addEventListener("click", () => {
       run();
     });
@@ -57,6 +58,7 @@ export function createStylePanel(container, editor) {
         color === "transparent"
           ? `${field === "strokeColor" ? "Stroke" : "Fill"} transparent`
           : `${field === "strokeColor" ? "Stroke" : "Fill"} ${color}`;
+      el.setAttribute("aria-label", el.title);
       if (color === "transparent") {
         el.classList.add("swatch-transparent");
       } else {
@@ -119,6 +121,7 @@ export function createStylePanel(container, editor) {
   const opacityRow = row("Opacity");
   opacity = document.createElement("input");
   opacity.type = "range";
+  opacity.setAttribute("aria-label", "Opacity");
   opacity.min = "10";
   opacity.max = "100";
   opacity.value = "100";
@@ -148,7 +151,9 @@ export function createStylePanel(container, editor) {
       return;
     }
     for (const { el, match } of matchers) {
-      el.classList.toggle("active", match(style));
+      const active = match(style);
+      el.classList.toggle("active", active);
+      el.setAttribute("aria-pressed", String(active));
     }
     opacity.value = String(Math.round(style.opacity * 100));
   };

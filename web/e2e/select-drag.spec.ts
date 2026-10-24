@@ -1,20 +1,9 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test } from "@playwright/test";
 
 // Bulk-selection drag at scale: marquee-select the whole overview board,
 // then drag it. Exercises the preview path (no per-move rebuilds, no
 // per-move index maintenance) plus release settle, in the real browser.
 
-declare global {
-  interface Window {
-    __rsEditor?: {
-      element_count(): number;
-      load_connected_fixture(nodes: number, arrowsPerNode: number): void;
-      zoom_to_fit(): void;
-      render(): void;
-      selection_bounds(): Float64Array | undefined;
-    };
-  }
-}
 
 test("bulk drag of a 50k board stays interactive", async ({ page }) => {
   test.setTimeout(300_000);

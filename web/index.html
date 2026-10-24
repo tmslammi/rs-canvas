@@ -3,19 +3,37 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="A local browser drawing tool for freehand sketches and hand-drawn cloud architecture diagrams."
+    />
+    <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" content="#1a1815" />
     <title>rs-canvas</title>
     <link
       rel="icon"
       href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%231a1815'/%3E%3Cpath d='M9 21 L16 8 L23 21 L16 25 Z' fill='none' stroke='%23d98e32' stroke-width='2' stroke-linejoin='round'/%3E%3C/svg%3E"
     />
+    <link
+      rel="preload"
+      href="/fonts/ComicShanns-Regular.ttf"
+      as="font"
+      type="font/ttf"
+      crossorigin
+    />
     <link rel="stylesheet" href="/src/styles.css" />
   </head>
   <body>
     <div id="app">
-      <canvas id="scene"></canvas>
-      <canvas id="grid"></canvas>
-      <canvas id="overlay"></canvas>
-      <textarea id="text-editor" spellcheck="false" autocomplete="off"></textarea>
+      <canvas id="scene" aria-label="Drawing canvas"></canvas>
+      <canvas id="grid" aria-hidden="true"></canvas>
+      <canvas id="overlay" aria-hidden="true"></canvas>
+      <textarea
+        id="text-editor"
+        aria-label="Text editor"
+        spellcheck="false"
+        autocomplete="off"
+      ></textarea>
       <div id="toolbar" role="toolbar" aria-label="Tools"></div>
       <aside id="style-panel" aria-label="Style"></aside>
     </div>

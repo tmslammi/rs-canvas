@@ -22,8 +22,12 @@ const TOOLS = [
 
 async function loadFonts() {
   const face = new FontFace("ComicShanns", "url(/fonts/ComicShanns-Regular.ttf)");
-  await face.load();
-  document.fonts.add(face);
+  try {
+    await face.load();
+    document.fonts.add(face);
+  } catch (error) {
+    console.warn("handwriting font unavailable; using the system font", error);
+  }
 }
 
 async function boot() {
@@ -49,6 +53,8 @@ async function boot() {
 
   const toast = document.createElement("div");
   toast.id = "toast";
+  toast.setAttribute("role", "status");
+  toast.setAttribute("aria-live", "polite");
   document.body.appendChild(toast);
   let toastTimer = 0;
   const showToast = (message, isError = false) => {
@@ -74,22 +80,27 @@ async function boot() {
   const gridButton = document.createElement("button");
   gridButton.textContent = "#";
   gridButton.title = "Grid — G";
+  gridButton.setAttribute("aria-label", "Toggle grid");
   const gridSizeButton = document.createElement("button");
   const snapButton = document.createElement("button");
   snapButton.textContent = "🧲";
   snapButton.title = "Snap to grid — ⇧G";
+  snapButton.setAttribute("aria-label", "Toggle snap to grid");
   const zoomButton = document.createElement("button");
+  zoomButton.setAttribute("aria-label", "Zoom speed");
 
   const updateGridSizeButton = () => {
     const size = Math.round(editor.grid_size());
     gridSizeButton.textContent = String(size);
     gridSizeButton.title = `Grid size — ${size} world units (click to change)`;
+    gridSizeButton.setAttribute("aria-label", `Grid size ${size}`);
   };
 
   const updateZoomButton = () => {
     const value = editor.zoom_sensitivity();
     zoomButton.textContent = `${value}×`;
     zoomButton.title = `Zoom speed — ${value}× (⌘/Ctrl + wheel)`;
+    zoomButton.setAttribute("aria-label", `Zoom speed ${value} times`);
   };
 
   const persist = (key, value) => {
@@ -103,12 +114,14 @@ async function boot() {
   const setGridVisible = (visible, remember = true) => {
     editor.set_grid_visible(visible);
     gridButton.classList.toggle("active", visible);
+    gridButton.setAttribute("aria-pressed", String(visible));
     if (remember) persist(GRID_KEY, visible);
   };
 
   const setSnapEnabled = (enabled, remember = true) => {
     editor.set_snap_enabled(enabled);
     snapButton.classList.toggle("active", enabled);
+    snapButton.setAttribute("aria-pressed", String(enabled));
     if (remember) persist(SNAP_KEY, enabled);
   };
 
@@ -194,6 +207,7 @@ async function boot() {
     const button = document.createElement("button");
     button.textContent = tool.glyph;
     button.title = `${tool.label} — ${tool.shortcut}`;
+    button.setAttribute("aria-label", tool.label);
     button.addEventListener("click", () => {
       if (editor.active_tool() === tool.name) return;
       editor.set_tool(tool.name);
@@ -219,7 +233,8 @@ async function boot() {
 
   const undoButton = document.createElement("button");
   undoButton.textContent = "↶";
-  undoButton.title = "Undo — ⌘Z";
+  undoButton.title = "Undo — Ctrl/Cmd+Z";
+  undoButton.setAttribute("aria-label", "Undo");
   undoButton.addEventListener("click", () => {
     editor.undo();
     refreshToolbar();
@@ -227,7 +242,8 @@ async function boot() {
 
   const redoButton = document.createElement("button");
   redoButton.textContent = "↷";
-  redoButton.title = "Redo — ⇧⌘Z";
+  redoButton.title = "Redo — Shift+Ctrl/Cmd+Z";
+  redoButton.setAttribute("aria-label", "Redo");
   redoButton.addEventListener("click", () => {
     editor.redo();
     refreshToolbar();
@@ -236,15 +252,16 @@ async function boot() {
   toolbar.appendChild(undoButton);
   toolbar.appendChild(redoButton);
 
-  // -- files --------------------------------------------------------------
+  // -- document actions ---------------------------------------------------
 
-  const fileDivider = document.createElement("div");
-  fileDivider.className = "divider";
-  toolbar.appendChild(fileDivider);
+  const actionDivider = document.createElement("div");
+  actionDivider.className = "divider";
+  toolbar.appendChild(actionDivider);
 
   const newButton = document.createElement("button");
   newButton.textContent = "✚";
   newButton.title = "New drawing";
+  newButton.setAttribute("aria-label", "New drawing");
   newButton.addEventListener("click", () => {
     editor.new_document();
     refreshToolbar();
@@ -254,6 +271,7 @@ async function boot() {
   const seedButton = document.createElement("button");
   seedButton.textContent = "🌱";
   seedButton.title = "Seed demo";
+  seedButton.setAttribute("aria-label", "Load the demo architecture");
   seedButton.addEventListener("click", () => {
     editor.seed_demo();
     refreshToolbar();
@@ -279,7 +297,13 @@ async function boot() {
   const agentButton = document.createElement("button");
   agentButton.textContent = "◎";
   agentButton.title = "Agent settings";
-  agentButton.addEventListener("click", () => agentPanel.toggle());
+  agentButton.setAttribute("aria-label", "Agent settings");
+  agentButton.setAttribute("aria-haspopup", "dialog");
+  agentButton.setAttribute("aria-controls", "agent-panel");
+  agentButton.setAttribute("aria-expanded", "false");
+  agentButton.addEventListener("click", () => {
+    agentButton.setAttribute("aria-expanded", String(agentPanel.toggle()));
+  });
   toolbar.appendChild(agentDivider);
   toolbar.appendChild(agentButton);
 
@@ -290,6 +314,7 @@ async function boot() {
       const isActive = name === active;
       button.classList.toggle("active", isActive);
       button.classList.toggle("locked", isActive && locked);
+      button.setAttribute("aria-pressed", String(isActive));
     }
     undoButton.disabled = !editor.can_undo();
     redoButton.disabled = !editor.can_redo();
@@ -797,7 +822,6 @@ async function boot() {
     },
   });
 
-  window.__rsWorkspace = workspace;
   if (workspace !== requestedWorkspace) showToast("Invalid workspace name. Opened default instead.", true);
   try {
     const message = sessionStorage.getItem("rs-canvas-workspace-message");

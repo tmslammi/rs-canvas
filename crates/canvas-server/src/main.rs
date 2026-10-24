@@ -1,5 +1,5 @@
 //! The rs-canvas server: static app, WebSocket bridge to the open page, and
-//! the MCP endpoint opencode uses to drive the canvas.
+//! the MCP endpoint agent clients use to drive the canvas.
 //!
 //! Binding is `127.0.0.1` only: the agent bridge is a local dev surface, not
 //! a networked service.

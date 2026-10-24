@@ -1,7 +1,7 @@
 import { expect, type APIRequestContext } from "@playwright/test";
 
-// A tiny MCP Streamable HTTP client for e2e tests: the same endpoint opencode
-// uses, driven directly.
+// A tiny MCP Streamable HTTP client for e2e tests: the same endpoint agent
+// clients use, driven directly.
 
 export interface ToolResult {
   isError?: boolean;
@@ -72,7 +72,7 @@ export function mcpClient(request: APIRequestContext, base: string): McpClient {
 }
 
 /** Parse a tool result's text as JSON. */
-export function toolJson(result: ToolResult): Record<string, unknown> {
+export function toolJson(result: ToolResult): Record<string, any> {
   const text = result.content?.find((block) => block.type === "text")?.text;
   expect(text, "tool returned no text").toBeTruthy();
   return JSON.parse(text!);

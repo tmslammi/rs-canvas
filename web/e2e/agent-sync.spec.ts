@@ -7,8 +7,8 @@ import { expect, test, type BrowserContext, type Page } from "@playwright/test";
 import { elementCount, mcpClient, toolJson } from "./mcp-client";
 
 // Document sync: the page and the server keep one drawing through the
-// merge-ready model. This spec runs against its own server on 4175 (its
-// assertions are exact element counts) and in serial.
+// merge-ready model. This spec runs against its own server (`testBase(2)`;
+// its assertions are exact element counts) and in serial.
 
 test.describe.configure({ mode: "serial" });
 
@@ -181,10 +181,10 @@ test("a canvas_pen stroke lands as a freehand element", async ({
       (e) => e.type === "freehand",
     );
   });
-  expect(element.pressures).toEqual([0.2, 1.0, 0.6]);
-  expect(element.style.strokeColor).toBe("#ff8787");
-  expect(element.style.strokeWidth).toBe(5);
-  expect(element.style.fillColor).toBe("#ffec99");
+  expect(element!.pressures).toEqual([0.2, 1.0, 0.6]);
+  expect(element!.style.strokeColor).toBe("#ff8787");
+  expect(element!.style.strokeWidth).toBe(5);
+  expect(element!.style.fillColor).toBe("#ffec99");
 });
 
 test("canvas_script builds a diagram in one atomic call", async ({

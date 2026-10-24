@@ -2,7 +2,6 @@ declare global {
   interface Window {
     __rsReady?: boolean;
     __rsAgentConnected?: boolean;
-    __rsWorkspace?: string;
     __rsEditor?: {
       scroll(): Float64Array;
       zoom(): number;
@@ -10,6 +9,9 @@ declare global {
       zoom_to_fit(): void;
       reset_zoom(): void;
       element_count(): number;
+      pointer_down(x: number, y: number, button: number, mods: { shift: boolean; alt: boolean; ctrl: boolean; meta: boolean }): void;
+      pointer_move(x: number, y: number, mods: { shift: boolean; alt: boolean; ctrl: boolean; meta: boolean }): void;
+      pointer_up(x: number, y: number, button: number, mods: { shift: boolean; alt: boolean; ctrl: boolean; meta: boolean }): void;
       new_document(): void;
       active_tool(): string;
       set_tool(name: string): void;
@@ -20,8 +22,11 @@ declare global {
       selection_bounds(): Float64Array | undefined;
       current_style(): string;
       update_style(patch: string): void;
+      commit_text(id: string, text: string): void;
       save_json(): string;
+      snapshot_json(): string;
       load_json(json: string): void;
+      flush_save(): void;
       export_svg(): string;
       export_png(scale: number): string;
       load_benchmark_fixture(count: number): void;
@@ -38,6 +43,7 @@ declare global {
       snap_enabled(): boolean;
       route_for(id: string): Float64Array;
       wheel(x: number, y: number, dx: number, dy: number, ctrl: boolean): void;
+      zoom_at(x: number, y: number, factor: number): void;
       render(): void;
       benchmark_tick(dx: number, dy: number): void;
       presentation_state(): string;

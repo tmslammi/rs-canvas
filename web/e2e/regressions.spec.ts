@@ -54,10 +54,10 @@ test("undo and redo work from the toolbar", async ({ page }) => {
   await drawRect(page);
   expect(await count(page)).toBe(1);
 
-  await page.getByTitle("Undo — ⌘Z").click();
+  await page.getByRole("button", { name: "Undo" }).click();
   expect(await count(page)).toBe(0);
 
-  await page.getByTitle("Redo — ⇧⌘Z").click();
+  await page.getByRole("button", { name: "Redo" }).click();
   expect(await count(page)).toBe(1);
 });
 
@@ -69,11 +69,11 @@ test("styling a restored shape enables the undo toolbar button", async ({ page }
   await page.evaluate((json) => window.__rsEditor!.load_json(json), saved);
   await page.keyboard.press("v");
   await page.mouse.click(300, 250);
-  await expect(page.getByTitle("Undo — ⌘Z")).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Undo" })).toBeDisabled();
   await page.getByTitle("Stroke #ff8787").click();
   expect(await page.evaluate(() => window.__rsEditor!.can_undo())).toBe(true);
-  await expect(page.getByTitle("Undo — ⌘Z")).toBeEnabled();
-  await page.getByTitle("Undo — ⌘Z").click();
+  await expect(page.getByRole("button", { name: "Undo" })).toBeEnabled();
+  await page.getByRole("button", { name: "Undo" }).click();
   const restored = JSON.parse(await page.evaluate(() => window.__rsEditor!.save_json()));
   expect(Object.values<any>(restored.elements)[0].style.strokeColor).toBe("#ece4d6");
 });

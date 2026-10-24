@@ -1,4 +1,4 @@
-//! The MCP surface: opencode drives the canvas through these tools.
+//! The MCP surface: local agent clients drive the canvas through these tools.
 //!
 //! View tools (camera, highlights) are transient; they never touch the
 //! document, history or storage. Drawing tools edit the mirrored document.
@@ -559,7 +559,8 @@ fn describe_changes(
 #[derive(Clone)]
 pub struct CanvasServer {
     state: Arc<AppState>,
-    /// Last observed workspace on this MCP session; guards legacy writes too.
+    /// Last workspace observed on this MCP session; guards writes that do not
+    /// pass an explicit context token.
     observed: Arc<tokio::sync::Mutex<Option<String>>>,
 }
 

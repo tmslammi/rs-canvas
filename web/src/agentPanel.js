@@ -60,7 +60,7 @@ export function createAgentPanel(host, { onChange }) {
 
   const note = document.createElement("div");
   note.className = "agent-note";
-  note.textContent = "Live preferences; the agent reads them.";
+  note.textContent = "Changes apply immediately and are shared with the agent.";
   panel.appendChild(note);
 
   const discussion = document.createElement("section");
@@ -99,10 +99,14 @@ export function createAgentPanel(host, { onChange }) {
 
   const render = () => {
     for (const [value, button] of cameraRow.buttons) {
-      button.classList.toggle("active", value === settings.camera);
+      const active = value === settings.camera;
+      button.classList.toggle("active", active);
+      button.setAttribute("aria-pressed", String(active));
     }
     for (const [value, button] of pacingRow.buttons) {
-      button.classList.toggle("active", value === settings.pacing);
+      const active = value === settings.pacing;
+      button.classList.toggle("active", active);
+      button.setAttribute("aria-pressed", String(active));
     }
   };
   render();
@@ -110,7 +114,7 @@ export function createAgentPanel(host, { onChange }) {
   host.appendChild(panel);
   return {
     setDiscussion,
-    toggle: () => panel.classList.toggle("hidden"),
+    toggle: () => !panel.classList.toggle("hidden"),
     setSettings: (next) => {
       settings = {
         camera: next?.camera ?? "gentle",

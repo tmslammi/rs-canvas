@@ -1,7 +1,3 @@
----
-status: accepted
----
-
 # Workspaces isolate concurrent canvas users; the agent follows the user
 
 The server hosts many **workspaces** instead of one canvas. A workspace is a named, isolated drawing context — one document and the pages viewing it — and the unit of isolation between concurrent users of the same server. Pages pin a tab to a workspace with `?ws=name`; each tab is a live view of exactly that document, with its own autosave slot. The agent has no workspace of its own: every tool call targets the **current workspace** — the one the user's most recently active page is on, or `default` when no page is connected. The workspace is therefore context the page reports (like the camera and selection hints of ADR-0006), not routing state the agent owns: the agent can never draw somewhere the user isn't looking, and view commands stop hitting every open tab. `default` is the unnamed workspace, so existing URLs, `--doc`, the autosave key and single-canvas behaviour are unchanged. Aliases, revisions, change logs, view hints, page broadcasts and pending present/screenshot requests are scoped per workspace; agent settings stay global. Workspaces other than `default` persist beside the default document at `workspaces/<name>.json`.

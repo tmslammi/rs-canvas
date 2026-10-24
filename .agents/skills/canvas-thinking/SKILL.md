@@ -12,8 +12,9 @@ constraint is ambiguous.
 For drawing, editing, arranging, reverting or saving discussion notes, delegate
 to the canvas agent. In Codex, spawn the custom agent type canvas; include the
 workspace context, observed revision, relevant handles, desired change and
-constraints. The primary agent's tool allowlist deliberately excludes mutations.
-Keep discussion, read tools and gentle presentation on the primary agent.
+constraints. Codex's allowlist excludes mutations; in OpenCode the mutating
+tools ask for approval. Keep discussion, read tools and gentle presentation on
+the primary agent.
 
 Preserve alternatives while exploring. Verify the canvas agent's returned changed
 lines and transaction; use a scoped read or screenshot when needed. A stale context

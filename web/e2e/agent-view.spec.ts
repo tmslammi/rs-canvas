@@ -2,12 +2,13 @@ import { testBase } from "./server-address";
 import { expect, test } from "@playwright/test";
 import { mcpClient, toolJson } from "./mcp-client";
 
-// The agent bridge: the same MCP endpoint opencode uses, driven over HTTP here.
+// The agent bridge: the same MCP endpoint agent clients use, driven over HTTP here.
 // Every test exercises server -> WebSocket -> wasm, so the whole view path is
 // covered without an LLM in the loop.
 //
-// This spec runs against its own server on 4174 and in serial: view commands
-// broadcast to every connected page, so parallel pages would stomp each other.
+// This spec runs against its own server (`testBase(1)`) and in serial: view
+// commands broadcast to every connected page, so parallel pages would stomp
+// each other.
 
 test.describe.configure({ mode: "serial" });
 

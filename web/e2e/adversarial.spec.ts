@@ -20,7 +20,6 @@ const elements = (page: Page) =>
 
 const byType = (page: Page, t: string) => elements(page).then((es) => es.filter((e) => e.type === t));
 
-const scroll = (page: Page) => page.evaluate(() => Array.from(window.__rsEditor!.scroll()));
 const zoom = (page: Page) => page.evaluate(() => window.__rsEditor!.zoom());
 const newDoc = (page: Page) => page.evaluate(() => window.__rsEditor!.new_document());
 
@@ -245,19 +244,13 @@ test("deleting a bound shape leaves no dangling reference", async ({ page }) => 
   expect(rectsFinite(await elements(page))).toBeUndefined();
   if (bindingBefore && bindingAfter) {
     const ids = new Set((await elements(page)).map((e) => e.id));
-    if (ids.has(bindingAfter)) {
-      // binding retargeted to a live element — fine
-    } else {
-      // report the smell: stale elementId persisted through delete + reload
-      console.log(`dangling binding survived delete+load: ${bindingAfter}`);
-    }
+    expect(ids.has(bindingAfter), `dangling binding after delete+load: ${bindingAfter}`).toBe(true);
   }
 });
 
 test("undoing a bound-shape delete restores the binding", async ({ page }) => {
   await boot(page);
   await boundPair(page);
-  const a0 = (await byType(page, "arrow"))[0];
   await page.keyboard.press("v");
   await page.mouse.click(300, 250);
   await page.keyboard.press("Delete");
@@ -266,7 +259,6 @@ test("undoing a bound-shape delete restores the binding", async ({ page }) => {
   expect(a1.start.binding, "start binding lost").toBeDefined();
   expect(a1.end.binding, "end binding lost").toBeDefined();
   // still follows: move the rect, endpoint tracks
-  const before = a1.start.x;
   await drag(page, 300, 250, 300, 380, 5);
   const a2 = (await byType(page, "arrow"))[0];
   expect(a2.start.y).not.toBe(250);
@@ -319,7 +311,6 @@ test("arrow endpoint can be rebound by dragging it", async ({ page }) => {
   await page.keyboard.press("v");
   await page.mouse.click(1000, 650); // deselect
   // select the arrow by clicking its midpoint
-  const a0 = (await byType(page, "arrow"))[0];
   await page.mouse.click(505, 250);
   const b = await bounds(page);
   expect(b, "arrow not selected").toBeDefined();
@@ -328,7 +319,6 @@ test("arrow endpoint can be rebound by dragging it", async ({ page }) => {
   const a1 = (await byType(page, "arrow"))[0];
   const endId = a1.end.binding?.elementId;
   const third = (await byType(page, "shape")).find((r) => r.rect.y === 450);
-  console.log(`rebind: end ${a0.end.binding?.elementId} -> ${endId}; third=${third?.id}`);
   expect(a1.end.binding, "endpoint did not rebind").toBeDefined();
   if (third) expect(endId).toBe(third.id);
 });
@@ -405,16 +395,15 @@ test("undo after new_document does not resurrect the old doc", async ({ page }) 
   expect(await count(page), "undo crossed new_document").toBe(0);
 });
 
-test("save_json drops tombstones", async ({ page }) => {
+test("save_json keeps tombstones for merge", async ({ page }) => {
   await boot(page);
   for (let i = 0; i < 10; i++) await rect(page, 100 + i * 20, 100, 150 + i * 20, 160);
   await page.keyboard.press("v");
   await page.keyboard.press("ControlOrMeta+a");
   await page.keyboard.press("Delete");
   const d = await doc(page);
-  const keys = Object.keys(d.elements);
-  const tombstones = keys.filter((k) => d.elements[k].isDeleted);
-  console.log(`doc holds ${keys.length} keys, ${tombstones.length} tombstones, count=${await count(page)}`);
+  const tombstones = Object.values(d.elements).filter((e: any) => e.isDeleted);
+  expect(tombstones, "deleted elements stay in the saved document").toHaveLength(10);
   expect(await count(page)).toBe(0);
 });
 
@@ -441,17 +430,21 @@ test("reversed drags normalize the rect", async ({ page }) => {
   expect(Math.abs(r.x - 400) < 2 && Math.abs(r.y - 400) < 2 && Math.abs(r.w - 200) < 2 && Math.abs(r.h - 100) < 2).toBe(true);
 });
 
-test("a 2px shape is drawable, selectable, erasable", async ({ page }) => {
+test("tiny shapes: a 2px drag is discarded, a 4px shape is selectable and erasable", async ({
+  page,
+}) => {
   await boot(page);
   await rect(page, 400, 400, 402, 402);
-  const c = await count(page);
-  console.log(`tiny drag created ${c} elements`);
-  if (c === 1) {
-    await page.keyboard.press("v");
-    await page.mouse.click(401, 401);
-    const b = await bounds(page);
-    console.log(`tiny shape selectable: ${b !== undefined}`);
-  }
+  expect(await count(page), "a 2px drag is below the draw threshold").toBe(0);
+
+  await rect(page, 400, 400, 404, 404);
+  expect(await count(page)).toBe(1);
+  await page.keyboard.press("v");
+  await page.mouse.click(402, 402);
+  expect(await bounds(page), "the small shape should be selectable").toBeDefined();
+  await page.keyboard.press("e");
+  await page.mouse.click(402, 402);
+  expect(await count(page), "the eraser should remove it").toBe(0);
 });
 
 test("NaN and hostile numeric input cannot poison the camera", async ({ page }) => {
@@ -488,7 +481,6 @@ test("NaN and hostile numeric input cannot poison the camera", async ({ page }) 
     }
     return out;
   });
-  console.log(JSON.stringify(results, null, 1));
   const bad = Object.entries(results).filter(([, v]) => v.includes("POISONED"));
   expect(bad, `camera poisoned: ${JSON.stringify(results)}`).toEqual([]);
   // still functional
@@ -523,7 +515,15 @@ test("update_style fuzz: rejects garbage, clamps or stores extremes", async ({ p
     e.update_style('{"opacity":1,"strokeWidth":2,"fontSize":20,"roughness":1}');
     return out;
   });
-  for (const [k, v] of Object.entries(results)) console.log(`${k} -> ${v}`);
+  expect(results["not json"]).toBe("rejected");
+  expect(results['{"strokeColor":123}']).toBe("rejected");
+  expect(results['{"fillStyle":"lava"}']).toBe("rejected");
+  expect(results['{"opacity":-1}']).toContain('"opacity":0.05');
+  expect(results['{"opacity":5}']).toContain('"opacity":1.0');
+  expect(results['{"strokeWidth":-3}']).toContain('"strokeWidth":0.5');
+  expect(results['{"strokeWidth":1000}']).toContain('"strokeWidth":64.0');
+  expect(results['{"fontSize":0}']).toContain('"fontSize":8.0');
+  expect(results['{"roughness":99}']).toContain('"roughness":2');
   // after extremes, a fresh shape must still draw sanely
   await rect(page, 300, 300, 460, 400);
   const s = (await byType(page, "shape"))[0].style;
@@ -543,7 +543,7 @@ test("set_tool with a bogus name", async ({ page }) => {
       return "threw";
     }
   });
-  console.log(`active_tool after bogus set: ${t}`);
+  expect(t, "a bogus tool name must leave the active tool unchanged").toBe("select");
   await page.evaluate(() => {
     const m = { shift: false, alt: false, ctrl: false, meta: false };
     const e = window.__rsEditor!;
@@ -557,13 +557,7 @@ test("set_tool with a bogus name", async ({ page }) => {
 
 test("commit_text on a dead id is a no-op", async ({ page }) => {
   await boot(page);
-  await page.evaluate(() => {
-    try {
-      window.__rsEditor!.commit_text("does-not-exist", "ghost");
-    } catch (e) {
-      console.log("threw", e);
-    }
-  });
+  await page.evaluate(() => window.__rsEditor!.commit_text("does-not-exist", "ghost"));
   expect(await count(page)).toBe(0);
 });
 
@@ -583,7 +577,10 @@ test("export_png scale edge values", async ({ page }) => {
     }
     return out;
   });
-  for (const [k, v] of Object.entries(results)) console.log(`scale ${k}: ${v}`);
+  expect(results["0"], "scale 0 must be rejected").toContain("threw");
+  expect(results["-2"], "a negative scale must be rejected").toContain("threw");
+  expect(results["0.5"]).toMatch(/^ok \d+ chars$/);
+  expect(results["4"]).toMatch(/^ok \d+ chars$/);
 });
 
 /* ------------------------------------------------------------------ */
@@ -617,8 +614,8 @@ test("crafted: arrow bound to a deleted element", async ({ page }) => {
   const status = await page.evaluate(() => {
     const d = JSON.parse(window.__rsEditor!.save_json());
     // delete the end binding's target shape
-    for (const [id, e] of Object.entries(d.elements) as any) {
-      if (e.type === "arrow") delete d.elements[(e as any).end.binding.elementId];
+    for (const e of Object.values(d.elements) as any[]) {
+      if (e.type === "arrow") delete d.elements[e.end.binding.elementId];
     }
     const s = JSON.stringify(d);
     window.__rsEditor!.new_document();
@@ -629,7 +626,7 @@ test("crafted: arrow bound to a deleted element", async ({ page }) => {
       return "threw: " + String(err).slice(0, 120);
     }
   });
-  console.log(`dangling binding load: ${status}; count=${await count(page)}`);
+  expect(status, "a document with a dangling binding should load and heal").toBe("loaded");
   // exercise the possibly-corrupt arrow
   await page.keyboard.press("v");
   await page.mouse.click(505, 250);
@@ -668,7 +665,6 @@ test("crafted: cyclic container_id between texts", async ({ page }) => {
       return "threw";
     }
   });
-  console.log(`cyclic containers: ${status}`);
   expect(status).not.toBe("threw"); // cycle should be tolerated or rejected, not crash
   await page.keyboard.press("v");
   await page.keyboard.press("ControlOrMeta+a");
@@ -710,7 +706,15 @@ test("crafted: unknown element type and bogus fields", async ({ page }) => {
     }
     return out;
   });
-  for (const [k, v] of Object.entries(results)) console.log(`${k}: ${v}`);
+  expect(results["evil type"]).toBe("rejected");
+  expect(results["missing shape field"]).toBe("rejected");
+  expect(results["schemaVersion 99"]).toBe("rejected");
+  expect(results["schemaVersion 0"]).toBe("rejected");
+  expect(results["negative w/h"]).toContain("loaded");
+  expect(results["bogus routing"]).toBe("rejected");
+  expect(results["isDeleted true"]).toContain("loaded (count=0)");
+  expect(results["duplicate index"]).toContain("loaded");
+  expect(results["mismatched key/id"]).toBe("rejected");
   // editor must still be alive after all that
   await newDoc(page);
   await rect(page, 200, 200, 300, 280);
@@ -728,11 +732,11 @@ test("crafted: absurd numeric values", async ({ page }) => {
     ["opacity=1e999", [/("opacity": )[\d.]+/, "$11e999"]],
   ] as Array<[string, [RegExp, string]]>) {
     const mutant = base.replace(re[0], re[1]);
-    const status = await tryLoad(page, mutant);
+    await tryLoad(page, mutant);
     const c = await count(page);
     const z = await zoom(page);
-    console.log(`${name}: ${status}, count=${c}, zoom=${z}`);
     expect(Number.isFinite(z), `zoom poisoned by ${name}`).toBe(true);
+    expect(c, `element count poisoned by ${name}`).toBe(1);
   }
 });
 
@@ -811,7 +815,7 @@ test("clicking a toolbar tool mid-edit commits the text", async ({ page }) => {
 /* device pixel ratio                                                   */
 /* ------------------------------------------------------------------ */
 
-test("drawing is correct at deviceScaleFactor=2", async ({ page, browser }) => {
+test("drawing is correct at deviceScaleFactor=2", async ({ browser }) => {
   const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 }, deviceScaleFactor: 2 });
   const p2 = await ctx.newPage();
   await p2.goto("/");
@@ -853,9 +857,7 @@ test("autosave flushes pending edits on reload", async ({ page }) => {
   // pagehide handler must flush the pending autosave.
   await page.reload();
   await page.waitForFunction(() => window.__rsReady === true);
-  const c = await count(page);
-  console.log(`restored ${c} elements after immediate reload`);
-  expect(c, "edit lost to autosave debounce on reload").toBeGreaterThanOrEqual(1);
+  expect(await count(page), "edit lost to autosave debounce on reload").toBeGreaterThanOrEqual(1);
 });
 
 test("flush_save -> immediate reload keeps the doc", async ({ page }) => {
@@ -885,18 +887,16 @@ test("autosave keeps a 10k-element document", async ({ page }) => {
 /* visibility / export purity                                           */
 /* ------------------------------------------------------------------ */
 
-test("opacity-0 shapes: selectable? exported?", async ({ page }) => {
+test("a 5%-opacity shape is clickable; a crafted 0-opacity shape is not", async ({ page }) => {
   await boot(page);
   await page.evaluate(() => window.__rsEditor!.update_style('{"opacity":0}'));
   await rect(page, 300, 300, 460, 400);
   await page.evaluate(() => window.__rsEditor!.update_style('{"opacity":1}'));
-  const b = await bounds(page);
-  console.log(`opacity-0 shape selected after draw: ${b !== undefined}`);
+  expect(await bounds(page), "a new shape should be selected after drawing").toBeDefined();
   await page.keyboard.press("v");
   await page.mouse.click(900, 600);
   await page.mouse.click(380, 350);
-  const b2 = await bounds(page);
-  console.log(`opacity-0 shape clickable: ${b2 !== undefined}`);
+  expect(await bounds(page), "a 5%-opacity shape should still be clickable").toBeDefined();
   // A truly invisible element (opacity 0 — only reachable via crafted load,
   // the UI clamps to 0.05) must not intercept clicks.
   await craftFromLive(page, (d) => {

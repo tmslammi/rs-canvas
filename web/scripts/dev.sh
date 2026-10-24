@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # Serve the app, the WebSocket agent bridge and the MCP endpoint from the Rust
-# server: no bundler, no transpiler, plain ES modules.
+# server. No bundler or transpiler: plain ES modules plus the wasm bundle.
 #
-# The server sets Cache-Control: no-store on every response, because a stale
-# main.js or wasm in the browser looks exactly like "the new feature isn't
-# there" — reloads then appear to do nothing until a hard refresh.
+# The server sends Cache-Control: no-store, so a reload picks up a rebuilt
+# wasm bundle.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

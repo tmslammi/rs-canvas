@@ -37,6 +37,25 @@ curl -fsSL https://raw.githubusercontent.com/tmslammi/rs-canvas/master/install.s
 Apple Silicon and Intel builds are published. Linux and Windows are not yet.
 Maintainer notes live in [`docs/releases.md`](docs/releases.md).
 
+## Keyboard and gestures
+
+| Action | Shortcut |
+| --- | --- |
+| Tools | `V` select, `H` hand, `R` rectangle, `D` diamond, `O` ellipse, `P` draw, `L` line, `A` arrow, `T` text, `N` sticky note, `K` sticky stack, `F` frame, `E` eraser |
+| Pan | Space-drag, middle-drag, or wheel/trackpad scroll |
+| Zoom | Ctrl + wheel or pinch |
+| Fit / reset view | `Shift+1` / `Shift+0` |
+| Undo / redo | Ctrl/Cmd+Z / Shift+Ctrl/Cmd+Z |
+| Copy / cut / paste | Ctrl/Cmd+C / Ctrl/Cmd+X / Ctrl/Cmd+V |
+| Duplicate / select all | Ctrl/Cmd+D / Ctrl/Cmd+A |
+| Delete | Delete or Backspace |
+| Nudge | Arrow keys; hold Shift for 10 px (or one grid cell with snapping) |
+| Reorder | Ctrl/Cmd+] or Ctrl/Cmd+[ |
+| Grid / snap | `G` / `Shift+G` |
+| Cancel | Escape |
+
+Double-click a shape to add or edit its label, a connector to label it, a frame to rename it, or a connector bend to remove the bend. Drag from a connection node to draw a bound arrow.
+
 ## Getting started
 
 Prerequisites: Rust with the `wasm32-unknown-unknown` target, `wasm-bindgen-cli` matching the version in `Cargo.lock` (currently 0.2.129), and Node 24+.
@@ -60,7 +79,7 @@ npm run test:e2e   # build wasm and run the Playwright suite
 
 The dev server exposes an MCP endpoint at `http://127.0.0.1:5173/mcp` and a WebSocket bridge to the open page. The checked-in `opencode.jsonc` and `.codex/config.toml` connect opencode and Codex to it. The agent can:
 
-- read the drawing and the current selection (`canvas_read`, `canvas_status`);
+- read the drawing, the current selection and the glyph catalog (`canvas_read`, `canvas_status`, `canvas_glyphs`);
 - draw and revise shapes, freehand ink, scripts and bulk grids (`canvas_draw`, `canvas_pen`, `canvas_script`, `canvas_bulk`);
 - move the view and capture it (`canvas_focus`, `canvas_point`, `canvas_zoom`, `canvas_screenshot`);
 - annotate, arrange and revert its own edits (`canvas_annotate`, `canvas_emphasis`, `canvas_tidy`, `canvas_clear`, `canvas_revert`);
@@ -85,10 +104,18 @@ cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 
 cd web
+npm run typecheck
 npm run test:e2e
 ```
 
 Set `RS_CANVAS_TEST_PORT=4273` to run the Playwright suite on a different port range.
+
+Benchmarks are local-only:
+
+```sh
+cargo run --release --example perf -p canvas-core
+cd web && npx playwright test massive-bench
+```
 
 ## License
 

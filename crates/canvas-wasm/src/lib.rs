@@ -720,11 +720,6 @@ impl Editor {
         self.apply(effects);
     }
 
-    pub fn cancel_text(&mut self) {
-        let effects = self.core.cancel_text();
-        self.apply(effects);
-    }
-
     /// Apply a style patch (JSON) to the selection and/or defaults.
     pub fn update_style(&mut self, patch_json: &str) -> Result<(), JsValue> {
         let patch: StylePatch = serde_json::from_str(patch_json)
@@ -773,14 +768,6 @@ impl Editor {
     pub fn set_tool(&mut self, name: &str) {
         if let Some(tool) = Tool::from_name(name) {
             let effects = self.core.set_tool(tool);
-            self.apply(effects);
-        }
-    }
-
-    /// Select a tool and keep it armed for repeated use.
-    pub fn set_tool_locked(&mut self, name: &str) {
-        if let Some(tool) = Tool::from_name(name) {
-            let effects = self.core.set_tool_locked(tool);
             self.apply(effects);
         }
     }
@@ -2153,12 +2140,6 @@ pub async fn delete_saved_workspace(workspace: String) -> Result<(), JsValue> {
     storage::delete_workspace(&workspace)
         .await
         .map_err(|error| JsValue::from_str(&error))
-}
-
-/// The shape-library catalog (JSON) for the panel.
-#[wasm_bindgen]
-pub fn glyph_catalog() -> String {
-    serde_json::to_string(&canvas_core::glyph_catalog()).unwrap_or_else(|_| "[]".into())
 }
 
 /// Whether `outer` fully contains `inner`. Used for the renderer's

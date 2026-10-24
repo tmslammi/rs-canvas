@@ -1,6 +1,6 @@
 # The agent drives the canvas over a local bridge
 
-opencode talks to the canvas through an MCP server hosted by the same Rust process that serves the web app: MCP Streamable HTTP at `/mcp` for tools, a WebSocket at `/ws` for the live page. The server mirrors the document; the page owns the interactive copy, and edits flow between them through the existing Delta/merge seam, never through a new protocol. Agent camera and presentation commands are one-way view-state commands: transient, never persisted, never merged, and cancelled by any user input. The server binds `127.0.0.1` only — the bridge is a local development surface, not a deployed one.
+An MCP client talks to the canvas through an MCP server hosted by the same Rust process that serves the web app: MCP Streamable HTTP at `/mcp` for tools, a WebSocket at `/ws` for the live page. The server mirrors the document; the page owns the interactive copy, and edits flow between them through the existing Delta/merge seam, never through a new protocol. Agent camera and presentation commands are one-way view-state commands: transient, never persisted, never merged, and cancelled by any user input. The server binds `127.0.0.1` only — the bridge is a local development surface, not a deployed one.
 
 ## Considered options
 

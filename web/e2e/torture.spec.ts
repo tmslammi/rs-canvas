@@ -22,9 +22,6 @@ const elements = (page: Page) =>
 const liveElements = (page: Page) =>
   doc(page).then((d) => Object.values(d.elements as Record<string, any>).filter((e: any) => !e.isDeleted));
 
-const byType = (page: Page, t: string) =>
-  elements(page).then((es) => es.filter((e) => e.type === t && !e.isDeleted));
-
 const liveByType = (page: Page, t: string) =>
   liveElements(page).then((es) => es.filter((e) => e.type === t));
 

@@ -20,7 +20,6 @@ export function connectAgentBridge(editor, hooks = {}) {
   // Servers can disable document sync (plain static serving for tests); the
   // hello frame says so before any snapshot is sent.
   let syncEnabled = true;
-  let settings = null;
   let lastHint = "";
   const publishHint = (force = false) => {
     if (!syncEnabled || !socket || socket.readyState !== WebSocket.OPEN) return;
@@ -92,8 +91,7 @@ export function connectAgentBridge(editor, hooks = {}) {
       syncEnabled = message.sync !== false;
       hooks.onDiscussionChange?.(message.discussion, message.discussion_persisted);
       if (message.settings) {
-        settings = message.settings;
-        hooks.onSettingsChange?.(settings);
+        hooks.onSettingsChange?.(message.settings);
       }
       publishHint(true);
       return;
@@ -103,8 +101,7 @@ export function connectAgentBridge(editor, hooks = {}) {
       return;
     }
     if (message.type === "settings" && message.settings) {
-      settings = message.settings;
-      hooks.onSettingsChange?.(settings);
+      hooks.onSettingsChange?.(message.settings);
       return;
     }
     if (message.type === "view") {
@@ -159,7 +156,6 @@ export function connectAgentBridge(editor, hooks = {}) {
       }
       return;
     }
-    console.debug("[agent]", message);
   };
 
   const connect = () => {
@@ -172,7 +168,6 @@ export function connectAgentBridge(editor, hooks = {}) {
       retry = RETRY_MIN_MS;
       lastHint = "";
       window.__rsAgentConnected = true;
-      console.info("[agent] bridge connected");
       publishDocument();
     });
 
@@ -217,5 +212,5 @@ export function connectAgentBridge(editor, hooks = {}) {
     window.__rsAgentConnected = false;
     socket?.close();
   };
-  return { publishDocument, publishChanges, patchSettings, close };
+  return { publishChanges, patchSettings, close };
 }

@@ -1,7 +1,7 @@
 import { expect, test, type Page } from "@playwright/test";
 
 // Massive-diagram benchmark: deterministic connected boards, zoomed-out
-// rendering, pan/zoom, and (once exposed) bulk-element motion.
+// rendering, pan/zoom, and bulk-element motion.
 //
 // Measures TWO clocks separately:
 //  - appCpuMs: performance.now() around the editor call (simulation +
@@ -23,19 +23,6 @@ const cpuStats = (v: number[]): CpuStats => {
   return { p50: q(s, 0.5), p95: q(s, 0.95), p99: q(s, 0.99), max: s[s.length - 1] ?? 0, n: s.length };
 };
 
-declare global {
-  interface Window {
-    __rsEditor?: {
-      element_count(): number;
-      load_connected_fixture(nodes: number, arrowsPerNode: number): void;
-      zoom_to_fit(): void;
-      zoom(): number;
-      wheel(x: number, y: number, dx: number, dy: number, ctrl: boolean): void;
-      render(): void;
-      benchmark_tick(dx: number, dy: number): void;
-    };
-  }
-}
 
 async function appCpu(page: Page, fnName: string, iters: number, args: unknown[] = []): Promise<number[]> {
   return page.evaluate(
@@ -108,7 +95,7 @@ const SIZES: Array<{ label: string; nodes: number }> = [
 // Benchmark, not a correctness check: CI runners are noisy and would only
 // burn ten minutes producing meaningless numbers. Run it locally:
 //   npx playwright test massive-bench
-test.skip(process.env.CI, "benchmark runs locally, not in CI");
+test.skip(Boolean(process.env.CI), "benchmark runs locally, not in CI");
 
 test("massive benchmark: zoomed-out render + pan/zoom appCPU vs frame intervals", async ({ page }) => {
   test.setTimeout(600_000);
@@ -118,7 +105,6 @@ test("massive benchmark: zoomed-out render + pan/zoom appCPU vs frame intervals"
     (window as unknown as { __rsPauseAutosave?: (p: boolean) => void }).__rsPauseAutosave?.(true),
   );
 
-  console.log("hardware: see outer log (Apple M4, 10c, 16GB, Chrome 155, 1280x800 viewport)");
   for (const { label, nodes } of SIZES) {
     const loadMs = await page.evaluate(([n]) => {
       const t0 = performance.now();

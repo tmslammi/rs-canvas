@@ -32,7 +32,7 @@ test("sticky notes: place, type, colour and resize", async ({ page }) => {
   await page.keyboard.press("Escape");
   expect(await count(page)).toBe(2);
   const text = (await elements(page)).find((e) => e.type === "text");
-  expect(text.text).toBe("idea");
+  expect(text!.text).toBe("idea");
 
   // A fill swatch recolours the note.
   await page.keyboard.press("v");
@@ -69,11 +69,11 @@ test("sticky stack: pull notes from the middle, move it by the border", async ({
   await page.mouse.up();
   expect(await count(page)).toBe(2);
   const note = (await elements(page)).find((e) => e.type === "shape");
-  expect(note.shape).toBe("sticky");
-  expect(note.rect.x).toBeCloseTo(600 - stackRect.w / 2, 0);
-  expect(note.rect.y).toBeCloseTo(450 - stackRect.h / 2, 0);
+  expect(note!.shape).toBe("sticky");
+  expect(note!.rect.x).toBeCloseTo(600 - stackRect.w / 2, 0);
+  expect(note!.rect.y).toBeCloseTo(450 - stackRect.h / 2, 0);
 
-  // With Select, dragging the middle pulls another note (Miro-style).
+  // With Select, dragging the middle pulls another note.
   await page.keyboard.press("v");
   await page.mouse.move(300, 300);
   await page.mouse.down();
@@ -134,19 +134,19 @@ test("dragging from a connection node draws a bound arrow", async ({ page }) => 
 
   expect(await count(page)).toBe(3);
   const arrow = (await elements(page)).find((e) => e.type === "arrow");
-  expect(arrow.start.binding).toBeDefined();
-  expect(arrow.end.binding).toBeDefined();
+  expect(arrow!.start.binding).toBeDefined();
+  expect(arrow!.end.binding).toBeDefined();
   expect(
     await page.evaluate(() => window.__rsEditor!.active_tool()),
     "the new arrow is selected and Select stays armed",
   ).toBe("select");
 
   // Moving the source shape drags the bound start along.
-  const startY = arrow.start.y;
+  const startY = arrow!.start.y;
   await page.mouse.move(300, 250);
   await page.mouse.down();
   await page.mouse.move(300, 350, { steps: 5 });
   await page.mouse.up();
   const moved = (await elements(page)).find((e) => e.type === "arrow");
-  expect(moved.start.y).toBeCloseTo(startY + 100, 0);
+  expect(moved!.start.y).toBeCloseTo(startY + 100, 0);
 });

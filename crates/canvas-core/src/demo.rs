@@ -1,6 +1,6 @@
-//! The seed demo: a small, proper cloud architecture that exercises the
-//! glyph library, frames, connectors and labels. Loaded from the toolbar —
-//! the app boots empty.
+//! The seed demo: a small cloud architecture that exercises the glyph
+//! library, frames, connectors and labels. Loaded from the toolbar; the app
+//! boots empty.
 
 use crate::connector;
 use crate::geometry::{Point, Rect};
