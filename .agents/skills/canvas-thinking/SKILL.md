@@ -25,10 +25,12 @@ tools ask for approval. Keep discussion, read tools and gentle presentation on
 the primary agent.
 
 Preserve alternatives while exploring. Verify the canvas agent's returned changed
-lines and transaction; use a scoped read or screenshot when needed. A stale context
-requires rereading the workspace, not forcing the write. Playback cancellation
-means the user took over; it does not undo the drawing. Revert can conflict with
-later edits and is retained only during this document lifetime.
+lines and transaction with a scoped `canvas_read`; ask for `canvas_screenshot`
+only when the rendered result itself matters (text wrapping, ink, exact camera
+framing) or the user asks to see it. A stale context requires rereading the
+workspace, not forcing the write. Playback cancellation means the user took over;
+it does not undo the drawing. Revert can conflict with later edits and is retained
+only during this document lifetime.
 
 When decisions become useful context, delegate merging constraints, agreed decisions
 with their reasons, and open questions into canvas_status.discussion. Speculation

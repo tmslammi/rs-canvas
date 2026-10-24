@@ -31,10 +31,12 @@ smallest useful sketch or revision, preserving existing work and element identit
    descriptive local aliases (e<number> is reserved), frame for ownership, and around
    to draw a frame that owns existing elements. Include captions/focus/point only
    when a paced explanation helps; otherwise let the batch land immediately.
-3. Inspect the returned changed lines and removed handles. Use a scoped read or
-   screenshot to verify relationships, labels and spacing. Revise until the brief's
-   intended flow is represented and unintended edits are absent. Playback cancellation
-   means the user took over; the committed drawing still exists.
+3. Inspect the returned changed lines and removed handles. Use a scoped read to
+   verify relationships, labels and spacing; reach for canvas_screenshot only when
+   the rendered result itself matters (text wrapping, ink, exact camera framing) or
+   the user asks to see it. Revise until the brief's intended flow is represented
+   and unintended edits are absent. Playback cancellation means the user took
+   over; the committed drawing still exists.
 4. Report relevant handles, the transaction ID and any unresolved tradeoff briefly.
    Use canvas_revert when asked to back out of an experiment; a conflict means later
    work must be preserved and revised explicitly. Revert is available for the last

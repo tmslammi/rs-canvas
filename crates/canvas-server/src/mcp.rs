@@ -28,7 +28,9 @@ const INSTRUCTIONS: &str =
     "rs-canvas is a hand-drawn architecture canvas open in the user's browser. \
 Use canvas_status to check that the local bridge and the page are up before acting. \
 canvas_read shows the current drawing as compact lines, each starting with a short \
-handle (e1, e2, ...); every tool accepts handles or raw ids. canvas_draw creates one \
+handle (e1, e2, ...); every tool accepts handles or raw ids. It is the primary view \
+of the workspace; canvas_screenshot is only for rendered appearance or when the user \
+asks to see it. canvas_draw creates one \
 element and canvas_pen draws a freehand stroke with per-point pressure and ink style \
 (width, colour, roughness, dash, opacity, fill/shading). \
 Camera and presentation tools move the user's view; they never change the drawing. \
@@ -836,7 +838,9 @@ impl CanvasServer {
                        offset pagination needs the first read's context and unchanged revision. \
                        detail adds exact element JSON, including full stroke points. \
                        summary returns whole-document counts by kind, bounds and top fills \
-                       in a few hundred tokens at any scale: start there on large boards."
+                       in a few hundred tokens at any scale: start there on large boards. \
+                       This is the primary way to understand the workspace; a screenshot \
+                       adds only rendered appearance."
     )]
     async fn canvas_read(
         &self,
@@ -1726,10 +1730,13 @@ impl CanvasServer {
     }
 
     #[tool(
-        description = "Look at the canvas: returns a PNG image of what the user is looking \
-                       at right now, camera included, after any in-flight explanation \
-                       settles. With no page open it renders the whole drawing headlessly. \
-                       Use it to check your own layout, spacing, labels and overlaps."
+        description = "Look at the rendered canvas: returns a PNG image of what the user \
+                       is looking at right now, camera included, after any in-flight \
+                       explanation settles. With no page open it renders the whole drawing \
+                       headlessly. Use canvas_read for geometry, content and handles; reach \
+                       for this only when the rendered result itself matters (text wrapping, \
+                       ink, exact camera framing) or the user asks to see it. It can also \
+                       check your own layout, spacing, labels and overlaps."
     )]
     async fn canvas_screenshot(
         &self,
