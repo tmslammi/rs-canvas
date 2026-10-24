@@ -1,0 +1,30 @@
+{
+  "name": "zoom-100k",
+  "actionError": null,
+  "durationMs": 1023.8,
+  "metrics": {
+    "LayoutCount": 0,
+    "RecalcStyleCount": 0,
+    "LayoutDuration": 0,
+    "RecalcStyleDuration": 0,
+    "ScriptDuration": 0.033057,
+    "TaskDuration": 0.084707,
+    "JSHeapUsedSize": 1842664,
+    "JSHeapTotalSize": 18677760,
+    "Nodes": 262,
+    "Documents": 1,
+    "Frames": 1,
+    "JSEventListeners": 117
+  },
+  "wasm": {
+    "bytes": 215089152,
+    "memories": 1,
+    "grows": 0,
+    "growBytes": 215089152
+  },
+  "longTasks": {
+    "count": 0,
+    "totalMs": 0,
+    "maxMs": 0
+  }
+}

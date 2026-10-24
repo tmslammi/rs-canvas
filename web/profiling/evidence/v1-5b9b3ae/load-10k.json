@@ -1,0 +1,34 @@
+{
+  "name": "load-10k",
+  "actionError": null,
+  "result": {
+    "loadMs": 71.2,
+    "count": 10000
+  },
+  "durationMs": 86.5,
+  "metrics": {
+    "LayoutCount": 0,
+    "RecalcStyleCount": 0,
+    "LayoutDuration": 0,
+    "RecalcStyleDuration": 0,
+    "ScriptDuration": 0.000302,
+    "TaskDuration": 0.086711,
+    "JSHeapUsedSize": 1687540,
+    "JSHeapTotalSize": 4259840,
+    "Nodes": 191,
+    "Documents": 1,
+    "Frames": 1,
+    "JSEventListeners": 101
+  },
+  "wasm": {
+    "bytes": 36044800,
+    "memories": 1,
+    "grows": 0,
+    "growBytes": 36044800
+  },
+  "longTasks": {
+    "count": 1,
+    "totalMs": 71,
+    "maxMs": 71
+  }
+}

@@ -1,0 +1,54 @@
+
+=== evidence/master-7959dae/connector-drag.cpuprofile — total 1038ms of samples ===
+
+top functions by self time:
+     909.6ms  87.6%  [other] (idle) @ (native):0
+      81.2ms   7.8%  [other] (program) @ (native):0
+      10.5ms   1.0%  [wasm] canvas_core::connector::binding_candidate::hf6b739b2b39da84d @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       7.0ms   0.7%  [wasm] <alloc::collections::btree::map::Values<K,V> as core::iter::traits::iterator::Iterator>::next::hb7d1eebd6c704036 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       3.6ms   0.3%  [wasm] canvas_core::model::Element::bounds::h69161c04a9130c6c @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       2.0ms   0.2%  [other] (garbage collector) @ (native):0
+       1.9ms   0.2%  [wasm] canvas_wasm::Editor::paint_dirty::hd80d862b69dd8d11 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       1.7ms   0.2%  [other] evaluate @ (native):305
+       1.7ms   0.2%  [other] (anonymous) @ (native):0
+       1.3ms   0.1%  [other] wasm-to-js @ (native):1
+       1.0ms   0.1%  [other] setupDragListeners @ (native):1
+       1.0ms   0.1%  [js] (anonymous) @ http://localhost:4180/src/main.js:527
+       1.0ms   0.1%  [other] clearRect @ (native):0
+       1.0ms   0.1%  [wasm] js-to-wasm:: @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.7ms   0.1%  [js] __wbg_set_fillStyle_a2961b4d44e572af @ http://localhost:4180/src/wasm/canvas_wasm.js:1171
+       0.7ms   0.1%  [wasm] memcmp @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.6ms   0.1%  [other] requestAnimationFrame @ (native):0
+       0.6ms   0.1%  [other] fill @ (native):0
+       0.6ms   0.1%  [wasm] canvas_core::connector::arrowhead::h840e81fc0fe866ba @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.6ms   0.1%  [other] (anonymous) @ (native):1
+
+totals: wasm 31.0ms (3.0%), js 4.1ms (0.4%)
+
+top wasm functions by self time:
+      10.5ms   1.0%  canvas_core::connector::binding_candidate::hf6b739b2b39da84d @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       7.0ms   0.7%  <alloc::collections::btree::map::Values<K,V> as core::iter::traits::iterator::Iterator>::next::hb7d1eebd6c704036 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       3.6ms   0.3%  canvas_core::model::Element::bounds::h69161c04a9130c6c @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       1.9ms   0.2%  canvas_wasm::Editor::paint_dirty::hd80d862b69dd8d11 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       1.0ms   0.1%  js-to-wasm:: @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.7ms   0.1%  memcmp @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.6ms   0.1%  canvas_core::connector::arrowhead::h840e81fc0fe866ba @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.4ms   0.0%  canvas_core::editor::Editor::node_points_for::h1e911285762cfcc3 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.4ms   0.0%  <alloc::vec::Vec<T,A> as core::ops::drop::Drop>::drop::h2e73567c2fff3fe3 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.4ms   0.0%  canvas_core::connector::elbow_corners::h0f7fe00498bda45e @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.4ms   0.0%  alloc::collections::btree::navigate::<impl alloc::collections::btree::node::Handle<alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Dying,K,V,alloc::collections::btree::node::marker::Leaf>,alloc::collections::btree::node::marker::Edge>>::deallocating_next_unchecked::h0911b25dde180b11 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.3ms   0.0%  alloc::collections::btree::search::<impl alloc::collections::btree::node::NodeRef<BorrowType,K,V,Type>>::find_key_index::h4ce5cfbfe5db1687 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.3ms   0.0%  alloc::vec::in_place_collect::from_iter_in_place::h06bb37a838f4cb67 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.3ms   0.0%  <alloc::vec::into_iter::IntoIter<T,A> as core::ops::drop::Drop>::drop::hf8022f3a73b32880 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.3ms   0.0%  canvas_core::rough::pen_band::hc20a7a71566f8f2b @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.3ms   0.0%  <canvas_wasm::Canvas2dRenderer as canvas_core::display::Renderer>::draw_path::h7ccae1e55c08d974 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.3ms   0.0%  editor_set_pressure @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.3ms   0.0%  alloc::collections::btree::search::<impl alloc::collections::btree::node::NodeRef<BorrowType,K,V,alloc::collections::btree::node::marker::LeafOrInternal>>::search_tree::h7a4a01f673b7dfa3 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.3ms   0.0%  alloc::vec::Vec<T,A>::extend_trusted::hd327e9dc85ec6521 @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.3ms   0.0%  canvas_wasm::Editor::pointer_move::h1f4adeb6294d119f @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+
+top scripts by self time:
+    1003.4ms  96.6%  (native)
+      31.0ms   3.0%  http://localhost:4180/src/wasm/canvas_wasm_bg.wasm
+       2.8ms   0.3%  http://localhost:4180/src/wasm/canvas_wasm.js
+       1.4ms   0.1%  http://localhost:4180/src/main.js

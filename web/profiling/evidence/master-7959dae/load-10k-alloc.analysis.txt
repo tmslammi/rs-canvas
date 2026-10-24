@@ -1,0 +1,11 @@
+
+=== out/load-10k.allocprofile.json — sampled allocations 0.1MB total ===
+
+       0.0MB  (     1 sites)  (anonymous) @ http://localhost:4180/src/wasm/canvas_wasm.js:928
+       0.0MB  (     1 sites)  js-to-wasm:ii: @ http://localhost:4180/src/wasm/canvas_wasm_bg.wasm:1
+       0.0MB  (     1 sites)  (root) @ (native):0
+       0.0MB  (     2 sites)  (anonymous) @ (native):1
+       0.0MB  (     1 sites)  evaluate @ (native):305
+       0.0MB  (     1 sites)  load_benchmark_fixture @ http://localhost:4180/src/wasm/canvas_wasm.js:276
+       0.0MB  (     1 sites)  __wbg_getRandomValues_a678b7300e8ed57f @ http://localhost:4180/src/wasm/canvas_wasm.js:928
+       0.0MB  (     1 sites)  handleError @ http://localhost:4180/src/wasm/canvas_wasm.js:1474

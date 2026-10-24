@@ -1,0 +1,34 @@
+{
+  "name": "boot",
+  "actionError": null,
+  "result": {
+    "bootMs": 50
+  },
+  "durationMs": 8.9,
+  "metrics": {
+    "LayoutCount": 7,
+    "RecalcStyleCount": 8,
+    "LayoutDuration": 0.01543,
+    "RecalcStyleDuration": 0.001029,
+    "ScriptDuration": 0.003827,
+    "TaskDuration": 0.042972,
+    "JSHeapUsedSize": 2306760,
+    "JSHeapTotalSize": 3997696,
+    "Nodes": 281,
+    "Documents": 4,
+    "Frames": 4,
+    "JSEventListeners": 122
+  },
+  "wasm": {
+    "bytes": 1179648,
+    "memories": 1,
+    "grows": 0,
+    "growBytes": 1179648
+  },
+  "longTasks": {
+    "count": 0,
+    "totalMs": 0,
+    "maxMs": 0
+  },
+  "bootMs": 50
+}

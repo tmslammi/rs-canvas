@@ -1,0 +1,30 @@
+{
+  "name": "drag-node-100k",
+  "actionError": null,
+  "durationMs": 2682,
+  "metrics": {
+    "LayoutCount": 1,
+    "RecalcStyleCount": 4,
+    "LayoutDuration": 0.000065,
+    "RecalcStyleDuration": 0.000198,
+    "ScriptDuration": 0.173074,
+    "TaskDuration": 0.328402,
+    "JSHeapUsedSize": 1822868,
+    "JSHeapTotalSize": 18939904,
+    "Nodes": 262,
+    "Documents": 1,
+    "Frames": 1,
+    "JSEventListeners": 597
+  },
+  "wasm": {
+    "bytes": 215023616,
+    "memories": 1,
+    "grows": 0,
+    "growBytes": 215023616
+  },
+  "longTasks": {
+    "count": 0,
+    "totalMs": 0,
+    "maxMs": 0
+  }
+}
