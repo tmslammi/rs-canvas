@@ -27,7 +27,7 @@ scenario shapes and ratios, not isolated milliseconds.
   suite is five tests and took 47 s on the current run.
 - Native probes:
   `cargo run --release --example mem -p canvas-core` and
-  `cargo run --release --example delete_bench -p canvas-core`.
+  `cargo run --release --example delete_scaling -p canvas-core`.
 - The repo's own frame budgets (`web/e2e/perf.spec.ts`,
   `web/e2e/scale.spec.ts`) were the historical cross-check; this report does
   not rerun them because they are not part of the profiling config.
@@ -86,7 +86,7 @@ full elements) remain the things to fix.
 #### #30 — mass delete/restore is still quadratic
 
 Evidence: [`select-all-delete-undo.analysis.txt`](./evidence/master-7959dae/select-all-delete-undo.analysis.txt),
-[`native-delete-bench.txt`](./evidence/master-7959dae/native-delete-bench.txt).
+[`native-delete-scaling.txt`](./evidence/master-7959dae/native-delete-scaling.txt).
 
 `select-all-delete-undo.cpuprofile` totals 1.91 s of samples, 98.9% wasm. Top
 self time:
@@ -267,7 +267,7 @@ node profiling/analyze-memory.mjs heap profiling/out/load-10k.heapsnapshot
 
 cd ..
 cargo run --release --example mem -p canvas-core
-cargo run --release --example delete_bench -p canvas-core
+cargo run --release --example delete_scaling -p canvas-core
 ```
 
 The raw heap snapshot is generated but intentionally not committed (4.6 MB);

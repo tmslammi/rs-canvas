@@ -95,14 +95,14 @@ release-only and need no server:
 
 ```sh
 cargo run --release --example mem -p canvas-core
-cargo run --release --example delete_bench -p canvas-core
+cargo run --release --example delete_scaling -p canvas-core
 ```
 
 - `mem` prints document/scene byte accounting for the 10k- and 100k-node
   connected fixtures. It reports the overview state (approximate layer
   bounds, no draw ops) and the full-detail state (all rough geometry built),
   which is the state the historical v1 report measured eagerly.
-- `delete_bench` runs select-all → delete → undo for 2.5k through 20k mixed
+- `delete_scaling` runs select-all → delete → undo for 2.5k through 20k mixed
   elements and prints delete+scene and undo+scene timings. The scene column
   includes the dirty-layer cache rebuild, not Canvas2D paint.
 

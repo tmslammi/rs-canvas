@@ -1,5 +1,5 @@
 //! Scratch probe: mass delete + undo through the scene rebuild path.
-//! Run with: cargo run --release --example delete_bench -p canvas-core
+//! Run with: cargo run --release --example delete_scaling -p canvas-core
 
 use std::time::Instant;
 
