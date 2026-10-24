@@ -4,7 +4,8 @@
 //! document, history or storage. Drawing tools edit the mirrored document.
 //! The server is created per MCP session but shares `AppState`. Every tool
 //! call acts on the current workspace — the one the user's most recently
-//! active page is viewing (ADR-0007) — never on an agent-owned one.
+//! active page is viewing (ADR-0007) — except `canvas_workspace_create`,
+//! which opens a new workspace and moves that page with it (ADR-0008).
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -20,19 +21,24 @@ use rmcp::{schemars, tool, tool_handler, tool_router, ErrorData as McpError, Ser
 use crate::doc_ops;
 use crate::render;
 use crate::script::{self, ScriptBeat};
-use crate::state::{AppState, PageMessage, Workspace};
+use crate::state::{AppState, PageMessage, Workspace, WorkspaceManagementError};
 use crate::verbs;
 
 const INSTRUCTIONS: &str =
     "rs-canvas is a hand-drawn architecture canvas open in the user's browser. \
 Use canvas_status to check that the local bridge and the page are up before acting. \
 canvas_read shows the current drawing as compact lines, each starting with a short \
-handle (e1, e2, ...); every tool accepts handles or raw ids. canvas_draw creates one \
+handle (e1, e2, ...); every tool accepts handles or raw ids. It is the primary view \
+of the workspace; canvas_screenshot is only for rendered appearance or when the user \
+asks to see it. canvas_draw creates one \
 element and canvas_pen draws a freehand stroke with per-point pressure and ink style \
 (width, colour, roughness, dash, opacity, fill/shading). \
 Camera and presentation tools move the user's view; they never change the drawing. \
 The user may keep several workspaces (named, isolated canvases); every tool acts on \
 the one the user is currently viewing — canvas_status names it and lists the rest. \
+canvas_workspace_create starts a new workspace and brings the user's page to it, so \
+later calls act there. Give a new discussion its own session workspace unless the \
+user is pointing at an existing drawing or workspace. \
 Think together: sketch the smallest useful idea, explore one concrete tradeoff or \
 failure case, and revise existing elements with canvas_script update beats. \
 Read selected elements, ids or a frame rather than unrelated content. Reads return \
@@ -48,6 +54,12 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as u64)
         .unwrap_or_default()
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct CreateWorkspaceArgs {
+    /// 1–40 lowercase letters, digits or dashes, starting with a letter or digit.
+    name: String,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -736,6 +748,86 @@ impl CanvasServer {
     }
 
     #[tool(
+        description = "Create a named workspace and open it for the user: the page \
+                       showing the current workspace saves its drawing and switches to \
+                       the new one, so later calls act there. Use it once at the start \
+                       of a session that has no existing drawing to work on, then reuse \
+                       that workspace for the session. Names are 1–40 lowercase \
+                       letters, digits or dashes, starting with a letter or digit; the \
+                       name must not exist. With no page connected the workspace is \
+                       created but the agent stays on the current workspace until the \
+                       user opens it. Waits briefly for the page to arrive and reports \
+                       whether it did; read canvas_status before drawing if it did not."
+    )]
+    async fn canvas_workspace_create(
+        &self,
+        Parameters(args): Parameters<CreateWorkspaceArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let source = self.current().await;
+        let workspace = match self.state.create_workspace(&args.name).await {
+            Ok(workspace) => workspace,
+            Err(WorkspaceManagementError::Invalid(message))
+            | Err(WorkspaceManagementError::Conflict(message)) => {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(message)]));
+            }
+            Err(WorkspaceManagementError::NotFound) => {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(
+                    "Could not create the workspace.",
+                )]));
+            }
+            Err(WorkspaceManagementError::Io(error)) => {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                    "Could not create the workspace: {error}"
+                ))]));
+            }
+        };
+        let watching = source.pages.load(Ordering::SeqCst);
+        let mut switched = false;
+        if watching > 0 {
+            let message = serde_json::json!({
+                "type": "workspace_changed",
+                "action": "switch",
+                "workspace": workspace.name,
+            })
+            .to_string();
+            let _ = source.to_pages.send(PageMessage::all(message));
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while tokio::time::Instant::now() < deadline {
+                if workspace.pages.load(Ordering::SeqCst) > 0 {
+                    switched = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            if switched {
+                // This call put the user on the new workspace, so it is a
+                // valid observation for subsequent context guards.
+                *self.observed.lock().await = Some(workspace.context());
+            }
+        }
+        let elements = workspace.doc.lock().await.live_count();
+        let note = if switched {
+            "The page is on the new workspace; later calls act there."
+        } else if watching > 0 {
+            "The workspace was created, but the page did not switch before the timeout; read canvas_status before drawing."
+        } else {
+            "No page is connected; the workspace exists but the agent still targets the current workspace."
+        };
+        let body = serde_json::json!({
+            "workspace": workspace.name,
+            "context": workspace.context(),
+            "switched": switched,
+            "pages_connected": workspace.pages.load(Ordering::SeqCst),
+            "persisted": workspace.doc_path.is_some(),
+            "document": { "elements": elements },
+            "note": note,
+        });
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            body.to_string(),
+        )]))
+    }
+
+    #[tool(
         description = "Read the current drawing as compact lines: `handle kind x,y wxh`, \
                        then membership and labels. Every line starts with a short handle \
                        (e1, e2, ...) that all id-taking tools accept. Read it before \
@@ -746,7 +838,9 @@ impl CanvasServer {
                        offset pagination needs the first read's context and unchanged revision. \
                        detail adds exact element JSON, including full stroke points. \
                        summary returns whole-document counts by kind, bounds and top fills \
-                       in a few hundred tokens at any scale: start there on large boards."
+                       in a few hundred tokens at any scale: start there on large boards. \
+                       This is the primary way to understand the workspace; a screenshot \
+                       adds only rendered appearance."
     )]
     async fn canvas_read(
         &self,
@@ -1636,10 +1730,13 @@ impl CanvasServer {
     }
 
     #[tool(
-        description = "Look at the canvas: returns a PNG image of what the user is looking \
-                       at right now, camera included, after any in-flight explanation \
-                       settles. With no page open it renders the whole drawing headlessly. \
-                       Use it to check your own layout, spacing, labels and overlaps."
+        description = "Look at the rendered canvas: returns a PNG image of what the user \
+                       is looking at right now, camera included, after any in-flight \
+                       explanation settles. With no page open it renders the whole drawing \
+                       headlessly. Use canvas_read for geometry, content and handles; reach \
+                       for this only when the rendered result itself matters (text wrapping, \
+                       ink, exact camera framing) or the user asks to see it. It can also \
+                       check your own layout, spacing, labels and overlaps."
     )]
     async fn canvas_screenshot(
         &self,
@@ -2820,6 +2917,122 @@ mod tests {
             .collect();
         assert!(names.contains(&"beta"), "{names:?}");
         assert!(names.contains(&"default"), "{names:?}");
+    }
+
+    #[tokio::test]
+    async fn workspace_create_without_a_page_is_listed_but_does_not_reroute_the_agent() {
+        let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
+        let server = CanvasServer::new(state.clone());
+
+        let result = server
+            .canvas_workspace_create(Parameters(CreateWorkspaceArgs {
+                name: "fresh".into(),
+            }))
+            .await
+            .unwrap();
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&error_text(&result)).unwrap();
+        assert_eq!(body["workspace"], "fresh");
+        assert_eq!(body["switched"], false);
+        assert_eq!(state.current_workspace().await.name, "default");
+
+        let status = server.canvas_status().await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&error_text(&status)).unwrap();
+        let names: Vec<&str> = body["workspaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|info| info["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"fresh"), "{names:?}");
+    }
+
+    #[tokio::test]
+    async fn workspace_create_rejects_invalid_reserved_and_existing_names() {
+        let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
+        let server = CanvasServer::new(state);
+
+        for (name, expected) in [("Bad Name", "lowercase"), ("default", "default workspace")] {
+            let result = server
+                .canvas_workspace_create(Parameters(CreateWorkspaceArgs { name: name.into() }))
+                .await
+                .unwrap();
+            assert_eq!(result.is_error, Some(true), "{name}");
+            assert!(error_text(&result).contains(expected), "{name}");
+        }
+        server
+            .canvas_workspace_create(Parameters(CreateWorkspaceArgs {
+                name: "fresh".into(),
+            }))
+            .await
+            .unwrap();
+        let duplicate = server
+            .canvas_workspace_create(Parameters(CreateWorkspaceArgs {
+                name: "fresh".into(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(duplicate.is_error, Some(true));
+        assert!(error_text(&duplicate).contains("already exists"));
+    }
+
+    #[tokio::test]
+    async fn workspace_create_opens_the_workspace_and_later_tools_land_there() {
+        let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
+        let source = state.workspace(crate::state::DEFAULT_WORKSPACE).await;
+        source.pages.store(1, Ordering::SeqCst);
+        source.note_page_activity();
+        let mut from_server = source.to_pages.subscribe();
+        let page_state = state.clone();
+        let page = tokio::spawn(async move {
+            let message = from_server.recv().await.unwrap();
+            let frame: serde_json::Value = serde_json::from_str(&message.text).unwrap();
+            assert_eq!(frame["type"], "workspace_changed");
+            assert_eq!(frame["action"], "switch");
+            let target = page_state
+                .workspace(frame["workspace"].as_str().unwrap())
+                .await;
+            target.pages.store(1, Ordering::SeqCst);
+            target.note_page_activity();
+            target
+        });
+        let server = CanvasServer::new(state.clone());
+
+        let result = server
+            .canvas_workspace_create(Parameters(CreateWorkspaceArgs {
+                name: "fresh".into(),
+            }))
+            .await
+            .unwrap();
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&error_text(&result)).unwrap();
+        assert_eq!(body["switched"], true);
+        assert_eq!(body["pages_connected"], 1);
+        let target = page.await.unwrap();
+
+        server
+            .canvas_draw(Parameters(DrawArgs {
+                kind: "sticky".into(),
+                text: Some("on the new workspace".into()),
+                name: None,
+                glyph: None,
+                x: None,
+                y: None,
+                w: None,
+                h: None,
+                near: None,
+                side: None,
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            target.doc.lock().await.live_count(),
+            2,
+            "the sticky and its label land where the page followed"
+        );
+        assert_eq!(source.doc.lock().await.live_count(), 0);
+        assert_eq!(state.current_workspace().await.name, "fresh");
     }
 
     #[tokio::test]

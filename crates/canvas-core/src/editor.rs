@@ -1323,6 +1323,12 @@ impl Editor {
                 let end = self.camera.screen_to_world(screen);
                 let rect = Rect::from_points(start, end);
                 self.marquee_current = None;
+                // Dropping the marquee is an overlay change even when the
+                // selection outcome is a no-op (empty rect, or only frames
+                // that the marquee failed to enclose). Without this the
+                // orange rectangle stays painted until some later event
+                // happens to invalidate the overlay.
+                effects.overlay_changed = true;
                 let hits: Vec<ElementId> = elements_in_rect_indexed(&self.doc, &self.hit, rect)
                     .into_iter()
                     .map(|id| crate::hit::resolve_container(&self.doc, &id))

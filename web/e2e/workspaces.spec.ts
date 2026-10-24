@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { expect, test, type Page } from "@playwright/test";
-import { mcpClient } from "./mcp-client";
+import { mcpClient, toolJson } from "./mcp-client";
 import { testBase, testPort } from "./server-address";
 
 // Workspace management gets its own persisted server. Its focus changes and
@@ -233,6 +233,29 @@ test("agent edits follow the focused workspace and stay isolated", async ({ cont
   await mcp.call("canvas_draw", { kind: "sticky", text: "first workspace" });
   await expect.poll(() => documentJson(first)).toContain("first workspace");
   expect(await documentJson(second)).not.toContain("first workspace");
+});
+
+test("the agent creates a workspace and brings the page with it", async ({ page, request }) => {
+  await page.goto(`${BASE}/?ws=ui-agent-source`);
+  await ready(page);
+  await page.waitForFunction(() => window.__rsAgentConnected === true);
+  await drawRectangle(page);
+  const mcp = mcpClient(request, BASE);
+
+  const created = toolJson(await mcp.call("canvas_workspace_create", { name: "ui-agent-created" }));
+  expect(created.workspace).toBe("ui-agent-created");
+  expect(created.switched).toBe(true);
+  await expect.poll(() => new URL(page.url()).searchParams.get("ws")).toBe("ui-agent-created");
+  await ready(page);
+  await page.waitForFunction(() => window.__rsAgentConnected === true);
+  expect(await count(page)).toBe(0);
+
+  await mcp.call("canvas_draw", { kind: "sticky", text: "created by the agent" });
+  await expect.poll(() => documentJson(page)).toContain("created by the agent");
+
+  await page.goto(`${BASE}/?ws=ui-agent-source`);
+  await ready(page);
+  expect(await count(page)).toBe(1);
 });
 
 test("duplicate copies the current drawing and rename preserves it under the new name", async ({ page }) => {

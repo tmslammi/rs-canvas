@@ -9,7 +9,7 @@ One drawing: everything that sits on the canvas and gets saved to a file. The un
 _Avoid_: Scene, board, drawing, canvas
 
 **Workspace**:
-A named, isolated drawing context: one document and the pages viewing it. The unit of isolation between concurrent users of the same server. The agent always works on the current workspace — the one the user's most recently active page is on, or `default`, the unnamed workspace, when no page is connected.
+A named, isolated drawing context: one document and the pages viewing it. The unit of isolation between concurrent users of the same server. The agent always works on the current workspace — the one the user's most recently active page is on, or `default`, the unnamed workspace, when no page is connected. Creating a workspace is the one agent action that moves the current workspace: it opens the new workspace in the user's page.
 _Avoid_: Board, room, project, canvas
 
 **Element**:

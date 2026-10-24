@@ -86,6 +86,7 @@ The dev server exposes an MCP endpoint at `http://127.0.0.1:5173/mcp` and a WebS
 - draw and revise shapes, freehand ink, scripts and bulk grids (`canvas_draw`, `canvas_pen`, `canvas_script`, `canvas_bulk`);
 - move the view and capture it (`canvas_focus`, `canvas_point`, `canvas_zoom`, `canvas_screenshot`);
 - annotate, arrange and revert its own edits (`canvas_annotate`, `canvas_emphasis`, `canvas_tidy`, `canvas_clear`, `canvas_revert`);
+- create a session workspace and bring the user's page to it (`canvas_workspace_create`);
 - save constraints, decisions and open questions for the current workspace (`canvas_remember`).
 
 The page remains the interactive source of truth: the agent edits a mirrored document over the same delta and merge path the browser uses, and camera commands are transient view state. The server binds to localhost only. See [`docs/adr/0005-agent-drives-canvas.md`](docs/adr/0005-agent-drives-canvas.md) for the design.

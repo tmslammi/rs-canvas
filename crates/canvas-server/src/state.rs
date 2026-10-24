@@ -7,6 +7,8 @@
 //! read and write. Both sides meet through the existing `canvas-core` merge
 //! rules, never through a bespoke protocol. Agent calls always act on the
 //! current workspace — the one the user's most recently active page is on.
+//! Creating a workspace is the one routing action: it navigates the user's
+//! page to the new workspace (ADR-0008).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -251,6 +253,10 @@ pub struct Workspace {
     persist_pending: AtomicBool,
     persist_write: Mutex<()>,
     pub retired: AtomicBool,
+    /// Created explicitly by an agent (or any future create RPC) rather than
+    /// lazily by a page naming the workspace. Keeps an empty workspace in the
+    /// listing even before its first page or element exists.
+    created: AtomicBool,
     /// Wakes the persist loop.
     persist_notify: Notify,
     /// Page acknowledgements of a finished presentation: (id, cancelled).
@@ -296,6 +302,7 @@ impl Workspace {
             persist_pending: AtomicBool::new(false),
             persist_write: Mutex::new(()),
             retired: AtomicBool::new(false),
+            created: AtomicBool::new(false),
             persist_notify: Notify::new(),
             present_acks,
             present_counter: AtomicU64::new(0),
@@ -801,6 +808,44 @@ impl AppState {
             .clone()
     }
 
+    /// Create a new, empty workspace for the user to open. Refuses names that
+    /// are invalid, reserved, already live or already on disk. An empty
+    /// document is written immediately when the workspace has a backing file,
+    /// so creation survives a restart before its first edit.
+    pub async fn create_workspace(
+        &self,
+        name: &str,
+    ) -> Result<Arc<Workspace>, WorkspaceManagementError> {
+        use WorkspaceManagementError::*;
+        if !valid_workspace_name(name) {
+            return Err(Invalid(
+                "Use 1–40 lowercase letters, digits or dashes, starting with a letter or digit."
+                    .into(),
+            ));
+        }
+        if name == DEFAULT_WORKSPACE {
+            return Err(Conflict("The default workspace already exists.".into()));
+        }
+        let _management = self.workspace_management.lock().await;
+        if self.workspaces.lock().unwrap().contains_key(name) {
+            return Err(Conflict(
+                "That workspace already exists. Choose another name.".into(),
+            ));
+        }
+        let candidate = self.build_workspace(name);
+        if let Some(path) = &candidate.doc_path {
+            if tokio::fs::try_exists(path).await.map_err(Io)? {
+                return Err(Conflict(
+                    "That workspace already exists. Choose another name.".into(),
+                ));
+            }
+        }
+        let workspace = self.workspace_unlocked(name).await;
+        workspace.created.store(true, Ordering::SeqCst);
+        workspace.persist_document().await;
+        Ok(workspace)
+    }
+
     /// Serialize connection admission with workspace management so a tab
     /// cannot join a document while it is being renamed or deleted.
     pub async fn register_page(&self, workspace: &Workspace) -> bool {
@@ -876,6 +921,9 @@ impl AppState {
             .unwrap_or_else(|| doc.clone());
         if let Some(new_name) = renamed {
             let destination = Arc::new(self.build_workspace(new_name));
+            destination
+                .created
+                .store(source.created.load(Ordering::SeqCst), Ordering::SeqCst);
             if let Some(path) = &destination.doc_path {
                 let json =
                     serialization::to_json(&merged).map_err(|error| Invalid(error.to_string()))?;
@@ -944,7 +992,11 @@ impl AppState {
         for ws in workspaces {
             let elements = ws.doc.lock().await.live_count();
             let pages = ws.pages.load(Ordering::SeqCst);
-            if ws.name != DEFAULT_WORKSPACE && ws.doc_path.is_none() && pages == 0 && elements == 0
+            if ws.name != DEFAULT_WORKSPACE
+                && !ws.created.load(Ordering::SeqCst)
+                && ws.doc_path.is_none()
+                && pages == 0
+                && elements == 0
             {
                 continue;
             }
@@ -1170,6 +1222,63 @@ mod tests {
         let alpha = reopened.workspace("alpha").await;
         assert_eq!(alpha.doc.lock().await.live_count(), 1);
         let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+
+    #[tokio::test]
+    async fn creating_a_workspace_is_validated_and_persisted_empty() {
+        let dir = std::env::temp_dir().join(format!(
+            "rs-workspace-create-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let state = AppState::new(PathBuf::from("."), Some(dir.join("current.json")), true);
+        assert!(matches!(
+            state.create_workspace("Bad Name").await,
+            Err(WorkspaceManagementError::Invalid(_))
+        ));
+        assert!(matches!(
+            state.create_workspace(DEFAULT_WORKSPACE).await,
+            Err(WorkspaceManagementError::Conflict(_))
+        ));
+
+        let created = state.create_workspace("fresh").await.unwrap();
+        assert_eq!(created.doc.lock().await.live_count(), 0);
+        assert!(created.created.load(Ordering::SeqCst));
+        assert!(
+            dir.join("workspaces/fresh.json").exists(),
+            "an explicitly created workspace is durable before its first edit"
+        );
+        assert!(matches!(
+            state.create_workspace("fresh").await,
+            Err(WorkspaceManagementError::Conflict(_))
+        ));
+
+        let restarted = AppState::new(PathBuf::from("."), Some(dir.join("current.json")), true);
+        let names: Vec<String> = restarted
+            .list_workspaces()
+            .await
+            .iter()
+            .map(|info| info.name.clone())
+            .collect();
+        assert!(names.contains(&"fresh".to_string()), "{names:?}");
+        let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+
+    #[tokio::test]
+    async fn created_workspaces_are_listed_without_a_backing_file() {
+        let state = AppState::new(PathBuf::from("."), None, true);
+        let created = state.create_workspace("fresh").await.unwrap();
+        assert_eq!(created.doc_path, None);
+        let names: Vec<String> = state
+            .list_workspaces()
+            .await
+            .iter()
+            .map(|info| info.name.clone())
+            .collect();
+        assert!(
+            names.contains(&"fresh".to_string()),
+            "an explicit create must be discoverable even in memory-only mode: {names:?}"
+        );
     }
 
     #[tokio::test]
