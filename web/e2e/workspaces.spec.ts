@@ -169,6 +169,7 @@ test("legacy browser autosaves remain listed and switchable when the API is unav
   await expect(page.getByRole("button", { name: "Switch to workspace ui-legacy", exact: true })).toBeVisible();
   await expect(page.locator(".workspace-status")).toContainText(/unavailable|browser/i);
   await page.getByRole("button", { name: "Switch to workspace ui-legacy", exact: true }).click();
+  await expect.poll(() => new URL(page.url()).searchParams.get("ws")).toBe("ui-legacy");
   await ready(page);
   await expect.poll(() => count(page)).toBe(1);
 });
