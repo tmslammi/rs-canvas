@@ -281,8 +281,17 @@ body {
   overflow: hidden;
   font-family: "ComicShanns", var(--mono);
   color: var(--ink);
+  /* Bound text wraps exactly like the canvas layout: a `pre` textarea
+     scrolls a long line sideways while the canvas wraps it, so the overlay
+     and the ink drift apart. Auto-width point text opts out via `.wrap`. */
   white-space: pre;
+  overflow-wrap: normal;
   caret-color: var(--accent);
+}
+
+#text-editor.wrap {
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
 }
 
 #text-editor.visible {

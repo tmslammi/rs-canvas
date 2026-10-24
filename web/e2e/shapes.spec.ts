@@ -107,6 +107,46 @@ test("marquee selects several shapes and shift-click adds", async ({ page }) => 
   expect(await count(page)).toBe(2);
 });
 
+test("a marquee that selects nothing erases itself on release", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.waitForFunction(() => window.__rsReady === true);
+  await page.evaluate(() => window.__rsEditor!.new_document());
+
+  // Two shapes in the top-right; the marquee below them hits nothing.
+  for (const [x, y] of [
+    [700, 150],
+    [900, 150],
+  ]) {
+    await page.keyboard.press("r");
+    await page.mouse.move(x, y);
+    await page.mouse.down();
+    await page.mouse.move(x + 80, y + 60, { steps: 3 });
+    await page.mouse.up();
+  }
+  await page.keyboard.press("v");
+  await page.mouse.click(150, 700);
+
+  await page.mouse.move(100, 400);
+  await page.mouse.down();
+  await page.mouse.move(600, 650, { steps: 4 });
+  await page.mouse.up();
+
+  const overlayInk = await page.evaluate(() => {
+    const canvas = document.getElementById("overlay") as HTMLCanvasElement;
+    const ctx = canvas.getContext("2d")!;
+    const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+    let ink = 0;
+    for (let i = 3; i < data.length; i += 4) {
+      if (data[i] > 0) ink++;
+    }
+    return ink;
+  });
+  expect(overlayInk, "the dropped marquee is gone").toBe(0);
+  expect(await selectionBounds(page)).toBeUndefined();
+});
+
 test("dragging inside a multi-selection moves the whole group", async ({ page }) => {
   await page.goto("/");
   await page.waitForFunction(() => window.__rsReady === true);

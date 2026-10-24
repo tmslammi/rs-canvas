@@ -37,6 +37,12 @@ pub enum ShellAction {
         font_size: f64,
         text: String,
         align: TextAlign,
+        /// The text's own ink, so the overlay reads exactly like the element
+        /// (a sticky's dark ink, not the canvas' light default).
+        color: String,
+        /// True when the canvas wraps this text to its rect width. Auto-width
+        /// point text must not wrap in the overlay either.
+        wrap: bool,
         /// True for one-line fields (frame names): Enter commits instead of
         /// inserting a newline.
         single_line: bool,
@@ -653,6 +659,17 @@ impl Editor {
             ids = live.iter().map(|e| e.id.clone()).collect();
         }
         self.select(ids)
+    }
+
+    /// The text element the shell's overlay editor is currently editing, if
+    /// any. Its cached layer is skipped when painting: the textarea is the
+    /// live copy, and drawing the committed text underneath it ghosted two
+    /// versions together whenever their wrapping or metrics differed.
+    pub fn editing_text_id(&self) -> Option<&str> {
+        match &self.interaction {
+            Interaction::TextEditing { id, .. } => Some(id.as_str()),
+            _ => None,
+        }
     }
 
     /// Bounds of the current selection, in world space.
@@ -1815,6 +1832,8 @@ impl Editor {
                     font_size: 14.0 * self.camera.zoom,
                     text: name,
                     align: TextAlign::Left,
+                    color: "#868e96".into(),
+                    wrap: false,
                     single_line: true,
                 };
                 Effects {
@@ -2040,10 +2059,25 @@ impl Editor {
 
     fn text_editor_action(&self, id: &str, content: String) -> Option<ShellAction> {
         let element = self.doc.element(id)?;
-        let (rect, font_size, align) = match &element.kind {
+        let (rect, font_size, align, color, wrap) = match &element.kind {
             ElementKind::Text {
-                rect, align, style, ..
-            } => (*rect, style.font_size, *align),
+                rect,
+                align,
+                style,
+                fixed_width,
+                container_id,
+                ..
+            } => (
+                *rect,
+                style.font_size,
+                *align,
+                if style.stroke_color == "transparent" {
+                    "#ece4d6".to_string()
+                } else {
+                    style.stroke_color.clone()
+                },
+                *fixed_width || container_id.is_some(),
+            ),
             _ => return None,
         };
         let top_left = self.camera.world_to_screen(Point::new(rect.x, rect.y));
@@ -2060,6 +2094,8 @@ impl Editor {
             font_size: font_size * self.camera.zoom,
             text: content,
             align,
+            color,
+            wrap,
             single_line: false,
         })
     }
@@ -4713,6 +4749,76 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_marquee_release_repaints_the_overlay() {
+        let mods = Modifiers::default();
+        // Empty space: the rectangle hits nothing at all.
+        let mut e = editor();
+        drag_shape(
+            &mut e,
+            Point::new(500.0, 500.0),
+            Point::new(550.0, 550.0),
+            1,
+        );
+        press(&mut e, "v", mods, 2);
+        e.clear_selection();
+        {
+            let fx = e.pointer_down(Point::new(0.0, 0.0), 0, mods, 3);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(100.0, 100.0), mods, 4);
+            pump(&mut e, &fx);
+        }
+        assert!(e.marquee_rect().is_some());
+        {
+            let fx = e.pointer_up(Point::new(100.0, 100.0), mods, 5);
+            pump(&mut e, &fx);
+            assert!(
+                fx.overlay_changed,
+                "dropping the marquee must erase it from the overlay"
+            );
+        }
+        assert!(e.marquee_rect().is_none());
+        assert!(e.selection.is_empty());
+
+        // Inside a frame: the frame intersects but is not enclosed, so it is
+        // filtered out and the selection still stays empty.
+        let mut e = editor();
+        press(&mut e, "f", mods, 6);
+        {
+            let fx = e.pointer_down(Point::new(0.0, 0.0), 0, mods, 7);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(400.0, 300.0), mods, 8);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(400.0, 300.0), mods, 9);
+            pump(&mut e, &fx);
+        }
+        press(&mut e, "v", mods, 10);
+        e.clear_selection();
+        {
+            let fx = e.pointer_down(Point::new(50.0, 50.0), 0, mods, 11);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(150.0, 150.0), mods, 12);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(150.0, 150.0), mods, 13);
+            pump(&mut e, &fx);
+            assert!(
+                fx.overlay_changed,
+                "a marquee that selects nothing must still erase itself"
+            );
+        }
+        assert!(e.selection.is_empty(), "the frame is not enclosed");
+    }
+
+    #[test]
     fn dragging_empty_space_inside_the_selection_moves_everything() {
         let mut e = editor();
         drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(100.0, 50.0), 1);
@@ -6396,18 +6502,35 @@ mod tests {
         assert_eq!(e.tool, Tool::Select, "the sticky tool is single-shot");
 
         // Double-click creates the note's bound text, inked in the note colour.
-        {
-            let fx = e.double_click(Point::new(200.0, 200.0), 4);
-            pump(&mut e, &fx);
-        }
+        let fx = e.double_click(Point::new(200.0, 200.0), 4);
+        let action_color = fx
+            .actions
+            .iter()
+            .find_map(|action| match action {
+                ShellAction::OpenTextEditor { color, .. } => Some(color.clone()),
+                _ => None,
+            })
+            .expect("double-click opens the text editor");
+        assert_eq!(
+            action_color,
+            crate::commands::STICKY_INK,
+            "the overlay types in the note's own ink, not the light canvas default"
+        );
+        pump(&mut e, &fx);
         let text_id = match &e.interaction {
             Interaction::TextEditing { id, .. } => id.clone(),
             other => panic!("expected the text editor, got {other:?}"),
         };
+        assert_eq!(
+            e.editing_text_id(),
+            Some(text_id.as_str()),
+            "the painter can hide the committed copy while the overlay is live"
+        );
         {
             let fx = e.commit_text(&text_id, "hello", 5);
             pump(&mut e, &fx);
         }
+        assert_eq!(e.editing_text_id(), None);
         assert_eq!(e.doc.ordered_live().len(), 2);
         let text = e.doc.element(&text_id).unwrap();
         match &text.kind {

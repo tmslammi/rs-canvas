@@ -35,6 +35,25 @@ test("type point text and commit with Escape", async ({ page }) => {
   expect(await count(page)).toBe(0);
 });
 
+test("point text does not wrap in the overlay", async ({ page }) => {
+  await page.goto("/");
+  await page.waitForFunction(() => window.__rsReady === true);
+  await page.evaluate(() => window.__rsEditor!.new_document());
+
+  await page.keyboard.press("t");
+  await page.mouse.click(300, 300);
+  await expect(textEditor(page)).toBeVisible();
+  await page.keyboard.type("a long line that keeps growing well past the editor box");
+
+  const box = await textEditor(page).evaluate((element) => ({
+    whiteSpace: getComputedStyle(element).whiteSpace,
+    scrollHeight: element.scrollHeight,
+  }));
+  expect(box.whiteSpace, "auto-width text has no wrap width").toBe("pre");
+  expect(box.scrollHeight, "the line stays on one row").toBeLessThanOrEqual(30);
+  await page.keyboard.press("Escape");
+});
+
 test("large text keeps its size after the stroke is repainted", async ({ page }) => {
   await page.goto("/");
   await page.waitForFunction(() => window.__rsReady === true);

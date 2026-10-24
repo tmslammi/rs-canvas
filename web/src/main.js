@@ -372,6 +372,11 @@ async function boot() {
     textEditor.style.fontSize = `${action.font_size}px`;
     textEditor.style.lineHeight = "1.3";
     textEditor.style.textAlign = action.align;
+    // Match the element's own ink: sticky notes are dark-on-pastel, while
+    // point text is drawn in the canvas' light default.
+    textEditor.style.color = action.color;
+    // Bound text wraps to its rect; auto-width point text does not.
+    textEditor.classList.toggle("wrap", !!action.wrap);
     // Frame names paint a band above the border; an opaque editor hides the
     // canvas-drawn name instead of ghosting through it.
     textEditor.classList.toggle("single-line", !!action.single_line);

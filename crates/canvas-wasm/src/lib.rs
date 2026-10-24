@@ -750,7 +750,9 @@ impl Editor {
             .dyn_into::<CanvasRenderingContext2d>()?;
 
         let hidden = self.presentation.as_ref().map(|p| &p.hidden);
-        let hidden_active = hidden.is_some_and(|s| !s.is_empty());
+        let editing = self.core.editing_text_id().map(str::to_string);
+        let skip =
+            |id: &str| editing.as_deref() == Some(id) || hidden.is_some_and(|set| set.contains(id));
         let mut renderer = Canvas2dRenderer::new(ctx);
         renderer.clear(BACKGROUND);
         renderer.set_transform(self.core.camera.transform().then(Affine::scale(scale)));
@@ -759,7 +761,7 @@ impl Editor {
         self.core.ensure_area(viewport);
         self.core.scene.flush_preview_stale(viewport);
         for layer in self.core.scene.visible(viewport) {
-            if hidden_active && hidden.unwrap().contains(&layer.element_id) {
+            if skip(&layer.element_id) {
                 continue;
             }
             renderer.draw_ops(&layer.ops);
@@ -938,6 +940,10 @@ impl Editor {
         // Borrowed, never cloned: the old per-frame BTreeSet clone cost
         // O(hidden) allocations on every frame even when idle.
         let hidden = self.presentation.as_ref().map(|p| &p.hidden);
+        // The shell's textarea is the live copy of the text being edited;
+        // painting the committed element underneath would ghost two versions.
+        let editing = self.core.editing_text_id();
+        let skip = |id: &str| editing == Some(id) || hidden.is_some_and(|set| set.contains(id));
         let transform = self.core.camera.transform().then(Affine::scale(self.dpr));
         {
             let scene = &self.core.scene;
@@ -951,36 +957,18 @@ impl Editor {
                 .cached_bounds()
                 .is_some_and(|b| viewport_contains(&viewport, &b));
             if all_visible {
-                match hidden {
-                    Some(set) if !set.is_empty() => {
-                        for layer in scene.all_layers() {
-                            if set.contains(&layer.element_id) {
-                                continue;
-                            }
-                            renderer.draw_ops(&layer.ops);
-                        }
+                for layer in scene.all_layers() {
+                    if skip(&layer.element_id) {
+                        continue;
                     }
-                    _ => {
-                        for layer in scene.all_layers() {
-                            renderer.draw_ops(&layer.ops);
-                        }
-                    }
+                    renderer.draw_ops(&layer.ops);
                 }
             } else {
-                match hidden {
-                    Some(set) if !set.is_empty() => {
-                        for layer in scene.visible(viewport) {
-                            if set.contains(&layer.element_id) {
-                                continue;
-                            }
-                            renderer.draw_ops(&layer.ops);
-                        }
+                for layer in scene.visible(viewport) {
+                    if skip(&layer.element_id) {
+                        continue;
                     }
-                    _ => {
-                        for layer in scene.visible(viewport) {
-                            renderer.draw_ops(&layer.ops);
-                        }
-                    }
+                    renderer.draw_ops(&layer.ops);
                 }
             }
             renderer.end_frame();
@@ -997,7 +985,8 @@ impl Editor {
         let (w, h) = self.core.viewport_size();
         let viewport = self.core.camera.viewport(w, h);
         let hidden = self.presentation.as_ref().map(|p| &p.hidden);
-        let hidden_active = hidden.is_some_and(|s| !s.is_empty());
+        let editing = self.core.editing_text_id();
+        let skip = |id: &str| editing == Some(id) || hidden.is_some_and(|set| set.contains(id));
         let transform = self.core.camera.transform().then(Affine::scale(self.dpr));
         let renderer = &mut self.renderer;
         renderer.begin_frame();
@@ -1019,7 +1008,7 @@ impl Editor {
                 let Some(idx) = layer.lod else {
                     continue;
                 };
-                if hidden_active && hidden.unwrap().contains(&layer.element_id) {
+                if skip(&layer.element_id) {
                     continue;
                 }
                 if !lod_present.contains(&idx) {
@@ -1034,7 +1023,7 @@ impl Editor {
                 let Some(idx) = layer.lod else {
                     continue;
                 };
-                if hidden_active && hidden.unwrap().contains(&layer.element_id) {
+                if skip(&layer.element_id) {
                     continue;
                 }
                 if !lod_present.contains(&idx) {
@@ -1061,7 +1050,7 @@ impl Editor {
                     if layer.lod != Some(*idx) {
                         continue;
                     }
-                    if hidden_active && hidden.unwrap().contains(&layer.element_id) {
+                    if skip(&layer.element_id) {
                         continue;
                     }
                     let b = layer.bounds;
@@ -1072,7 +1061,7 @@ impl Editor {
                     if layer.lod != Some(*idx) {
                         continue;
                     }
-                    if hidden_active && hidden.unwrap().contains(&layer.element_id) {
+                    if skip(&layer.element_id) {
                         continue;
                     }
                     let b = layer.bounds;
@@ -2000,7 +1989,14 @@ impl Editor {
         // dirty rect repaints in full, so without the clip its parts outside
         // the cleared rect would paint over untouched pixels — most visibly
         // letting a lower layer cover the higher layers around it.
-        self.renderer.clip_rects(&cleared);
+        //
+        // Canvas antialiases clip edges, so a clip exactly on the cleared
+        // boundary lets the background bleed through as a hairline seam
+        // across the repainted element (a faint line under a sticky's text
+        // after each edit). Pad the clip outward; the extra ring lands on
+        // pixels whose content is already correct.
+        let clip: Vec<Rect> = cleared.iter().map(|rect| rect.expand(1.0)).collect();
+        self.renderer.clip_rects(&clip);
         self.renderer
             .set_transform(self.core.camera.transform().then(Affine::scale(self.dpr)));
         // Non-LOD only (LOD edits full-render before reaching here): flush
@@ -2008,8 +2004,12 @@ impl Editor {
         self.core.scene.flush_pending_ops();
         self.core.ensure_area(union);
         self.core.scene.flush_preview_stale(union);
+        let editing = self.core.editing_text_id();
         for layer in self.core.scene.layers.iter() {
             if !layer.bounds.intersects(&union) {
+                continue;
+            }
+            if editing == Some(layer.element_id.as_str()) {
                 continue;
             }
             if merged.iter().any(|rect| layer.bounds.intersects(rect)) {
