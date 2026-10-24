@@ -22,74 +22,9 @@ use crate::scene::Scene;
 use crate::spatial::{HitIndex, ObstacleIndex};
 use crate::text::{layout_text, ApproxMeasurer, TextMeasurer};
 use crate::tool::Tool;
+use crate::view::ViewState;
 
-/// A message from the core to the browser shell (via the wasm façade).
-#[derive(Clone, Debug, PartialEq, serde::Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ShellAction {
-    OpenTextEditor {
-        id: ElementId,
-        /// Screen-space rectangle in CSS pixels.
-        x: f64,
-        y: f64,
-        width: f64,
-        height: f64,
-        font_size: f64,
-        text: String,
-        align: TextAlign,
-        /// The text's own ink, so the overlay reads exactly like the element
-        /// (a sticky's dark ink, not the canvas' light default).
-        color: String,
-        /// True when the canvas wraps this text to its rect width. Auto-width
-        /// point text must not wrap in the overlay either.
-        wrap: bool,
-        /// True for one-line fields (frame names): Enter commits instead of
-        /// inserting a newline.
-        single_line: bool,
-    },
-    /// The document changed: the shell should debounce and call `flush_save`.
-    DocumentChanged,
-}
-
-/// What the shell should repaint after an input.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct Effects {
-    /// Elements whose cached layers must be rebuilt.
-    pub changed: BTreeSet<ElementId>,
-    /// The whole frame changed (camera moves, history jumps).
-    pub repaint_all: bool,
-    /// Selection or in-progress decoration changed (overlay repaint).
-    pub overlay_changed: bool,
-    /// The document itself changed, as opposed to only the camera: this is
-    /// what makes an autosave due. Camera pans repaint without saving.
-    pub document_changed: bool,
-    /// Mid-gesture preview (selection drags): caches already shifted, so the
-    /// shell must repaint dirty regions WITHOUT rebuilding layers, and must
-    /// skip obstacle/hit maintenance until release. Never persisted.
-    pub preview: bool,
-    /// Shell actions to dispatch (text editor, later: dialogs).
-    pub actions: Vec<ShellAction>,
-}
-
-impl Effects {
-    fn changed(id: impl Into<ElementId>) -> Self {
-        let mut effects = Self {
-            document_changed: true,
-            ..Self::default()
-        };
-        effects.changed.insert(id.into());
-        effects
-    }
-
-    fn merge(&mut self, other: Effects) {
-        self.changed.extend(other.changed);
-        self.repaint_all |= other.repaint_all;
-        self.overlay_changed |= other.overlay_changed;
-        self.document_changed |= other.document_changed;
-        self.preview |= other.preview;
-        self.actions.extend(other.actions);
-    }
-}
+pub use crate::shell::{Effects, ShellAction};
 
 /// Modifier keys as the shell reports them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -333,7 +268,6 @@ enum Interaction {
 /// The editable session.
 pub struct Editor {
     pub doc: Document,
-    pub camera: Camera,
     pub scene: Scene,
     /// Spatial index of routing obstacles, kept in sync with `doc`.
     pub obstacles: ObstacleIndex,
@@ -341,22 +275,8 @@ pub struct Editor {
     /// must never scan the document per pointer event.
     pub hit: HitIndex,
     pub history: History,
-    pub nav: NavigationState,
-    pub tool: Tool,
-    pub tool_locked: bool,
-    pub style: Style,
-    /// Whether the optional grid is drawn (view state; the shell persists it).
-    pub grid_visible: bool,
-    /// Whether pointer-driven edits snap to the grid.
-    pub snap_to_grid: bool,
-    /// World-space grid spacing (the snap step when snapping is enabled).
-    pub grid_size: f64,
-    pub selection: BTreeSet<ElementId>,
-    /// Cached selection bounds: shifted (not recomputed) on preview moves,
-    /// cleared on any selection or structural change. Overlay reads this per
-    /// frame during drags; recomputing over thousands of elements per move
-    /// is what made big drags stutter the marching ants.
-    selection_bounds_cache: Option<Rect>,
+    /// Camera, navigation, tool, style defaults, grid, viewport and selection.
+    pub(crate) view: ViewState,
     /// Total snapped drag delta already previewed (see `Interaction::Moving`):
     /// preview moves translate incrementally, clone-free. Reset whenever a
     /// move gesture starts.
@@ -388,27 +308,17 @@ pub struct Editor {
     hover_anchors: Option<(ElementId, Vec<Point>)>,
     /// The sticky stack under the pointer, if its pull zone is hovered.
     hover_stack: Option<ElementId>,
-    viewport_size: (f64, f64),
 }
 
 impl Editor {
     pub fn new(doc: Document) -> Self {
         let mut editor = Self {
             doc,
-            camera: Camera::default(),
             scene: Scene::new(),
             obstacles: ObstacleIndex::new(),
             hit: HitIndex::new(),
             history: History::new(),
-            nav: NavigationState::new(),
-            tool: Tool::default(),
-            tool_locked: false,
-            style: Style::default(),
-            grid_visible: false,
-            snap_to_grid: false,
-            grid_size: GRID_SIZE,
-            selection: BTreeSet::new(),
-            selection_bounds_cache: None,
+            view: ViewState::new(),
             drag_applied: Point::ZERO,
             drag_slots: Vec::new(),
             drag_working: Vec::new(),
@@ -423,7 +333,6 @@ impl Editor {
             measurer: Box::new(ApproxMeasurer),
             hover_anchors: None,
             hover_stack: None,
-            viewport_size: (800.0, 600.0),
         };
         editor.refresh_scene();
         editor
@@ -431,12 +340,129 @@ impl Editor {
 
     /// The shell reports its viewport size (used for insert-at-centre).
     pub fn set_viewport(&mut self, width: f64, height: f64) {
-        self.viewport_size = (width.max(1.0), height.max(1.0));
+        self.view.viewport_size = (width.max(1.0), height.max(1.0));
+    }
+
+    /// The committed document (read-only). Committed mutations go through the
+    /// editor's command entry points; the document is never edited in place by
+    /// the shell.
+    pub fn document(&self) -> &Document {
+        &self.doc
+    }
+
+    /// The current camera (view state only, copied for the shell's reads).
+    pub fn camera(&self) -> Camera {
+        self.view.camera
+    }
+
+    pub fn camera_mut(&mut self) -> &mut Camera {
+        &mut self.view.camera
+    }
+
+    pub fn set_camera(&mut self, camera: Camera) {
+        self.view.camera = camera;
+    }
+
+    pub fn nav(&self) -> &NavigationState {
+        &self.view.nav
+    }
+
+    pub fn nav_mut(&mut self) -> &mut NavigationState {
+        &mut self.view.nav
+    }
+
+    /// Wheel input: navigation owns the pan/zoom classification and mutates
+    /// the camera it is given.
+    pub fn wheel(&mut self, screen: Point, dx: f64, dy: f64, ctrl: bool) {
+        self.view
+            .nav
+            .wheel(&mut self.view.camera, screen, dx, dy, ctrl);
+    }
+
+    pub fn tool(&self) -> Tool {
+        self.view.tool
+    }
+
+    pub fn tool_locked(&self) -> bool {
+        self.view.tool_locked
+    }
+
+    pub fn set_tool_locked(&mut self, locked: bool) {
+        self.view.tool_locked = locked;
+    }
+
+    pub fn toggle_tool_lock(&mut self) {
+        self.view.tool_locked = !self.view.tool_locked;
+    }
+
+    pub fn grid_visible(&self) -> bool {
+        self.view.grid_visible
+    }
+
+    pub fn set_grid_visible(&mut self, visible: bool) {
+        self.view.grid_visible = visible;
+    }
+
+    pub fn grid_size(&self) -> f64 {
+        self.view.grid_size
+    }
+
+    pub fn set_grid_size(&mut self, size: f64) {
+        self.view.grid_size = size;
+    }
+
+    pub fn snap_enabled(&self) -> bool {
+        self.view.snap_to_grid
+    }
+
+    pub fn set_snap_enabled(&mut self, enabled: bool) {
+        self.view.snap_to_grid = enabled;
+    }
+
+    pub fn selection(&self) -> &BTreeSet<ElementId> {
+        &self.view.selection
+    }
+
+    /// Drop selected ids that a remote merge or deletion made non-live.
+    pub fn retain_live_selection(&mut self) {
+        self.view.retain_live_selection(&self.doc);
+    }
+
+    pub fn can_undo(&self) -> bool {
+        self.history.can_undo()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        self.history.can_redo()
+    }
+
+    /// Take every delta applied since the last drain (the sync outbox).
+    pub fn drain_outbox(&mut self) -> Vec<Delta> {
+        self.history.drain_outbox()
+    }
+
+    /// Replace the committed document with a merged remote snapshot, keeping
+    /// undo history and view state. Returns whether anything changed.
+    pub fn merge_document(&mut self, merged: Document) -> bool {
+        if merged == self.doc {
+            return false;
+        }
+        self.doc = merged;
+        self.view.retain_live_selection(&self.doc);
+        self.refresh_scene();
+        true
+    }
+
+    /// Apply a remote element patch with per-element last-writer-wins rules.
+    pub fn apply_patch(&mut self, patch: &crate::patch::Patch) -> Vec<ElementId> {
+        let changed = patch.apply_to(&mut self.doc);
+        self.view.retain_live_selection(&self.doc);
+        changed
     }
 
     /// The last viewport size the shell reported, in CSS pixels.
     pub fn viewport_size(&self) -> (f64, f64) {
-        self.viewport_size
+        self.view.viewport_size
     }
 
     /// A camera that fits an element — frames include their descendants — or
@@ -446,8 +472,8 @@ impl Editor {
             Some(id) => self.doc.framing_bounds(id)?,
             None => self.doc.bounds()?,
         };
-        let mut camera = self.camera;
-        camera.zoom_to_fit(bounds, self.viewport_size, padding);
+        let mut camera = self.view.camera;
+        camera.zoom_to_fit(bounds, self.view.viewport_size, padding);
         Some(camera)
     }
 
@@ -462,16 +488,16 @@ impl Editor {
         } else {
             Effects::default()
         };
-        self.tool = tool;
-        self.tool_locked = tool == Tool::Freehand;
+        self.view.tool = tool;
+        self.view.tool_locked = tool == Tool::Freehand;
         effects.overlay_changed = true;
         effects
     }
 
     /// After a finished gesture, single-shot tools hand back to Select.
     fn finish_tool_use(&mut self) {
-        if !self.tool_locked {
-            self.tool = Tool::Select;
+        if !self.view.tool_locked {
+            self.view.tool = Tool::Select;
         }
     }
 
@@ -484,7 +510,7 @@ impl Editor {
     pub fn replace_document(&mut self, doc: Document) -> Effects {
         self.doc = doc;
         self.history = History::new();
-        self.selection.clear();
+        self.view.clear_selection();
         self.interaction = Interaction::Idle;
         self.tx = None;
         self.marquee_current = None;
@@ -511,7 +537,7 @@ impl Editor {
         // documents); the first edit or route that needs it builds once.
         self.obstacles.invalidate();
         self.hit.rebuild(&self.doc);
-        self.selection_bounds_cache = None;
+        self.view.invalidate_selection_bounds();
         self.scene
             .rebuild_all(&self.doc, self.measurer.as_ref(), &self.obstacles)
     }
@@ -520,7 +546,7 @@ impl Editor {
     pub fn rebuild_changed(&mut self, changed: &BTreeSet<ElementId>) -> Vec<Rect> {
         self.obstacles.apply(&self.doc, changed);
         self.hit.apply(&self.doc, changed);
-        self.selection_bounds_cache = None;
+        self.view.invalidate_selection_bounds();
         self.scene
             .update(&self.doc, changed, self.measurer.as_ref(), &self.obstacles)
     }
@@ -584,52 +610,28 @@ impl Editor {
     }
 
     fn tolerance(&self) -> f64 {
-        SELECT_TOLERANCE_PX / self.camera.zoom
+        self.view.world_tolerance(SELECT_TOLERANCE_PX)
     }
 
     fn min_draw_size(&self) -> f64 {
-        MIN_DRAW_SIZE_PX / self.camera.zoom
+        self.view.world_tolerance(MIN_DRAW_SIZE_PX)
     }
 
     /// The nearest grid point when snapping is enabled.
     fn snap(&self, point: Point) -> Point {
-        if !self.snap_to_grid {
-            return point;
-        }
-        let size = self.grid_size;
-        Point::new(
-            (point.x / size).round() * size,
-            (point.y / size).round() * size,
-        )
+        self.view.snap(point)
     }
 
     /// A drag delta adjusted so the moving set's top-left corner lands on the
     /// grid (relative positions inside the set stay intact).
     fn snap_delta(&self, originals: &[Element], dx: f64, dy: f64) -> (f64, f64) {
-        if !self.snap_to_grid || originals.is_empty() {
-            return (dx, dy);
-        }
-        let Some(bounds) = originals
-            .iter()
-            .map(|element| element.bounds())
-            .reduce(|a, b| a.union(&b))
-        else {
-            return (dx, dy);
-        };
-        let target = self.snap(Point::new(bounds.x + dx, bounds.y + dy));
-        (target.x - bounds.x, target.y - bounds.y)
+        self.view.snap_delta(originals, dx, dy)
     }
 
     // -- selection ---------------------------------------------------------
 
     pub fn select(&mut self, ids: impl IntoIterator<Item = ElementId>) -> Effects {
-        self.selection = ids.into_iter().collect();
-        self.selection_bounds_cache = self
-            .selection
-            .iter()
-            .filter_map(|id| self.doc.element(id))
-            .map(|e| e.bounds())
-            .reduce(|a, b| a.union(&b));
+        self.view.select(ids, &self.doc);
         Effects {
             overlay_changed: true,
             ..Effects::default()
@@ -637,11 +639,10 @@ impl Editor {
     }
 
     pub fn clear_selection(&mut self) -> Effects {
-        if self.selection.is_empty() {
+        if self.view.selection.is_empty() {
             return Effects::default();
         }
-        self.selection.clear();
-        self.selection_bounds_cache = None;
+        self.view.clear_selection();
         Effects {
             overlay_changed: true,
             ..Effects::default()
@@ -674,14 +675,7 @@ impl Editor {
 
     /// Bounds of the current selection, in world space.
     pub fn selection_bounds(&self) -> Option<Rect> {
-        if let Some(cached) = self.selection_bounds_cache {
-            return Some(cached);
-        }
-        self.selection
-            .iter()
-            .filter_map(|id| self.doc.element(id))
-            .map(|e| e.bounds())
-            .reduce(|a, b| a.union(&b))
+        self.view.selection_bounds(&self.doc)
     }
 
     /// The in-progress marquee rectangle, if any.
@@ -715,17 +709,17 @@ impl Editor {
                 .unwrap_or_default();
             let _ = self.commit_text(&id, &current, now);
         }
-        if self.nav.pointer_down(screen, button) {
+        if self.view.nav.pointer_down(screen, button) {
             return Effects::default();
         }
         if button != 0 {
             return Effects::default();
         }
-        let world = self.camera.screen_to_world(screen);
+        let world = self.view.camera.screen_to_world(screen);
         // Geometry-creating tools snap their anchor; hit-testing tools must
         // aim at what the user actually pointed at.
         let spot = self.snap(world);
-        match self.tool {
+        match self.view.tool {
             Tool::Select => self.begin_select(screen, world, mods, now),
             Tool::Rectangle | Tool::Diamond | Tool::Ellipse => self.begin_drawing(spot, now),
             Tool::Sticky => self.begin_sticky(spot, now),
@@ -737,14 +731,14 @@ impl Editor {
             Tool::Eraser => self.begin_erase(world, now),
             Tool::Text => self.begin_text_tool(spot, now),
             Tool::Hand => {
-                self.nav.start_pan(screen);
+                self.view.nav.start_pan(screen);
                 Effects::default()
             }
         }
     }
 
     pub fn pointer_move(&mut self, screen: Point, mods: Modifiers, now: u64) -> Effects {
-        if self.nav.pointer_move(&mut self.camera, screen) {
+        if self.view.nav.pointer_move(&mut self.view.camera, screen) {
             return Effects {
                 repaint_all: true,
                 ..Effects::default()
@@ -754,7 +748,7 @@ impl Editor {
         // read-only match below (this also keeps the match clone-free).
         if let Interaction::Erasing { erased } = &self.interaction {
             let mut erased = erased.clone();
-            let world = self.camera.screen_to_world(screen);
+            let world = self.view.camera.screen_to_world(screen);
             let mut effects = Effects::default();
             self.erase_at(world, &mut erased, &mut effects, now);
             self.interaction = Interaction::Erasing { erased };
@@ -765,7 +759,7 @@ impl Editor {
         if let Interaction::ArrowWaypoint { id, drag } = &self.interaction {
             let id = id.clone();
             let mut drag = *drag;
-            let current = self.snap(self.camera.screen_to_world(screen));
+            let current = self.snap(self.view.camera.screen_to_world(screen));
             let effects = Effects {
                 changed: [id.clone()].into_iter().collect(),
                 overlay_changed: true,
@@ -793,7 +787,7 @@ impl Editor {
                         // A click that never moved (pointer_up replays a
                         // zero-distance move) must leave the route alone.
                         if inserted.is_none() {
-                            if current.distance(*grab) <= 2.0 / self.camera.zoom {
+                            if current.distance(*grab) <= 2.0 / self.view.camera.zoom {
                                 self.interaction = Interaction::ArrowWaypoint { id, drag };
                                 return effects;
                             }
@@ -862,12 +856,12 @@ impl Editor {
         }
         match &self.interaction {
             Interaction::Idle => {
-                let world = self.camera.screen_to_world(screen);
+                let world = self.view.camera.screen_to_world(screen);
                 self.update_hover(world)
             }
             Interaction::FrameNameEditing { .. } => Effects::default(),
             Interaction::Drawing { id, start } => {
-                let current = self.snap(self.camera.screen_to_world(screen));
+                let current = self.snap(self.view.camera.screen_to_world(screen));
                 // A sticky note starts at its default size: a click keeps it,
                 // and only a real drag resizes it.
                 if self.doc.element(id).is_some_and(|e| e.is_sticky())
@@ -890,7 +884,7 @@ impl Editor {
                 Effects::changed(id.clone())
             }
             Interaction::Marquee { start: _ } => {
-                self.marquee_current = Some(self.camera.screen_to_world(screen));
+                self.marquee_current = Some(self.view.camera.screen_to_world(screen));
                 let _ = mods;
                 Effects {
                     overlay_changed: true,
@@ -900,7 +894,7 @@ impl Editor {
             Interaction::Moving {
                 start, originals, ..
             } => {
-                let current = self.camera.screen_to_world(screen);
+                let current = self.view.camera.screen_to_world(screen);
                 let (dx, dy) = (current.x - start.x, current.y - start.y);
                 if dx.abs() < 1e-9 && dy.abs() < 1e-9 {
                     return Effects::default();
@@ -967,10 +961,7 @@ impl Editor {
                 // The changed set stays empty: preview paints from the drained
                 // dirty rects, and release recomputes the full set for settle.
                 self.scene.shift_slots(&self.drag_slots, inc_x, inc_y);
-                if let Some(cached) = self.selection_bounds_cache.as_mut() {
-                    cached.x += inc_x;
-                    cached.y += inc_y;
-                }
+                self.view.shift_selection_bounds(inc_x, inc_y);
                 Effects {
                     preview: true,
                     overlay_changed: true,
@@ -983,7 +974,7 @@ impl Editor {
                 bounds,
                 originals,
             } => {
-                let current = self.snap(self.camera.screen_to_world(screen));
+                let current = self.snap(self.view.camera.screen_to_world(screen));
                 let target = resized_bounds(*bounds, *handle, *start, current, mods.shift);
                 let mut effects = Effects::default();
                 for original in originals {
@@ -1005,14 +996,14 @@ impl Editor {
             Interaction::ArrowWaypoint { .. } => unreachable!("handled above"),
             Interaction::TextEditing { .. } => Effects::default(),
             Interaction::Freehand { id } => {
-                let current = self.camera.screen_to_world(screen);
+                let current = self.view.camera.screen_to_world(screen);
                 let last = self.doc.element(id).and_then(|e| match &e.kind {
                     ElementKind::Freehand { points, .. } => points.last().copied(),
                     _ => None,
                 });
                 let mut effects = Effects::default();
                 let far_enough = last
-                    .map(|last| last.distance(current) >= 1.5 / self.camera.zoom)
+                    .map(|last| last.distance(current) >= 1.5 / self.view.camera.zoom)
                     .unwrap_or(false);
                 if far_enough {
                     let pressure = self.last_pressure;
@@ -1032,7 +1023,7 @@ impl Editor {
                 effects
             }
             Interaction::Line { id, start } => {
-                let current = self.camera.screen_to_world(screen);
+                let current = self.view.camera.screen_to_world(screen);
                 let end = constrain_angle(*start, current, mods.shift);
                 // An angle-constrained end is already intentional; snapping it
                 // would shear the angle.
@@ -1048,7 +1039,7 @@ impl Editor {
                 Effects::changed(id.clone())
             }
             Interaction::Connecting { id, start } => {
-                let current = self.camera.screen_to_world(screen);
+                let current = self.view.camera.screen_to_world(screen);
                 let tolerance = self.tolerance().max(4.0);
                 let approach = self
                     .doc
@@ -1148,7 +1139,7 @@ impl Editor {
                 }
             }
             Interaction::ArrowEndpoint { id, end } => {
-                let current = self.camera.screen_to_world(screen);
+                let current = self.view.camera.screen_to_world(screen);
                 let tolerance = self.tolerance().max(4.0);
                 let id = id.clone();
                 let end = *end;
@@ -1247,7 +1238,7 @@ impl Editor {
                 }
             }
             Interaction::PullingSticky { id, .. } => {
-                let current = self.snap(self.camera.screen_to_world(screen));
+                let current = self.snap(self.view.camera.screen_to_world(screen));
                 let size = self
                     .doc
                     .element(id)
@@ -1272,7 +1263,7 @@ impl Editor {
     }
 
     pub fn pointer_up(&mut self, screen: Point, mods: Modifiers, now: u64) -> Effects {
-        if self.nav.pointer_up(0) || self.nav.pointer_up(1) {
+        if self.view.nav.pointer_up(0) || self.view.nav.pointer_up(1) {
             return Effects::default();
         }
         // Take the interaction out rather than cloning it: `Moving`/`Resizing`
@@ -1335,7 +1326,7 @@ impl Editor {
                 }
             }
             Interaction::Marquee { start } => {
-                let end = self.camera.screen_to_world(screen);
+                let end = self.view.camera.screen_to_world(screen);
                 let rect = Rect::from_points(start, end);
                 self.marquee_current = None;
                 // Dropping the marquee is an overlay change even when the
@@ -1364,8 +1355,8 @@ impl Editor {
                 hits.sort();
                 hits.dedup();
                 if mods.shift {
-                    hits.retain(|id| !self.selection.contains(id));
-                    self.selection.extend(hits);
+                    hits.retain(|id| !self.view.selection.contains(id));
+                    self.view.selection.extend(hits);
                     effects.merge(Effects {
                         overlay_changed: true,
                         ..Effects::default()
@@ -1384,8 +1375,8 @@ impl Editor {
                 started_in_selection,
                 ..
             } => {
-                let end = self.camera.screen_to_world(screen);
-                let moved = end.distance(start) > 0.5 / self.camera.zoom;
+                let end = self.view.camera.screen_to_world(screen);
+                let moved = end.distance(start) > 0.5 / self.view.camera.zoom;
                 // Preview ran iff the pointer actually moved the drag total.
                 let previewed =
                     self.drag_applied.x.abs() > 1e-9 || self.drag_applied.y.abs() > 1e-9;
@@ -1626,8 +1617,8 @@ impl Editor {
                 }
             }
             Interaction::PullingSticky { id, origin } => {
-                let end = self.camera.screen_to_world(screen);
-                let pulled = end.distance(origin) > 3.0 / self.camera.zoom;
+                let end = self.view.camera.screen_to_world(screen);
+                let pulled = end.distance(origin) > 3.0 / self.view.camera.zoom;
                 if pulled {
                     self.sync_frame_membership(now);
                     if let Some(tx) = self.tx.take() {
@@ -1721,7 +1712,7 @@ impl Editor {
         if self.interaction != Interaction::Idle {
             return Effects::default();
         }
-        let world = self.camera.screen_to_world(screen);
+        let world = self.view.camera.screen_to_world(screen);
         // Double-clicking a bend removes it.
         if let Some((id, ArrowHandle::Waypoint { index, .. })) = self.arrow_handle_at(world) {
             let mut tx = Transaction::begin();
@@ -1821,15 +1812,16 @@ impl Editor {
             Target::Frame { id, rect, name } => {
                 self.interaction = Interaction::FrameNameEditing { id: id.clone() };
                 let top_left = self
+                    .view
                     .camera
                     .world_to_screen(Point::new(rect.x, rect.y - 18.0));
                 let action = ShellAction::OpenTextEditor {
                     id,
                     x: top_left.x,
                     y: top_left.y,
-                    width: (rect.w * self.camera.zoom).max(120.0),
-                    height: 20.0 * self.camera.zoom.max(0.5),
-                    font_size: 14.0 * self.camera.zoom,
+                    width: (rect.w * self.view.camera.zoom).max(120.0),
+                    height: 20.0 * self.view.camera.zoom.max(0.5),
+                    font_size: 14.0 * self.view.camera.zoom,
                     text: name,
                     align: TextAlign::Left,
                     color: "#868e96".into(),
@@ -1909,7 +1901,7 @@ impl Editor {
             return Effects::default();
         }
         let mut tx = Transaction::begin();
-        let line_height = self.measurer.line_height(self.style.font_size);
+        let line_height = self.measurer.line_height(self.view.style.font_size);
         let element = Element::new(
             ElementKind::Text {
                 rect: Rect::new(
@@ -1924,7 +1916,7 @@ impl Editor {
                 align: TextAlign::Left,
                 fixed_width: false,
                 container_id: None,
-                style: self.style.clone(),
+                style: self.view.style.clone(),
             },
             self.next_index(),
             now,
@@ -1989,12 +1981,12 @@ impl Editor {
             })
         );
         let mut tx = Transaction::begin();
-        let font_size = self.style.font_size;
+        let font_size = self.view.style.font_size;
         let line_height = self.measurer.line_height(font_size);
         // Sticky text sits inside the note, inked in the note's own (dark)
         // outline colour so it reads on the pastel fill.
         let padding = if is_sticky { 14.0 } else { 10.0 };
-        let mut text_style = self.style.clone();
+        let mut text_style = self.view.style.clone();
         if is_sticky {
             if let Some(ElementKind::Shape { style, .. }) =
                 self.doc.element(&container_id).map(|e| &e.kind)
@@ -2080,8 +2072,9 @@ impl Editor {
             ),
             _ => return None,
         };
-        let top_left = self.camera.world_to_screen(Point::new(rect.x, rect.y));
+        let top_left = self.view.camera.world_to_screen(Point::new(rect.x, rect.y));
         let bottom_right = self
+            .view
             .camera
             .world_to_screen(Point::new(rect.max_x(), rect.max_y()));
         let screen = Rect::from_points(top_left, bottom_right);
@@ -2090,8 +2083,8 @@ impl Editor {
             x: screen.x,
             y: screen.y,
             width: screen.w.max(60.0),
-            height: screen.h.max(font_size * self.camera.zoom * 1.6),
-            font_size: font_size * self.camera.zoom,
+            height: screen.h.max(font_size * self.view.camera.zoom * 1.6),
+            font_size: font_size * self.view.camera.zoom,
             text: content,
             align,
             color,
@@ -2186,7 +2179,7 @@ impl Editor {
                             self.unlink_dead_reference(id);
                         }
                     }
-                    self.selection.remove(id);
+                    self.view.selection.remove(id);
                 }
             }
             return effects;
@@ -2209,7 +2202,7 @@ impl Editor {
             if let Some(tx) = self.tx.take() {
                 tx.commit(&mut self.history);
             }
-            self.selection = [id.to_string()].into_iter().collect();
+            self.view.selection = [id.to_string()].into_iter().collect();
             effects.changed.insert(id.to_string());
             if was_new_text {
                 self.finish_tool_use();
@@ -2355,7 +2348,7 @@ impl Editor {
             "]" | "}" if mods.command() => self.reorder(1, now),
             "[" | "{" if mods.command() => self.reorder(-1, now),
             " " => {
-                self.nav.set_space(true);
+                self.view.nav.set_space(true);
                 Effects::default()
             }
             _ => {
@@ -2363,8 +2356,8 @@ impl Editor {
                     return Effects::default();
                 }
                 if let Some(tool) = Tool::from_shortcut(key) {
-                    if tool == self.tool {
-                        self.tool_locked = !self.tool_locked;
+                    if tool == self.view.tool {
+                        self.view.tool_locked = !self.view.tool_locked;
                         return Effects {
                             overlay_changed: true,
                             ..Effects::default()
@@ -2378,19 +2371,19 @@ impl Editor {
     }
 
     fn nudge_step(&self, mods: Modifiers) -> f64 {
-        if self.snap_to_grid {
-            return self.grid_size;
+        if self.view.snap_to_grid {
+            return self.view.grid_size;
         }
         if mods.shift {
-            10.0 / self.camera.zoom
+            10.0 / self.view.camera.zoom
         } else {
-            1.0 / self.camera.zoom
+            1.0 / self.view.camera.zoom
         }
     }
 
     pub fn key_up(&mut self, key: &str) -> Effects {
         if key == " " {
-            self.nav.set_space(false);
+            self.view.nav.set_space(false);
         }
         Effects::default()
     }
@@ -2552,7 +2545,7 @@ impl Editor {
         if self.interaction != Interaction::Idle {
             return self.cancel();
         }
-        if self.selection.is_empty() {
+        if self.view.selection.is_empty() {
             return Effects::default();
         }
         let mut tx = Transaction::begin();
@@ -2566,7 +2559,7 @@ impl Editor {
             }
         }
         tx.commit(&mut self.history);
-        self.selection.clear();
+        self.view.selection.clear();
         Effects {
             changed: ids.into_iter().collect(),
             overlay_changed: true,
@@ -2582,7 +2575,7 @@ impl Editor {
                 BTreeSet::new()
             }
         };
-        self.selection.clear();
+        self.view.selection.clear();
         Effects {
             changed,
             overlay_changed: true,
@@ -2599,7 +2592,7 @@ impl Editor {
                 BTreeSet::new()
             }
         };
-        self.selection.clear();
+        self.view.selection.clear();
         Effects {
             changed,
             overlay_changed: true,
@@ -2751,6 +2744,7 @@ impl Editor {
         if let Some(bounds) = self.selection_bounds() {
             if let Some(handle) = self.handle_at(screen, bounds) {
                 let originals: Vec<Element> = self
+                    .view
                     .selection
                     .iter()
                     .filter_map(|sid| self.doc.element(sid).cloned())
@@ -2784,20 +2778,20 @@ impl Editor {
         match hit_test_indexed(&self.doc, &self.hit, world, tolerance) {
             Some(id) => {
                 if mods.shift {
-                    if self.selection.contains(&id) {
-                        self.selection.remove(&id);
+                    if self.view.selection.contains(&id) {
+                        self.view.selection.remove(&id);
                     } else {
-                        self.selection.insert(id);
+                        self.view.selection.insert(id);
                     }
-                    self.selection_bounds_cache = None;
+                    self.view.selection_bounds_cache = None;
                     return Effects {
                         overlay_changed: true,
                         ..Effects::default()
                     };
                 }
-                if !self.selection.contains(&id) {
-                    self.selection = [id].into_iter().collect();
-                    self.selection_bounds_cache = None;
+                if !self.view.selection.contains(&id) {
+                    self.view.selection = [id].into_iter().collect();
+                    self.view.selection_bounds_cache = None;
                 }
                 let originals: Vec<Element> = self.selection_with_followers();
                 let moved: BTreeSet<ElementId> = originals.iter().map(|e| e.id.clone()).collect();
@@ -2807,7 +2801,7 @@ impl Editor {
             None => {
                 // Dragging from empty space inside the selection's bounding
                 // box moves the whole selection; only a click clears it.
-                if !mods.shift && !self.selection.is_empty() {
+                if !mods.shift && !self.view.selection.is_empty() {
                     if let Some(bounds) = self.selection_bounds() {
                         if bounds.contains(world) {
                             let originals = self.selection_with_followers();
@@ -2830,7 +2824,7 @@ impl Editor {
 
     fn begin_drawing(&mut self, world: Point, now: u64) -> Effects {
         let mut tx = Transaction::begin();
-        let kind = match self.tool {
+        let kind = match self.view.tool {
             Tool::Rectangle => ShapeKind::Rectangle,
             Tool::Diamond => ShapeKind::Diamond,
             _ => ShapeKind::Ellipse,
@@ -2839,7 +2833,7 @@ impl Editor {
             ElementKind::Shape {
                 shape: kind,
                 rect: Rect::new(world.x, world.y, 0.0, 0.0),
-                style: self.style.clone(),
+                style: self.view.style.clone(),
                 bound_text_id: None,
             },
             self.next_index(),
@@ -2871,7 +2865,7 @@ impl Editor {
     /// Resize handle positions in screen space, if something is selected.
     pub fn resize_handles(&self) -> Option<[(Handle, Point); 8]> {
         self.selection_bounds()
-            .map(|r| Handle::ALL.map(|h| (h, self.camera.world_to_screen(h.position(r)))))
+            .map(|r| Handle::ALL.map(|h| (h, self.view.camera.world_to_screen(h.position(r)))))
     }
 
     fn handle_at(&self, screen: Point, _bounds: Rect) -> Option<Handle> {
@@ -2886,13 +2880,16 @@ impl Editor {
     // -- connection nodes --------------------------------------------------
 
     fn node_grab(&self) -> f64 {
-        HANDLE_HIT_PX / self.camera.zoom
+        HANDLE_HIT_PX / self.view.camera.zoom
     }
 
     /// Where a side's connection node floats: just outside the edge, in
     /// screen-constant distance, so it never fights the resize handles.
     fn node_position(&self, side: connector::AnchorSide, anchor: Point) -> Point {
-        anchor + side.focus().scale(CONNECTION_NODE_PX / self.camera.zoom)
+        anchor
+            + side
+                .focus()
+                .scale(CONNECTION_NODE_PX / self.view.camera.zoom)
     }
 
     fn node_points_for(&self, element: &Element) -> Vec<Point> {
@@ -2916,7 +2913,7 @@ impl Editor {
         world: Point,
         exclude: Option<&str>,
     ) -> Option<(ElementId, connector::AnchorSide, Point)> {
-        let reach = (CONNECTION_NODE_PX + HANDLE_HIT_PX) / self.camera.zoom;
+        let reach = (CONNECTION_NODE_PX + HANDLE_HIT_PX) / self.view.camera.zoom;
         let grab = self.node_grab();
         // Grid candidates instead of a full scan: same model-bounds reject.
         let pad = reach + crate::spatial::hit_pad();
@@ -2976,7 +2973,7 @@ impl Editor {
 
     /// Refresh the hovered element's connection nodes for the Select tool.
     fn update_hover(&mut self, world: Point) -> Effects {
-        if self.tool != Tool::Select {
+        if self.view.tool != Tool::Select {
             return self.clear_hover();
         }
         let mut effects = Effects::default();
@@ -3035,7 +3032,7 @@ impl Editor {
             return None;
         }
         let rect = element.bounds();
-        let inset = STACK_EDGE_PX / self.camera.zoom;
+        let inset = STACK_EDGE_PX / self.view.camera.zoom;
         let inner = Rect::new(
             rect.x + inset,
             rect.y + inset,
@@ -3077,7 +3074,7 @@ impl Editor {
                 point: *point,
             })
             .collect();
-        let min_segment = 24.0 / self.camera.zoom;
+        let min_segment = 24.0 / self.view.camera.zoom;
         // On a multi-segment elbow the first and last segments leave the
         // anchors themselves; bowing them can only double the route back on
         // itself. Only interior runs offer insert handles.
@@ -3101,16 +3098,16 @@ impl Editor {
     }
 
     fn lone_arrow(&self) -> Option<&Element> {
-        if self.selection.len() != 1 {
+        if self.view.selection.len() != 1 {
             return None;
         }
-        let element = self.doc.element(self.selection.iter().next()?)?;
+        let element = self.doc.element(self.view.selection.iter().next()?)?;
         matches!(element.kind, ElementKind::Arrow { .. }).then_some(element)
     }
 
     fn arrow_handle_at(&self, world: Point) -> Option<(ElementId, ArrowHandle)> {
         let element = self.lone_arrow()?;
-        let grab = HANDLE_HIT_PX / self.camera.zoom;
+        let grab = HANDLE_HIT_PX / self.view.camera.zoom;
         let handle = self
             .arrow_path_handles()
             .into_iter()
@@ -3121,15 +3118,15 @@ impl Editor {
     /// When the selection is a lone connector, which endpoint `world` grabs.
     /// Returns the element id and the grabbed end.
     fn arrow_endpoint_at(&self, world: Point) -> Option<(ElementId, EndpointEnd)> {
-        if self.selection.len() != 1 {
+        if self.view.selection.len() != 1 {
             return None;
         }
-        let id = self.selection.iter().next()?;
+        let id = self.view.selection.iter().next()?;
         let element = self.doc.element(id)?;
         let ElementKind::Arrow { start, end, .. } = &element.kind else {
             return None;
         };
-        let grab = HANDLE_HIT_PX / self.camera.zoom;
+        let grab = HANDLE_HIT_PX / self.view.camera.zoom;
         let start_point = connector::endpoint_point(start, end.point(), &self.doc);
         if world.distance(start_point) <= grab {
             return Some((id.clone(), EndpointEnd::Start));
@@ -3145,10 +3142,10 @@ impl Editor {
     /// shaft (but not an endpoint — `arrow_endpoint_at` covers those), the
     /// originals for a body drag: the connector plus its followers.
     fn lone_arrow_shaft_hit(&self, world: Point) -> Option<Vec<Element>> {
-        if self.selection.len() != 1 {
+        if self.view.selection.len() != 1 {
             return None;
         }
-        let id = self.selection.iter().next()?;
+        let id = self.view.selection.iter().next()?;
         let element = self.doc.element(id)?;
         if !matches!(element.kind, ElementKind::Arrow { .. }) {
             return None;
@@ -3165,11 +3162,11 @@ impl Editor {
         if patch.is_empty() {
             return Effects::default();
         }
-        patch.apply_to(&mut self.style);
-        if self.selection.is_empty() || self.interaction != Interaction::Idle {
+        patch.apply_to(&mut self.view.style);
+        if self.view.selection.is_empty() || self.interaction != Interaction::Idle {
             return Effects::default();
         }
-        let ids: Vec<ElementId> = self.selection.iter().cloned().collect();
+        let ids: Vec<ElementId> = self.view.selection.iter().cloned().collect();
         let mut tx = Transaction::begin();
         let mut effects = Effects::default();
         for id in &ids {
@@ -3207,13 +3204,14 @@ impl Editor {
 
     /// The style shown in the panel: the selection's style, else defaults.
     pub fn current_style(&self) -> Style {
-        self.selection
+        self.view
+            .selection
             .iter()
             .next()
             .and_then(|id| self.doc.element(id))
             .and_then(|element| element_style(element))
             .cloned()
-            .unwrap_or_else(|| self.style.clone())
+            .unwrap_or_else(|| self.view.style.clone())
     }
 
     /// Insert a library glyph at the viewport centre with a caption beneath.
@@ -3224,9 +3222,9 @@ impl Editor {
         if self.interaction != Interaction::Idle {
             return Effects::default();
         }
-        let center = self.camera.screen_to_world(Point::new(
-            self.viewport_size.0 / 2.0,
-            self.viewport_size.1 / 2.0,
+        let center = self.view.camera.screen_to_world(Point::new(
+            self.view.viewport_size.0 / 2.0,
+            self.view.viewport_size.1 / 2.0,
         ));
         let size = 96.0;
         let rect = Rect::new(center.x - size / 2.0, center.y - size / 2.0, size, size);
@@ -3236,7 +3234,7 @@ impl Editor {
             ElementKind::Glyph {
                 glyph: glyph.to_string(),
                 rect,
-                style: self.style.clone(),
+                style: self.view.style.clone(),
                 caption_id: None,
             },
             self.next_index(),
@@ -3250,7 +3248,7 @@ impl Editor {
         let wrap = rect.w * 2.0;
         let layout = layout_text(
             definition.name,
-            self.style.font_size,
+            self.view.style.font_size,
             Some(wrap),
             self.measurer.as_ref(),
         );
@@ -3267,7 +3265,7 @@ impl Editor {
                 align: TextAlign::Center,
                 fixed_width: true,
                 container_id: Some(glyph_id.clone()),
-                style: self.style.clone(),
+                style: self.view.style.clone(),
             },
             self.next_index(),
             now,
@@ -3285,7 +3283,7 @@ impl Editor {
             debug_assert!(false, "caption link failed: {err}");
         }
         tx.commit(&mut self.history);
-        self.selection = [glyph_id.clone()].into_iter().collect();
+        self.view.selection = [glyph_id.clone()].into_iter().collect();
         Effects {
             changed: [glyph_id, caption_id].into_iter().collect(),
             overlay_changed: true,
@@ -3296,7 +3294,7 @@ impl Editor {
     /// The style new sticky notes and stacks inherit: a solid pastel fill and
     /// dark ink, so text reads on the note.
     fn sticky_style(&self) -> Style {
-        crate::commands::sticky_style(self.style.clone())
+        crate::commands::sticky_style(self.view.style.clone())
     }
 
     /// The sticky tool: pull a note off a stack under the pointer, otherwise
@@ -3361,7 +3359,7 @@ impl Editor {
         if let Some(tx) = self.tx.take() {
             tx.commit(&mut self.history);
         }
-        self.selection = [id.clone()].into_iter().collect();
+        self.view.selection = [id.clone()].into_iter().collect();
         self.finish_tool_use();
         Effects {
             changed: [id].into_iter().collect(),
@@ -3476,7 +3474,7 @@ impl Editor {
             ElementKind::Freehand {
                 points: vec![world],
                 pressures: vec![self.last_pressure],
-                style: self.style.clone(),
+                style: self.view.style.clone(),
             },
             self.next_index(),
             now,
@@ -3566,7 +3564,7 @@ impl Editor {
                 routing: Routing::Elbow,
                 start_arrowhead: false,
                 end_arrowhead: true,
-                style: self.style.clone(),
+                style: self.view.style.clone(),
                 waypoints: Vec::new(),
                 label_id: None,
             },
@@ -3769,7 +3767,7 @@ impl Editor {
 
     fn begin_line(&mut self, world: Point, now: u64) -> Effects {
         let mut tx = Transaction::begin();
-        let arrowhead = self.tool == Tool::Arrow;
+        let arrowhead = self.view.tool == Tool::Arrow;
         let element = Element::new(
             ElementKind::Arrow {
                 start: crate::model::Endpoint::free(world.x, world.y),
@@ -3777,7 +3775,7 @@ impl Editor {
                 routing: crate::model::Routing::Straight,
                 start_arrowhead: false,
                 end_arrowhead: arrowhead,
-                style: self.style.clone(),
+                style: self.view.style.clone(),
                 waypoints: Vec::new(),
                 label_id: None,
             },
@@ -3857,7 +3855,7 @@ impl Editor {
 
     /// The selection plus every follower, transitively.
     pub fn selection_with_followers_recursive(&self) -> BTreeSet<ElementId> {
-        let mut out = self.selection.clone();
+        let mut out = self.view.selection.clone();
         let mut frontier: Vec<ElementId> = out.iter().cloned().collect();
         while let Some(id) = frontier.pop() {
             for follower in self.followers(&id) {
@@ -3898,7 +3896,7 @@ impl Editor {
 
     /// Move the selection by a world-space delta, one undo step.
     pub fn nudge(&mut self, dx: f64, dy: f64, now: u64) -> Effects {
-        if self.selection.is_empty() || self.interaction != Interaction::Idle {
+        if self.view.selection.is_empty() || self.interaction != Interaction::Idle {
             return Effects::default();
         }
         let originals = self.selection_with_followers();
@@ -4022,14 +4020,14 @@ impl Editor {
             effects.changed.insert(id);
         }
         tx.commit(&mut self.history);
-        self.selection = effects.changed.clone();
+        self.view.selection = effects.changed.clone();
         effects.overlay_changed = true;
         effects
     }
 
     /// Move the selection one step forward (`1`) or backward (`-1`) in z-order.
     pub fn reorder(&mut self, direction: i32, now: u64) -> Effects {
-        if self.selection.is_empty() || self.interaction != Interaction::Idle {
+        if self.view.selection.is_empty() || self.interaction != Interaction::Idle {
             return Effects::default();
         }
         let mut seq: Vec<ElementId> = self
@@ -4038,7 +4036,7 @@ impl Editor {
             .iter()
             .map(|e| e.id.clone())
             .collect();
-        let selected = self.selection.clone();
+        let selected = self.view.selection.clone();
         match direction {
             1 => {
                 for i in (0..seq.len().saturating_sub(1)).rev() {
@@ -4584,15 +4582,15 @@ mod tests {
         assert_eq!(e.doc.ordered_live().len(), 1);
         let shape = e.doc.ordered_live()[0];
         assert_eq!(shape.bounds(), Rect::new(10.0, 10.0, 100.0, 50.0));
-        assert_eq!(e.selection.len(), 1);
+        assert_eq!(e.view.selection.len(), 1);
     }
 
     #[test]
     fn snapping_rounds_creation_to_the_grid() {
         let mut e = editor();
-        assert!(!e.snap_to_grid, "snapping is off by default");
-        assert!(!e.grid_visible, "the grid is off by default");
-        e.snap_to_grid = true;
+        assert!(!e.view.snap_to_grid, "snapping is off by default");
+        assert!(!e.view.grid_visible, "the grid is off by default");
+        e.view.snap_to_grid = true;
         drag_shape(&mut e, Point::new(13.0, 27.0), Point::new(103.0, 217.0), 1);
         assert_eq!(
             e.doc.ordered_live()[0].bounds(),
@@ -4603,8 +4601,8 @@ mod tests {
     #[test]
     fn snapping_respects_a_custom_grid_size() {
         let mut e = editor();
-        e.snap_to_grid = true;
-        e.grid_size = 40.0;
+        e.view.snap_to_grid = true;
+        e.view.grid_size = 40.0;
         drag_shape(&mut e, Point::new(13.0, 27.0), Point::new(103.0, 217.0), 1);
         assert_eq!(
             e.doc.ordered_live()[0].bounds(),
@@ -4617,7 +4615,7 @@ mod tests {
         let mut e = editor();
         drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(100.0, 50.0), 1);
         press(&mut e, "v", Modifiers::default(), 2);
-        e.snap_to_grid = true;
+        e.view.snap_to_grid = true;
         let mods = Modifiers::default();
         {
             let fx = e.pointer_down(Point::new(50.0, 25.0), 0, mods, 3);
@@ -4639,7 +4637,7 @@ mod tests {
         let mut e = editor();
         drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(100.0, 100.0), 1);
         press(&mut e, "v", Modifiers::default(), 2);
-        e.snap_to_grid = true;
+        e.view.snap_to_grid = true;
         let mods = Modifiers::default();
         {
             let fx = e.pointer_down(Point::new(100.0, 100.0), 0, mods, 3);
@@ -4688,7 +4686,7 @@ mod tests {
 
         let moved = e.doc.ordered_live()[0];
         assert_eq!(moved.bounds(), Rect::new(30.0, 20.0, 100.0, 50.0));
-        assert_eq!(e.selection.len(), 1);
+        assert_eq!(e.view.selection.len(), 1);
     }
 
     #[test]
@@ -4745,7 +4743,7 @@ mod tests {
             let fx = e.pointer_up(Point::new(300.0, 100.0), mods, 6);
             pump(&mut e, &fx);
         }
-        assert_eq!(e.selection.len(), 2);
+        assert_eq!(e.view.selection.len(), 2);
     }
 
     #[test]
@@ -4779,7 +4777,7 @@ mod tests {
             );
         }
         assert!(e.marquee_rect().is_none());
-        assert!(e.selection.is_empty());
+        assert!(e.view.selection.is_empty());
 
         // Inside a frame: the frame intersects but is not enclosed, so it is
         // filtered out and the selection still stays empty.
@@ -4815,7 +4813,7 @@ mod tests {
                 "a marquee that selects nothing must still erase itself"
             );
         }
-        assert!(e.selection.is_empty(), "the frame is not enclosed");
+        assert!(e.view.selection.is_empty(), "the frame is not enclosed");
     }
 
     #[test]
@@ -4855,7 +4853,7 @@ mod tests {
             e.doc.ordered_live()[1].bounds(),
             Rect::new(210.0, 20.0, 100.0, 50.0)
         );
-        assert_eq!(e.selection.len(), 2, "the whole group stays selected");
+        assert_eq!(e.view.selection.len(), 2, "the whole group stays selected");
 
         let mods_cmd = Modifiers {
             meta: true,
@@ -4892,7 +4890,10 @@ mod tests {
             let fx = e.pointer_up(Point::new(150.0, 25.0), mods, 9);
             pump(&mut e, &fx);
         }
-        assert!(e.selection.is_empty(), "a click inside the box deselects");
+        assert!(
+            e.view.selection.is_empty(),
+            "a click inside the box deselects"
+        );
         assert_eq!(
             e.doc.ordered_live()[0].bounds(),
             Rect::new(0.0, 0.0, 100.0, 50.0),
@@ -5019,7 +5020,7 @@ mod tests {
             let fx = e.pointer_up(Point::new(125.0, 25.0), shift, 7);
             pump(&mut e, &fx);
         }
-        assert_eq!(e.selection.len(), 2);
+        assert_eq!(e.view.selection.len(), 2);
 
         {
             let fx = e.pointer_down(Point::new(125.0, 25.0), 0, shift, 8);
@@ -5029,7 +5030,7 @@ mod tests {
             let fx = e.pointer_up(Point::new(125.0, 25.0), shift, 9);
             pump(&mut e, &fx);
         }
-        assert_eq!(e.selection.len(), 1);
+        assert_eq!(e.view.selection.len(), 1);
     }
 
     #[test]
@@ -5055,11 +5056,11 @@ mod tests {
         let mut e = editor();
         let mods = Modifiers::default();
         press(&mut e, "d", mods, 1);
-        assert_eq!(e.tool, Tool::Diamond);
+        assert_eq!(e.view.tool, Tool::Diamond);
         press(&mut e, "o", mods, 2);
-        assert_eq!(e.tool, Tool::Ellipse);
+        assert_eq!(e.view.tool, Tool::Ellipse);
         press(&mut e, "v", mods, 3);
-        assert_eq!(e.tool, Tool::Select);
+        assert_eq!(e.view.tool, Tool::Select);
     }
 
     #[test]
@@ -5236,9 +5237,12 @@ mod tests {
         };
         press(&mut e, "d", cmd, 2);
         assert_eq!(e.doc.ordered_live().len(), 2);
-        assert_eq!(e.selection.len(), 1);
-        assert!(!e.selection.contains(&original_id));
-        let copy = e.doc.element(e.selection.iter().next().unwrap()).unwrap();
+        assert_eq!(e.view.selection.len(), 1);
+        assert!(!e.view.selection.contains(&original_id));
+        let copy = e
+            .doc
+            .element(e.view.selection.iter().next().unwrap())
+            .unwrap();
         assert_eq!(copy.bounds(), Rect::new(12.0, 12.0, 100.0, 50.0));
     }
 
@@ -5256,7 +5260,7 @@ mod tests {
         assert_eq!(e.doc.ordered_live().len(), 3);
 
         press(&mut e, "a", cmd, 5);
-        assert_eq!(e.selection.len(), 3);
+        assert_eq!(e.view.selection.len(), 3);
         press(&mut e, "x", cmd, 6);
         assert_eq!(e.doc.ordered_live().len(), 0);
 
@@ -5388,7 +5392,7 @@ mod tests {
         let mut e = editor();
         let mods = Modifiers::default();
         press(&mut e, "p", mods, 1);
-        assert!(e.tool_locked, "the brush arms locked");
+        assert!(e.view.tool_locked, "the brush arms locked");
         {
             let fx = e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
             pump(&mut e, &fx);
@@ -5405,7 +5409,7 @@ mod tests {
             pump(&mut e, &fx);
         }
 
-        assert_eq!(e.tool, Tool::Freehand, "the pencil stays armed");
+        assert_eq!(e.view.tool, Tool::Freehand, "the pencil stays armed");
         assert_eq!(e.doc.ordered_live().len(), 1);
 
         // A second stroke needs no re-arming.
@@ -5435,7 +5439,7 @@ mod tests {
             pump(&mut e, &fx);
         }
         assert_eq!(
-            e.selection.iter().next(),
+            e.view.selection.iter().next(),
             Some(&id),
             "the stroke is selectable once Select is armed"
         );
@@ -5446,9 +5450,12 @@ mod tests {
         let mut e = editor();
         let mods = Modifiers::default();
         press(&mut e, "p", mods, 1);
-        assert!(e.tool_locked);
+        assert!(e.view.tool_locked);
         press(&mut e, "p", mods, 2);
-        assert!(!e.tool_locked, "second press makes the brush single-shot");
+        assert!(
+            !e.view.tool_locked,
+            "second press makes the brush single-shot"
+        );
 
         {
             let fx = e.pointer_down(Point::new(0.0, 0.0), 0, mods, 3);
@@ -5463,7 +5470,7 @@ mod tests {
             pump(&mut e, &fx);
         }
         assert_eq!(
-            e.tool,
+            e.view.tool,
             Tool::Select,
             "unlocked, it hands back after one use"
         );
@@ -5573,7 +5580,7 @@ mod tests {
             }
             other => panic!("expected text, got {other:?}"),
         }
-        assert_eq!(e.selection.len(), 1);
+        assert_eq!(e.view.selection.len(), 1);
     }
 
     #[test]
@@ -5681,7 +5688,7 @@ mod tests {
             let fx = e.pointer_up(Point::new(5.0, 5.0), mods, 5);
             pump(&mut e, &fx);
         }
-        assert!(e.selection.contains(&shape_id));
+        assert!(e.view.selection.contains(&shape_id));
 
         // Shrink the shape by dragging its SE handle.
         {
@@ -5753,7 +5760,7 @@ mod tests {
             let fx = e.update_style(&patch, 1);
             pump(&mut e, &fx);
         }
-        assert_eq!(e.style.stroke_width, 4.0);
+        assert_eq!(e.view.style.stroke_width, 4.0);
 
         drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(50.0, 50.0), 2);
         match &e.doc.ordered_live()[0].kind {
@@ -5791,7 +5798,7 @@ mod tests {
         drag_shape(&mut e, Point::new(300.0, 0.0), Point::new(400.0, 100.0), 2);
         let a = e.doc.ordered_live()[0].id.clone();
         let b = e.doc.ordered_live()[1].id.clone();
-        e.selection.clear();
+        e.view.selection.clear();
 
         let mods = Modifiers::default();
         press(&mut e, "a", mods, 3);
@@ -6499,7 +6506,7 @@ mod tests {
             }
             other => panic!("expected a sticky, got {other:?}"),
         }
-        assert_eq!(e.tool, Tool::Select, "the sticky tool is single-shot");
+        assert_eq!(e.view.tool, Tool::Select, "the sticky tool is single-shot");
 
         // Double-click creates the note's bound text, inked in the note colour.
         let fx = e.double_click(Point::new(200.0, 200.0), 4);
@@ -6563,7 +6570,7 @@ mod tests {
         }
         let stack = e.doc.ordered_live()[0].clone();
         assert!(stack.is_sticky_stack());
-        assert_eq!(e.tool, Tool::Select, "placing a stack is single-shot");
+        assert_eq!(e.view.tool, Tool::Select, "placing a stack is single-shot");
         assert_eq!(stack.bounds(), Rect::new(230.0, 230.0, 140.0, 140.0));
 
         // N-drag from the pile pulls a note out; the pile stays.
@@ -6594,7 +6601,7 @@ mod tests {
             stack.bounds(),
             "the pile did not move"
         );
-        assert_eq!(e.tool, Tool::Select);
+        assert_eq!(e.view.tool, Tool::Select);
 
         // A click on the pile pulls nothing.
         press(&mut e, "n", mods, 8);
@@ -6746,7 +6753,7 @@ mod tests {
                 pump(&mut e, &fx);
             }
             assert!(
-                e.selection.contains(&frame_id),
+                e.view.selection.contains(&frame_id),
                 "a selection rectangle enclosing a frame must select it"
             );
         }
@@ -6788,10 +6795,10 @@ mod tests {
             pump(&mut e, &fx);
         }
 
-        assert_eq!(e.selection.len(), 1);
-        assert!(e.selection.contains(&shape_id));
+        assert_eq!(e.view.selection.len(), 1);
+        assert!(e.view.selection.contains(&shape_id));
         assert!(
-            !e.selection.contains(&frame_id),
+            !e.view.selection.contains(&frame_id),
             "a marquee inside the frame does not grab the frame"
         );
     }
@@ -6907,11 +6914,11 @@ mod tests {
         };
         assert_eq!(bindings, (Some(a.clone()), Some(b.clone())));
         assert_eq!(
-            e.selection.iter().next(),
+            e.view.selection.iter().next(),
             Some(&arrow.id),
             "the new arrow is selected"
         );
-        assert_eq!(e.tool, Tool::Select);
+        assert_eq!(e.view.tool, Tool::Select);
 
         // The start followed the source shape when it moved.
         e.select([a.clone()]);
@@ -7035,8 +7042,8 @@ mod tests {
             assert_eq!(live.len(), 1);
             live[0].id.clone()
         };
-        assert_eq!(e.tool, Tool::Select, "the draw tool is single-shot");
-        assert_eq!(e.selection.iter().next(), Some(&id));
+        assert_eq!(e.view.tool, Tool::Select, "the draw tool is single-shot");
+        assert_eq!(e.view.selection.iter().next(), Some(&id));
 
         // The placed shape is selectable after deselecting.
         e.clear_selection();
@@ -7048,7 +7055,11 @@ mod tests {
             let fx = e.pointer_up(Point::new(50.0, 30.0), mods, 6);
             pump(&mut e, &fx);
         }
-        assert_eq!(e.selection.len(), 1, "clicking the drawn shape selects it");
+        assert_eq!(
+            e.view.selection.len(),
+            1,
+            "clicking the drawn shape selects it"
+        );
     }
 
     #[test]
@@ -7057,8 +7068,8 @@ mod tests {
         let mods = Modifiers::default();
         press(&mut e, "r", mods, 1);
         press(&mut e, "r", mods, 2);
-        assert!(e.tool_locked, "second press locks the tool");
-        assert_eq!(e.tool, Tool::Rectangle);
+        assert!(e.view.tool_locked, "second press locks the tool");
+        assert_eq!(e.view.tool, Tool::Rectangle);
 
         for (i, start) in [0.0_f64, 200.0].iter().enumerate() {
             let now = 10 + i as u64 * 10;
@@ -7076,7 +7087,7 @@ mod tests {
             }
         }
         assert_eq!(e.doc.ordered_live().len(), 2, "locked tool keeps drawing");
-        assert_eq!(e.tool, Tool::Rectangle);
+        assert_eq!(e.view.tool, Tool::Rectangle);
 
         let cmd = Modifiers {
             meta: true,
@@ -7085,8 +7096,8 @@ mod tests {
         let _ = press(&mut e, "z", cmd, 99);
         let _ = cmd;
         press(&mut e, "v", mods, 100);
-        assert_eq!(e.tool, Tool::Select);
-        assert!(!e.tool_locked);
+        assert_eq!(e.view.tool, Tool::Select);
+        assert!(!e.view.tool_locked);
     }
 
     #[test]
@@ -7103,7 +7114,7 @@ mod tests {
             let fx = e.commit_text(&id, "hello", 3);
             pump(&mut e, &fx);
         }
-        assert_eq!(e.tool, Tool::Select, "new text is single-shot");
+        assert_eq!(e.view.tool, Tool::Select, "new text is single-shot");
 
         press(&mut e, "t", mods, 4);
         let effects = e.pointer_down(Point::new(55.0, 55.0), 0, mods, 5);
@@ -7112,7 +7123,11 @@ mod tests {
             let fx = e.commit_text(&id, "hello again", 6);
             pump(&mut e, &fx);
         }
-        assert_eq!(e.tool, Tool::Text, "editing existing text keeps the tool");
+        assert_eq!(
+            e.view.tool,
+            Tool::Text,
+            "editing existing text keeps the tool"
+        );
     }
 
     #[test]
@@ -7150,7 +7165,7 @@ mod tests {
             pump(&mut e, &fx);
         }
         assert_eq!(
-            e.selection.iter().next().map(String::as_str),
+            e.view.selection.iter().next().map(String::as_str),
             Some(glyph.id.as_str()),
             "clicking the caption selects the glyph"
         );
@@ -7219,7 +7234,7 @@ mod tests {
             pump(&mut e, &fx);
         }
         assert_eq!(e.doc.ordered_live().len(), 1);
-        assert_eq!(e.tool, Tool::Select, "placing text is single-shot");
+        assert_eq!(e.view.tool, Tool::Select, "placing text is single-shot");
 
         press(&mut e, "t", mods, 4);
         {
@@ -7362,7 +7377,7 @@ mod tests {
             pump(&mut e, &fx);
         }
         assert!(e.doc.is_empty(), "tool switch committed a half-drawn shape");
-        assert_eq!(e.tool, Tool::Select);
+        assert_eq!(e.view.tool, Tool::Select);
         // The gesture is really over: the next drag uses the new tool.
         {
             let fx = e.pointer_down(Point::new(300.0, 300.0), 0, mods, 6);

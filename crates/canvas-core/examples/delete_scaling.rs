@@ -30,7 +30,7 @@ fn main() {
         let undo = start.elapsed();
         println!(
             "{n}\t{}\t{:>8.2}ms\t{:>8.2}ms",
-            editor.doc.live_count(),
+            editor.document().live_count(),
             delete.as_secs_f64() * 1000.0,
             undo.as_secs_f64() * 1000.0
         );

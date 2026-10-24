@@ -482,17 +482,17 @@ impl Editor {
     pub fn new_document(&mut self) {
         // View preferences survive replacing the document.
         let (grid_visible, snap_to_grid, grid_size) = (
-            self.core.grid_visible,
-            self.core.snap_to_grid,
-            self.core.grid_size,
+            self.core.grid_visible(),
+            self.core.snap_enabled(),
+            self.core.grid_size(),
         );
-        let zoom_sensitivity = self.core.nav.zoom_sensitivity();
+        let zoom_sensitivity = self.core.nav().zoom_sensitivity();
         self.core = CoreEditor::new(Document::new());
         self.purge_ledger.clear();
-        self.core.grid_visible = grid_visible;
-        self.core.snap_to_grid = snap_to_grid;
-        self.core.grid_size = grid_size;
-        self.core.nav.set_zoom_sensitivity(zoom_sensitivity);
+        self.core.set_grid_visible(grid_visible);
+        self.core.set_snap_enabled(snap_to_grid);
+        self.core.set_grid_size(grid_size);
+        self.core.nav_mut().set_zoom_sensitivity(zoom_sensitivity);
         self.core
             .set_measurer(Box::new(FontMeasurer::new(self.measure_ctx.clone())));
         self.core.set_viewport(self.css_width(), self.css_height());
@@ -606,7 +606,7 @@ impl Editor {
     /// carries the document instead. Purges still enter the ledger so the
     /// snapshot cannot forget an explicit deletion.
     pub fn discard_outbound(&mut self) {
-        let deltas = self.core.history.drain_outbox();
+        let deltas = self.core.drain_outbox();
         if deltas.is_empty() {
             return;
         }
@@ -639,7 +639,7 @@ impl Editor {
 
     /// Export the drawing as a standalone SVG.
     pub fn export_svg(&self) -> String {
-        canvas_core::svg::to_svg(&self.core.doc, self.core.measurer())
+        canvas_core::svg::to_svg(self.core.document(), self.core.measurer())
     }
 
     /// Export the drawing as a PNG data URL at the requested scale.
@@ -724,8 +724,8 @@ impl Editor {
             |id: &str| editing.as_deref() == Some(id) || hidden.is_some_and(|set| set.contains(id));
         let mut renderer = Canvas2dRenderer::new(ctx);
         renderer.clear(BACKGROUND);
-        renderer.set_transform(self.core.camera.transform().then(Affine::scale(scale)));
-        let viewport = self.core.camera.viewport(css_w, css_h);
+        renderer.set_transform(self.core.camera().transform().then(Affine::scale(scale)));
+        let viewport = self.core.camera().viewport(css_w, css_h);
         self.core.scene.flush_pending_ops();
         self.core.ensure_area(viewport);
         self.core.scene.flush_preview_stale(viewport);
@@ -787,27 +787,27 @@ impl Editor {
     }
 
     pub fn scroll(&self) -> Vec<f64> {
-        vec![self.core.camera.scroll.x, self.core.camera.scroll.y]
+        vec![self.core.camera().scroll.x, self.core.camera().scroll.y]
     }
 
     pub fn zoom(&self) -> f64 {
-        self.core.camera.zoom
+        self.core.camera().zoom
     }
 
     pub fn element_count(&self) -> usize {
-        self.core.doc.live_count()
+        self.core.document().live_count()
     }
 
     pub fn active_tool(&self) -> String {
-        self.core.tool.name().into()
+        self.core.tool().name().into()
     }
 
     pub fn can_undo(&self) -> bool {
-        self.core.history.can_undo()
+        self.core.can_undo()
     }
 
     pub fn can_redo(&self) -> bool {
-        self.core.history.can_redo()
+        self.core.can_redo()
     }
 
     /// Selection bounds in world space, or undefined.
@@ -825,52 +825,52 @@ impl Editor {
     }
 
     pub fn toggle_tool_lock(&mut self) {
-        self.core.tool_locked = !self.core.tool_locked;
+        self.core.toggle_tool_lock();
     }
 
     pub fn is_tool_locked(&self) -> bool {
-        self.core.tool_locked
+        self.core.tool_locked()
     }
 
     /// Show or hide the optional grid.
     pub fn set_grid_visible(&mut self, visible: bool) {
-        self.core.grid_visible = visible;
+        self.core.set_grid_visible(visible);
         self.draw_grid();
     }
 
     pub fn grid_visible(&self) -> bool {
-        self.core.grid_visible
+        self.core.grid_visible()
     }
 
     /// Set the grid spacing (world units). Out-of-range values are clamped;
     /// non-finite values are ignored.
     pub fn set_grid_size(&mut self, size: f64) {
         if size.is_finite() {
-            self.core.grid_size = size.clamp(4.0, 400.0);
+            self.core.set_grid_size(size.clamp(4.0, 400.0));
             self.draw_grid();
         }
     }
 
     pub fn grid_size(&self) -> f64 {
-        self.core.grid_size
+        self.core.grid_size()
     }
 
     /// Multiplier on wheel-zoom strength (1 is the tuned default).
     pub fn set_zoom_sensitivity(&mut self, sensitivity: f64) {
-        self.core.nav.set_zoom_sensitivity(sensitivity);
+        self.core.nav_mut().set_zoom_sensitivity(sensitivity);
     }
 
     pub fn zoom_sensitivity(&self) -> f64 {
-        self.core.nav.zoom_sensitivity()
+        self.core.nav().zoom_sensitivity()
     }
 
     /// Enable or disable snapping edits to the grid.
     pub fn set_snap_enabled(&mut self, enabled: bool) {
-        self.core.snap_to_grid = enabled;
+        self.core.set_snap_enabled(enabled);
     }
 
     pub fn snap_enabled(&self) -> bool {
-        self.core.snap_to_grid
+        self.core.snap_enabled()
     }
 
     /// Load the seed demo: a small cloud architecture to explore.
@@ -893,7 +893,7 @@ impl Editor {
 
     /// Draw everything visible for this frame.
     pub fn render(&mut self) {
-        if self.core.camera.zoom < LOD_ZOOM {
+        if self.core.camera().zoom < LOD_ZOOM {
             self.render_lod();
             return;
         }
@@ -902,7 +902,7 @@ impl Editor {
         // never touch ops, so drift loops at overview zoom skip it entirely.
         self.core.scene.flush_pending_ops();
         let (w, h) = self.core.viewport_size();
-        let viewport = self.core.camera.viewport(w, h);
+        let viewport = self.core.camera().viewport(w, h);
         self.core.ensure_area(viewport);
         self.core.scene.flush_preview_stale(viewport);
         // During playback, unrevealed elements stay off the canvas. The
@@ -914,7 +914,7 @@ impl Editor {
         // painting the committed element underneath would ghost two versions.
         let editing = self.core.editing_text_id();
         let skip = |id: &str| editing == Some(id) || hidden.is_some_and(|set| set.contains(id));
-        let transform = self.core.camera.transform().then(Affine::scale(self.dpr));
+        let transform = self.core.camera().transform().then(Affine::scale(self.dpr));
         {
             let scene = &self.core.scene;
             let renderer = &mut self.renderer;
@@ -953,11 +953,11 @@ impl Editor {
     /// restores exact ink (full ops stay cached, bounds stay exact throughout).
     fn render_lod(&mut self) {
         let (w, h) = self.core.viewport_size();
-        let viewport = self.core.camera.viewport(w, h);
+        let viewport = self.core.camera().viewport(w, h);
         let hidden = self.presentation.as_ref().map(|p| &p.hidden);
         let editing = self.core.editing_text_id();
         let skip = |id: &str| editing == Some(id) || hidden.is_some_and(|set| set.contains(id));
-        let transform = self.core.camera.transform().then(Affine::scale(self.dpr));
+        let transform = self.core.camera().transform().then(Affine::scale(self.dpr));
         let renderer = &mut self.renderer;
         renderer.begin_frame();
         renderer.clear(BACKGROUND);
@@ -1097,7 +1097,7 @@ impl Editor {
     /// Abort an interrupted pointer gesture instead of committing its last
     /// preview. Used by browser pointer cancellation and touch pinch takeover.
     pub fn pointer_cancel(&mut self) {
-        self.core.nav.cancel();
+        self.core.nav_mut().cancel();
         if self.core.is_interacting() {
             let effects = self.core.cancel();
             self.apply(effects);
@@ -1113,9 +1113,7 @@ impl Editor {
         }
         self.cancel_camera_transition();
         self.cancel_presentation();
-        self.core
-            .nav
-            .wheel(&mut self.core.camera, Point::new(x, y), dx, dy, ctrl);
+        self.core.wheel(Point::new(x, y), dx, dy, ctrl);
         if !self.try_paint_pan_current() {
             self.render();
         }
@@ -1127,7 +1125,7 @@ impl Editor {
         }
         self.cancel_camera_transition();
         self.cancel_presentation();
-        self.core.camera.zoom_at(Point::new(x, y), factor);
+        self.core.camera().zoom_at(Point::new(x, y), factor);
         self.render();
     }
 
@@ -1192,27 +1190,27 @@ impl Editor {
     }
 
     pub fn blur(&mut self) {
-        self.core.nav.set_space(false);
-        self.core.nav.cancel();
+        self.core.nav_mut().set_space(false);
+        self.core.nav_mut().cancel();
         self.core.clear_hover();
         self.settle_view();
         self.draw_overlay();
     }
 
     pub fn cursor(&self) -> String {
-        if self.core.nav.is_panning() {
+        if self.core.nav().is_panning() {
             return "grabbing".into();
         }
-        if self.core.nav.space_held() || self.core.tool == Tool::Hand {
+        if self.core.nav().space_held() || self.core.tool() == Tool::Hand {
             return "grab".into();
         }
-        if self.core.tool == Tool::Select && !self.core.hover_anchor_points().is_empty() {
+        if self.core.tool() == Tool::Select && !self.core.hover_anchor_points().is_empty() {
             return "crosshair".into();
         }
-        if self.core.tool == Tool::Select && self.core.stack_pull_hover() {
+        if self.core.tool() == Tool::Select && self.core.stack_pull_hover() {
             return "grab".into();
         }
-        match self.core.tool {
+        match self.core.tool() {
             Tool::Select => "default".into(),
             Tool::Text => "text".into(),
             _ => "crosshair".into(),
@@ -1222,7 +1220,7 @@ impl Editor {
     pub fn zoom_to_fit(&mut self) {
         self.cancel_camera_transition();
         if let Some(bounds) = self.core.scene.bounds() {
-            self.core.camera.zoom_to_fit(
+            self.core.camera().zoom_to_fit(
                 bounds,
                 (
                     self.scene_canvas.client_width() as f64,
@@ -1231,7 +1229,7 @@ impl Editor {
                 48.0,
             );
         } else {
-            self.core.camera = canvas_core::Camera::default();
+            self.core.set_camera(canvas_core::Camera::default());
         }
         self.render();
     }
@@ -1242,7 +1240,7 @@ impl Editor {
             self.scene_canvas.client_width() as f64 / 2.0,
             self.scene_canvas.client_height() as f64 / 2.0,
         );
-        self.core.camera.set_zoom_at(center, 1.0);
+        self.core.camera().set_zoom_at(center, 1.0);
         self.render();
     }
 
@@ -1288,12 +1286,12 @@ impl Editor {
                 let viewport = (self.css_width(), self.css_height());
                 let target = match mode {
                     "in" => {
-                        let mut camera = self.core.camera;
+                        let mut camera = self.core.camera();
                         camera.zoom_at(Point::new(viewport.0 / 2.0, viewport.1 / 2.0), 1.3);
                         Some(cap_zoom(camera, viewport, zoom_cap))
                     }
                     "out" => {
-                        let mut camera = self.core.camera;
+                        let mut camera = self.core.camera();
                         camera.zoom_at(Point::new(viewport.0 / 2.0, viewport.1 / 2.0), 1.0 / 1.3);
                         Some(camera)
                     }
@@ -1302,7 +1300,7 @@ impl Editor {
                         .focus_camera(None, 48.0)
                         .map(|camera| cap_zoom(camera, viewport, zoom_cap)),
                     "reset" => Some(Camera::from_center(
-                        self.core.camera.center(viewport),
+                        self.core.camera().center(viewport),
                         1.0,
                         viewport,
                     )),
@@ -1316,7 +1314,7 @@ impl Editor {
                 let Some(id) = command.get("id").and_then(|value| value.as_str()) else {
                     return false;
                 };
-                let Some(bounds) = self.core.doc.framing_bounds(id) else {
+                let Some(bounds) = self.core.document().framing_bounds(id) else {
                     return false;
                 };
                 self.pulse = Some(Pulse {
@@ -1343,7 +1341,7 @@ impl Editor {
         if let Some(tween) = self.tween {
             let viewport = (self.css_width(), self.css_height());
             let (camera, done) = tween.camera_at(now, viewport);
-            self.core.camera = camera;
+            self.core.set_camera(camera);
             if done {
                 self.tween = None;
             } else {
@@ -1450,12 +1448,12 @@ impl Editor {
     /// hint (see ADR 0006).
     pub fn view_state_json(&self) -> String {
         let (w, h) = (self.css_width(), self.css_height());
-        let selection: Vec<&str> = self.core.selection.iter().map(String::as_str).collect();
+        let selection: Vec<&str> = self.core.selection().iter().map(String::as_str).collect();
         serde_json::json!({
             "camera": {
-                "x": self.core.camera.scroll.x,
-                "y": self.core.camera.scroll.y,
-                "zoom": self.core.camera.zoom,
+                "x": self.core.camera().scroll.x,
+                "y": self.core.camera().scroll.y,
+                "zoom": self.core.camera().zoom,
             },
             "viewport": { "w": w, "h": h },
             "selection": selection,
@@ -1465,14 +1463,14 @@ impl Editor {
 
     /// Screen point -> world point, through the current camera.
     pub fn screen_to_world(&self, x: f64, y: f64) -> Vec<f64> {
-        let p = self.core.camera.screen_to_world(Point::new(x, y));
+        let p = self.core.camera().screen_to_world(Point::new(x, y));
         vec![p.x, p.y]
     }
 
     /// The routed polyline currently drawn for a connector, as flat x/y
     /// world coordinates. Empty for anything that is not a connector.
     pub fn route_for(&self, id: &str) -> Vec<f64> {
-        let Some(element) = self.core.doc.element(id) else {
+        let Some(element) = self.core.document().element(id) else {
             return Vec::new();
         };
         let canvas_core::model::ElementKind::Arrow {
@@ -1490,7 +1488,7 @@ impl Editor {
             end,
             *routing,
             waypoints,
-            &self.core.doc,
+            self.core.document(),
             &self.core.obstacles,
         )
         .into_iter()
@@ -1510,8 +1508,8 @@ impl Editor {
 
     fn remember_view(&mut self) {
         self.last_paint = Some(ViewSnapshot {
-            scroll: self.core.camera.scroll,
-            zoom: self.core.camera.zoom,
+            scroll: self.core.camera().scroll,
+            zoom: self.core.camera().zoom,
             width: self.scene_canvas.width(),
             height: self.scene_canvas.height(),
         });
@@ -1521,7 +1519,7 @@ impl Editor {
     /// zoomed approximation.
     fn settle_view(&mut self) {
         if let Some(from) = self.last_paint {
-            if from.scroll != self.core.camera.scroll || from.zoom != self.core.camera.zoom {
+            if from.scroll != self.core.camera().scroll || from.zoom != self.core.camera().zoom {
                 self.render();
             }
         }
@@ -1532,13 +1530,13 @@ impl Editor {
     fn start_camera_transition(&mut self, target: Camera, animate: bool) -> bool {
         if !animate {
             self.tween = None;
-            self.core.camera = target;
+            self.core.set_camera(target);
             self.render();
             return false;
         }
         let viewport = (self.css_width(), self.css_height());
         self.tween = Some(CameraTween::between(
-            &self.core.camera,
+            &self.core.camera(),
             &target,
             viewport,
             now_ms(),
@@ -1557,15 +1555,15 @@ impl Editor {
     /// fit zoom is capped so small elements don't cause a dramatic jump.
     fn focus_plan(&self, id: Option<&str>, pad: f64, zoom_cap: f64) -> Option<Camera> {
         let bounds = match id {
-            Some(id) => self.core.doc.framing_bounds(id)?,
-            None => self.core.doc.bounds()?,
+            Some(id) => self.core.document().framing_bounds(id)?,
+            None => self.core.document().bounds()?,
         };
         let viewport = (self.css_width(), self.css_height());
         if viewport.0 <= 0.0 || viewport.1 <= 0.0 {
             return None;
         }
-        let visible = self.core.camera.viewport(viewport.0, viewport.1);
-        let margin = FOCUS_MARGIN_PX / self.core.camera.zoom;
+        let visible = self.core.camera().viewport(viewport.0, viewport.1);
+        let margin = FOCUS_MARGIN_PX / self.core.camera().zoom;
         let comfortably_visible = bounds.x >= visible.x + margin
             && bounds.y >= visible.y + margin
             && bounds.max_x() <= visible.max_x() - margin
@@ -1573,7 +1571,7 @@ impl Editor {
         if comfortably_visible {
             return None;
         }
-        let mut camera = self.core.camera;
+        let mut camera = self.core.camera();
         camera.zoom_to_fit(bounds, viewport, pad);
         Some(Camera::from_center(
             bounds.center(),
@@ -1604,7 +1602,7 @@ impl Editor {
             }
         }
         if let Some(id) = step.point.as_deref() {
-            if let Some(bounds) = self.core.doc.framing_bounds(id) {
+            if let Some(bounds) = self.core.document().framing_bounds(id) {
                 self.pulse = Some(Pulse {
                     bounds,
                     started_ms: now_ms(),
@@ -1643,7 +1641,7 @@ impl Editor {
     /// enter the ledger with the exact tombstone this patch projects, so a
     /// later reconnect snapshot is byte-for-byte the same deletion.
     fn take_outbound_patch(&mut self) -> Option<canvas_core::Patch> {
-        let deltas = self.core.history.drain_outbox();
+        let deltas = self.core.drain_outbox();
         if deltas.is_empty() {
             return None;
         }
@@ -1655,7 +1653,7 @@ impl Editor {
     /// The live document with explicit purge tombstones folded in. Absence in
     /// the live document is not a deletion; only the ledger adds one.
     fn synced_document(&self) -> Document {
-        self.purge_ledger.materialize(&self.core.doc)
+        self.purge_ledger.materialize(self.core.document())
     }
 
     /// Merge a remote snapshot now: reconcile, rebuild the scene, repaint.
@@ -1667,16 +1665,11 @@ impl Editor {
     }
 
     fn apply_remote_snapshot(&mut self, remote: Document) -> bool {
-        let merged = canvas_core::reconcile(&self.core.doc, &remote);
-        if merged == self.core.doc {
+        let merged = canvas_core::reconcile(self.core.document(), &remote);
+        self.last_paint = None;
+        if !self.core.merge_document(merged) {
             return false;
         }
-        self.core.doc = merged;
-        self.core
-            .selection
-            .retain(|id| self.core.doc.element(id).is_some_and(|e| !e.is_deleted));
-        self.last_paint = None;
-        self.core.refresh_scene();
         self.render();
         true
     }
@@ -1694,13 +1687,10 @@ impl Editor {
     fn apply_remote_elements(&mut self, elements: Vec<canvas_core::Element>) -> bool {
         let patch = canvas_core::Patch { put: elements };
         let changed: BTreeSet<canvas_core::ElementId> =
-            patch.apply_to(&mut self.core.doc).into_iter().collect();
+            self.core.apply_patch(&patch).into_iter().collect();
         if changed.is_empty() {
             return false;
         }
-        self.core
-            .selection
-            .retain(|id| self.core.doc.element(id).is_some_and(|e| !e.is_deleted));
         self.last_paint = None;
         let dirty = self.core.rebuild_changed(&changed);
         self.paint_dirty(&dirty);
@@ -1729,13 +1719,13 @@ impl Editor {
         // At overview zoom the LOD full render is cheaper than pixel-shifting
         // plus per-strip full-detail repaints (which would also mismatch the
         // LOD main image). Fall back to `render()` there.
-        if self.core.camera.zoom < LOD_ZOOM {
+        if self.core.camera().zoom < LOD_ZOOM {
             return false;
         }
         let Some(from) = self.last_paint else {
             return false;
         };
-        let camera = self.core.camera;
+        let camera = self.core.camera();
         if camera.zoom != from.zoom {
             return false;
         }
@@ -1901,19 +1891,19 @@ impl Editor {
     fn paint_dirty(&mut self, dirty: &[Rect]) {
         // At overview zoom a single LOD pass is cheaper and keeps the whole
         // frame on the same detail level (no full-ink island in an LOD sea).
-        if self.core.camera.zoom < LOD_ZOOM {
+        if self.core.camera().zoom < LOD_ZOOM {
             self.render();
             return;
         }
         if let Some(from) = self.last_paint {
-            if from.scroll != self.core.camera.scroll || from.zoom != self.core.camera.zoom {
+            if from.scroll != self.core.camera().scroll || from.zoom != self.core.camera().zoom {
                 // The canvas no longer corresponds to the snapshot; the next
                 // pan must fall back to a full render.
                 self.last_paint = None;
             }
         }
         let (w, h) = self.core.viewport_size();
-        let viewport = self.core.camera.viewport(w, h);
+        let viewport = self.core.camera().viewport(w, h);
         let visible: Vec<Rect> = dirty
             .iter()
             .filter(|r| r.intersects(&viewport))
@@ -1932,10 +1922,13 @@ impl Editor {
         self.renderer.begin_frame();
         let mut cleared: Vec<Rect> = Vec::with_capacity(merged.len());
         for rect in &merged {
-            let top_left = self.core.camera.world_to_screen(Point::new(rect.x, rect.y));
+            let top_left = self
+                .core
+                .camera()
+                .world_to_screen(Point::new(rect.x, rect.y));
             let bottom_right = self
                 .core
-                .camera
+                .camera()
                 .world_to_screen(Point::new(rect.max_x(), rect.max_y()));
             let screen = Rect::from_points(top_left, bottom_right).expand(1.0);
             let device = Rect::new(
@@ -1960,7 +1953,7 @@ impl Editor {
         let clip: Vec<Rect> = cleared.iter().map(|rect| rect.expand(1.0)).collect();
         self.renderer.clip_rects(&clip);
         self.renderer
-            .set_transform(self.core.camera.transform().then(Affine::scale(self.dpr)));
+            .set_transform(self.core.camera().transform().then(Affine::scale(self.dpr)));
         // Non-LOD only (LOD edits full-render before reaching here): flush
         // deferred drift so repainted layers draw at new positions.
         self.core.scene.flush_pending_ops();
@@ -1991,9 +1984,9 @@ impl Editor {
         self.grid.save();
         let _ = self.grid.set_transform(1.0, 0.0, 0.0, 1.0, 0.0, 0.0);
         self.grid.clear_rect(0.0, 0.0, w, h);
-        if self.core.grid_visible && w > 0.0 && h > 0.0 {
-            let camera = self.core.camera;
-            let mut step = self.core.grid_size;
+        if self.core.grid_visible() && w > 0.0 && h > 0.0 {
+            let camera = self.core.camera();
+            let mut step = self.core.grid_size();
             while step * camera.zoom * self.dpr < GRID_MIN_SPACING_PX {
                 step *= 2.0;
             }
@@ -2031,7 +2024,7 @@ impl Editor {
         let _ = self.overlay.set_transform(1.0, 0.0, 0.0, 1.0, 0.0, 0.0);
         self.overlay.clear_rect(0.0, 0.0, w, h);
 
-        let camera = self.core.camera;
+        let camera = self.core.camera();
         if let Some(rect) = self.core.marquee_rect() {
             let a = camera.world_to_screen(Point::new(rect.x, rect.y));
             let b = camera.world_to_screen(Point::new(rect.max_x(), rect.max_y()));
@@ -2056,7 +2049,7 @@ impl Editor {
         // Bend handles on a selected connector: filled = existing waypoint,
         // hollow = drag to add one.
         for handle in self.core.arrow_path_handles() {
-            let screen = self.core.camera.world_to_screen(handle.point());
+            let screen = self.core.camera().world_to_screen(handle.point());
             let (x, y) = (screen.x * self.dpr, screen.y * self.dpr);
             let existing = matches!(handle, ArrowHandle::Waypoint { .. });
             let radius = if existing { 4.0 } else { 3.5 } * self.dpr;
@@ -2080,7 +2073,7 @@ impl Editor {
             self.overlay.set_stroke_style_str(ACCENT);
             self.overlay.set_line_width(self.dpr * 1.5);
             for &point in anchors {
-                let screen = self.core.camera.world_to_screen(point);
+                let screen = self.core.camera().world_to_screen(point);
                 let (x, y) = (screen.x * self.dpr, screen.y * self.dpr);
                 let radius = 4.0 * self.dpr;
                 self.overlay.begin_path();

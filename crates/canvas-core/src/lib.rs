@@ -30,11 +30,13 @@ pub mod relations;
 pub mod rough;
 pub mod scene;
 pub mod serialization;
+mod shell;
 pub mod spatial;
 pub mod svg;
 pub mod sync;
 pub mod text;
 pub mod tool;
+mod view;
 pub mod wire;
 
 pub use benchmark::benchmark_fixture;

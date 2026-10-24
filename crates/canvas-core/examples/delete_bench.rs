@@ -67,7 +67,11 @@ fn main() {
             undo_scene.push(scene);
             total.push(delete_total + command + scene);
 
-            assert_eq!(editor.doc.live_count(), n, "undo restores every element");
+            assert_eq!(
+                editor.document().live_count(),
+                n,
+                "undo restores every element"
+            );
         }
 
         let total = median(total);
