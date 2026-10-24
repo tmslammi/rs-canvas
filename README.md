@@ -18,14 +18,17 @@ Prebuilt alpha builds are published as GitHub pre-releases. On a Mac:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/tmslammi/rs-canvas/master/install.sh | bash
-rs-canvas
+~/.local/bin/rs-canvas
 ```
 
 The installer verifies the release checksum and puts `rs-canvas` in
-`~/.local/bin`. The executable carries the front end, so the installing machine
-does not need Rust, Node or a checkout. It serves the app at
-<http://127.0.0.1:5173> and the MCP endpoint at
-<http://127.0.0.1:5173/mcp>; documents live in `~/.rs-canvas`.
+`~/.local/bin`; macOS 12 or newer is required. The current shell may not pick
+up the new PATH until you open a new terminal, so the first launch above uses
+the full path. After that, `rs-canvas` works directly.
+
+The executable carries the front end, so the installing machine does not need
+Rust, Node or a checkout. It serves the app at <http://127.0.0.1:5173> and the
+MCP endpoint at <http://127.0.0.1:5173/mcp>; documents live in `~/.rs-canvas`.
 
 To pin or roll back to a specific alpha:
 

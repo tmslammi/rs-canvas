@@ -122,6 +122,7 @@ fn print_help() {
     println!("  -h, --help     Print this help");
     println!();
     println!("Installed builds keep documents in ~/.rs-canvas and expose MCP at /mcp.");
+    println!("Set RS_CANVAS_HOME to use a different document directory.");
 }
 
 /// Where an installed build stores documents when `--doc` is omitted.

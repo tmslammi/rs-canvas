@@ -17,7 +17,7 @@ Versions follow SemVer with an explicit alpha counter:
 - A fix or rebuild of the same feature set bumps the alpha number.
 - A release that changes the document schema must include a migration and pass
   the old-document tests. Alpha can break features; it should not silently
-  break saved drawings.
+  break saved documents.
 
 The tag is the version with a `v` prefix: `v0.1.0-alpha.1`. The tag, the Rust
 workspace version and `web/package.json` must match; the release workflow
@@ -43,11 +43,15 @@ refuses to publish when they do not.
    - `rs-canvas-x86_64-apple-darwin.tar.gz`
    - `SHA256SUMS`
    - `install.sh`
+   The build job runs `scripts/test-install.sh` against each tarball with a
+   local mock release before uploading.
 5. Verify the install from a clean directory:
    ```sh
    curl -fsSL https://raw.githubusercontent.com/tmslammi/rs-canvas/master/install.sh | bash
-   rs-canvas --version
+   ~/.local/bin/rs-canvas --version
    ```
+   The installer adds `~/.local/bin` to the profile; use the full path in the
+   current shell until it is reloaded.
 
 The workflow can also be run manually with an existing tag
 (`Actions -> Release -> Run workflow`). A re-run replaces the assets of an
@@ -90,7 +94,8 @@ behaviour.
 
 ## Platforms
 
-macOS Apple Silicon and Intel are the supported alpha targets. Linux and
-Windows need their own build matrix rows and platform smoke tests before they
-are advertised. Homebrew, auto-update, notarisation and code signing are
-intentionally out of scope until more than one person installs the build.
+macOS 12 or newer on Apple Silicon and Intel are the supported alpha targets.
+Linux and Windows need their own build matrix rows and platform smoke tests
+before they are advertised. Homebrew, auto-update, notarisation and code
+signing are intentionally out of scope until more than one person installs the
+build.
