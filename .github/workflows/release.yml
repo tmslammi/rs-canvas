@@ -1,0 +1,195 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to release (for example v0.1.0-alpha.1)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  ci:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ inputs.tag || github.ref }}
+
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - name: Check the tag matches the version
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          web_version="$(sed -n 's/^  "version": "\([^"]*\)",/\1/p' web/package.json | head -n 1)"
+          if [ -z "$version" ] || [ -z "$web_version" ]; then
+            echo "::error::could not read the workspace or web version"
+            exit 1
+          fi
+          if [ "v$version" != "$TAG" ]; then
+            echo "::error::tag $TAG does not match Cargo.toml version v$version"
+            exit 1
+          fi
+          if [ "$web_version" != "$version" ]; then
+            echo "::error::web/package.json is $web_version, expected $version"
+            exit 1
+          fi
+
+  build:
+    needs: [ci, guard]
+    runs-on: macos-latest
+    env:
+      # Keep the binaries usable on the oldest macOS either architecture is
+      # likely to run in an alpha.
+      MACOSX_DEPLOYMENT_TARGET: "12.0"
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94.0"
+          targets: wasm32-unknown-unknown,${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@0.2.129
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build the front end
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build rs-canvas
+        run: |
+          set -euo pipefail
+          export RS_CANVAS_GIT_SHA="$(git rev-parse --short HEAD)"
+          cargo build --release --locked -p canvas-server \
+            --features embed-web --target "${{ matrix.target }}"
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          staging="$(mktemp -d)"
+          cp "target/${{ matrix.target }}/release/canvas-server" "$staging/rs-canvas"
+          cp LICENSE "$staging/LICENSE"
+          tar -czf "rs-canvas-${{ matrix.target }}.tar.gz" \
+            -C "$staging" rs-canvas LICENSE
+          rm -rf "$staging"
+
+      - name: Smoke-test the packaged binary
+        run: |
+          set -euo pipefail
+          package="$(mktemp -d)"
+          tar -xzf "rs-canvas-${{ matrix.target }}.tar.gz" -C "$package"
+          "$package/rs-canvas" --version
+          "$package/rs-canvas" --no-open --port 5199 --doc "$RUNNER_TEMP/smoke.json" &
+          server=$!
+          trap 'kill "$server" 2>/dev/null || true' EXIT
+
+          ready=false
+          for _ in $(seq 1 50); do
+            if curl -fsS http://127.0.0.1:5199/ >/dev/null 2>&1; then
+              ready=true
+              break
+            fi
+            sleep 0.2
+          done
+          if [ "$ready" != true ]; then
+            echo "::error::rs-canvas did not start from the packaged binary"
+            exit 1
+          fi
+
+          curl -fsS http://127.0.0.1:5199/ -o "$package/index.html"
+          grep -q '<title>rs-canvas</title>' "$package/index.html"
+          curl -fsS http://127.0.0.1:5199/src/main.js >/dev/null
+          curl -fsS http://127.0.0.1:5199/src/wasm/canvas_wasm_bg.wasm >/dev/null
+
+          kill "$server" 2>/dev/null || true
+          wait "$server" 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: rs-canvas-${{ matrix.target }}
+          path: rs-canvas-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum *.tar.gz > SHA256SUMS
+      - name: Publish the pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          # The copy attached to a release installs that release; the copy on
+          # master resolves the newest release. Rebaking keeps old download
+          # URLs honest and makes them good rollback targets.
+          sed "s|^DEFAULT_VERSION=\"\"$|DEFAULT_VERSION=\"${version}\"|" install.sh > dist/install.sh
+          grep -Fq "DEFAULT_VERSION=\"${version}\"" dist/install.sh
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            is_draft="$(gh release view "$TAG" --json isDraft --jq '.isDraft')"
+            if [ "$is_draft" != "true" ]; then
+              echo "::error::release $TAG is already published; bump the alpha version instead"
+              exit 1
+            fi
+            gh release upload "$TAG" dist/* --clobber
+          else
+            args=(--draft --title "rs-canvas $TAG" --generate-notes)
+            case "$TAG" in
+              *-*) args+=(--prerelease) ;;
+            esac
+            gh release create "$TAG" "${args[@]}" dist/*
+          fi
+
+          case "$TAG" in
+            *-*) gh release edit "$TAG" --draft=false --prerelease ;;
+            *) gh release edit "$TAG" --draft=false ;;
+          esac

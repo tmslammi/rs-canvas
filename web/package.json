@@ -1,10 +1,12 @@
 {
   "name": "rs-canvas-web",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.0-alpha.1",
   "type": "module",
   "scripts": {
     "build:wasm": "bash scripts/build-wasm.sh",
+    "stage": "bash scripts/stage.sh",
+    "build": "npm run build:wasm && npm run stage",
     "dev": "npm run build:wasm && bash scripts/dev.sh",
     "test:e2e": "npm run build:wasm && playwright test"
   },

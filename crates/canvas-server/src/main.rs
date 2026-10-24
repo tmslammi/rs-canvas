@@ -6,6 +6,8 @@
 
 mod aliases;
 mod doc_ops;
+#[cfg(feature = "embed-web")]
+mod embedded;
 mod mcp;
 mod render;
 mod script;
@@ -15,6 +17,7 @@ mod workspace_api;
 mod ws;
 
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Arc;
 
 use axum::extract::State;
@@ -29,44 +32,113 @@ use tower_http::set_header::SetResponseHeaderLayer;
 
 use crate::state::{AppState, DEFAULT_WORKSPACE};
 
+const DEFAULT_PORT: u16 = 5173;
+
 struct Args {
-    web: PathBuf,
+    /// `None` uses the embedded front end in release builds, or the working
+    /// directory in development builds.
+    web: Option<PathBuf>,
     port: u16,
     doc: Option<PathBuf>,
     sync: bool,
+    /// `None` opens a browser only for embedded (installed) builds.
+    open: Option<bool>,
 }
 
 fn parse_args() -> Args {
-    let mut web = PathBuf::from(".");
-    let mut port = 5173;
-    let mut doc = None;
-    let mut sync = true;
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
+    let mut args = Args {
+        web: None,
+        port: DEFAULT_PORT,
+        doc: None,
+        sync: true,
+        open: None,
+    };
+    let mut iter = std::env::args().skip(1);
+    while let Some(arg) = iter.next() {
         match arg.as_str() {
-            "--web" => {
-                if let Some(value) = args.next() {
-                    web = PathBuf::from(value);
-                }
+            "-h" | "--help" => {
+                print_help();
+                std::process::exit(0);
             }
+            "-V" | "--version" => {
+                print_version();
+                std::process::exit(0);
+            }
+            "--web" => args.web = Some(PathBuf::from(next_value(&mut iter, "--web"))),
             "--port" => {
-                if let Some(value) = args.next() {
-                    port = value.parse().expect("--port must be a number");
-                }
+                let raw = next_value(&mut iter, "--port");
+                args.port = raw.parse().unwrap_or_else(|_| {
+                    eprintln!("rs-canvas: --port must be a number, got {raw:?}");
+                    std::process::exit(2);
+                });
             }
-            "--doc" => doc = args.next().map(PathBuf::from),
-            "--no-sync" => sync = false,
+            "--doc" => args.doc = Some(PathBuf::from(next_value(&mut iter, "--doc"))),
+            "--no-sync" => args.sync = false,
+            "--open" => args.open = Some(true),
+            "--no-open" => args.open = Some(false),
             other => {
-                panic!("unknown argument {other:?} (expected --web, --port, --doc or --no-sync)")
+                eprintln!("rs-canvas: unknown argument {other:?}");
+                eprintln!("Try `rs-canvas --help`.");
+                std::process::exit(2);
             }
         }
     }
-    Args {
-        web,
-        port,
-        doc,
-        sync,
+    args
+}
+
+fn next_value(args: &mut impl Iterator<Item = String>, flag: &str) -> String {
+    args.next().unwrap_or_else(|| {
+        eprintln!("rs-canvas: {flag} needs a value");
+        std::process::exit(2);
+    })
+}
+
+fn version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+fn print_version() {
+    match option_env!("RS_CANVAS_GIT_SHA") {
+        Some(sha) => println!("rs-canvas {} ({sha})", version()),
+        None => println!("rs-canvas {}", version()),
     }
+}
+
+fn print_help() {
+    println!("rs-canvas {}", version());
+    println!();
+    println!("A local-first, hand-drawn canvas for sketching and architecture diagrams.");
+    println!();
+    println!("Usage: rs-canvas [options]");
+    println!();
+    println!("Options:");
+    println!("  --web <dir>    Serve the front end from <dir> instead of the embedded copy");
+    println!("  --port <port>  Listen on 127.0.0.1:<port> (default {DEFAULT_PORT})");
+    println!("  --doc <file>   Persist the default workspace to <file>");
+    println!("  --no-sync      Do not persist or sync the document");
+    println!("  --open         Open the app in the default browser");
+    println!("  --no-open      Do not open a browser");
+    println!("  -V, --version  Print the version");
+    println!("  -h, --help     Print this help");
+    println!();
+    println!("Installed builds keep documents in ~/.rs-canvas and expose MCP at /mcp.");
+}
+
+/// Where an installed build stores documents when `--doc` is omitted.
+#[cfg(feature = "embed-web")]
+fn installed_doc_path() -> Option<PathBuf> {
+    if let Some(home) = std::env::var_os("RS_CANVAS_HOME") {
+        return Some(PathBuf::from(home).join("current.json"));
+    }
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    Some(PathBuf::from(home).join(".rs-canvas").join("current.json"))
+}
+
+/// Development builds keep the historical behaviour: no `--doc` means no
+/// server-side persistence.
+#[cfg(not(feature = "embed-web"))]
+fn installed_doc_path() -> Option<PathBuf> {
+    None
 }
 
 #[tokio::main]
@@ -78,8 +150,21 @@ async fn main() {
         )
         .init();
 
-    let args = parse_args();
-    let state = Arc::new(AppState::new(args.web.clone(), args.doc.clone(), args.sync));
+    let Args {
+        web,
+        port,
+        doc,
+        sync,
+        open,
+    } = parse_args();
+
+    // Release builds are the only ones that assume a per-user document and
+    // open a browser; `--doc` and `--no-open` stay available to override.
+    let doc = doc.or_else(installed_doc_path);
+    let open = open.unwrap_or(cfg!(feature = "embed-web"));
+    let web_dir = web.clone().unwrap_or_else(|| PathBuf::from("."));
+
+    let state = Arc::new(AppState::new(web_dir, doc.clone(), sync));
     // Create the default workspace up front so its document is loaded before
     // anyone asks; every other workspace is born when a page names it.
     state.workspace(DEFAULT_WORKSPACE).await;
@@ -108,14 +193,35 @@ async fn main() {
         .route("/api/workspaces/{name}/rename", post(workspace_api::rename))
         .route("/api/workspaces/{name}", delete(workspace_api::delete))
         .nest_service("/mcp", mcp_service)
-        .fallback_service(ServeDir::new(&args.web))
-        .layer(no_store)
         .with_state(state.clone());
 
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", args.port))
-        .await
-        .expect("cannot bind the canvas server port");
-    tracing::info!("rs-canvas: http://localhost:{} (MCP at /mcp)", args.port);
+    let app = match web.as_deref() {
+        Some(dir) => app.fallback_service(ServeDir::new(dir)),
+        None => {
+            #[cfg(feature = "embed-web")]
+            {
+                app.fallback(embedded::handler)
+            }
+            #[cfg(not(feature = "embed-web"))]
+            {
+                app.fallback_service(ServeDir::new("."))
+            }
+        }
+    };
+    let app = app.layer(no_store);
+
+    let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("rs-canvas: cannot listen on 127.0.0.1:{port}: {error}");
+            std::process::exit(1);
+        }
+    };
+    let url = format!("http://127.0.0.1:{port}");
+    tracing::info!("rs-canvas {} at {url} (MCP at {url}/mcp)", version());
+    if open {
+        open_browser(&url);
+    }
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -124,6 +230,23 @@ async fn main() {
 
     // The debounced writers may still owe a write.
     state.persist_all().await;
+}
+
+fn open_browser(url: &str) {
+    #[cfg(target_os = "macos")]
+    let mut command = Command::new("open");
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = Command::new("cmd");
+        command.args(["/C", "start", ""]);
+        command
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = Command::new("xdg-open");
+
+    if let Err(error) = command.arg(url).spawn() {
+        tracing::warn!("could not open a browser: {error}");
+    }
 }
 
 /// The workspace listing the page's switcher shows: live workspaces plus

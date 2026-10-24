@@ -4,6 +4,12 @@ on:
   push:
     branches: [master]
   pull_request:
+  workflow_call:
+    inputs:
+      ref:
+        description: "Git ref to check out (defaults to the caller's ref)"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -17,19 +23,25 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
         with:
+          ref: ${{ inputs.ref }}
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94.0"
           components: rustfmt, clippy
       - run: cargo fmt --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
 
   web:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
         with:
+          ref: ${{ inputs.ref }}
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94.0"
           targets: wasm32-unknown-unknown
       - uses: taiki-e/install-action@v2
         with:
@@ -45,6 +57,12 @@ jobs:
         working-directory: web
       - run: npm run test:e2e
         working-directory: web
+      - run: npm run stage
+        working-directory: web
+      - name: Check the embedded release target
+        run: |
+          cargo clippy --locked -p canvas-server --features embed-web --all-targets -- -D warnings
+          cargo test --locked -p canvas-server --features embed-web
       - uses: actions/upload-artifact@v7
         if: failure()
         with:
