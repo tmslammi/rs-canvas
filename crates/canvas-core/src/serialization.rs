@@ -1,9 +1,10 @@
-//! Document serialization: versioned JSON for import/export and the wire, and
-//! the versioned binary envelope for persistence.
+//! Document serialization: versioned JSON for import/export and the versioned
+//! binary envelope for persistence.
 //!
-//! Files and autosaves share one schema. The migration function is the single
-//! place older documents are upgraded; unknown future versions are rejected.
-//! Both read paths funnel into the same identity check and sanitizing pass.
+//! Files and autosaves share one schema and are always binary. The migration
+//! function is the single place older documents are upgraded; unknown future
+//! versions are rejected. JSON imports and binary loads funnel into the same
+//! identity check and sanitizing pass.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -73,8 +74,8 @@ pub fn from_json(input: &str) -> Result<Document, SchemaError> {
 }
 
 /// Load a document from an already-parsed JSON value, with the same schema
-/// check, migration and sanitizing as `from_json`. Used by the wire protocol,
-/// where the document arrives as an embedded JSON object.
+/// check, migration and sanitizing as `from_json`. Used by the
+/// workspace-management API, where the caller sends an embedded document.
 pub fn from_value(value: Value) -> Result<Document, SchemaError> {
     let version = value
         .get("schemaVersion")
@@ -101,20 +102,11 @@ pub fn to_bytes(doc: &Document) -> Result<Vec<u8>, SchemaError> {
     Ok(envelope::encode(SCHEMA_VERSION, Codec::Postcard, &payload)?)
 }
 
-/// Load a persisted document, auto-detecting the binary envelope.
+/// Load a persisted document from the binary envelope.
 ///
-/// Bytes without the magic are treated as UTF-8 JSON (legacy autosaves,
-/// checkpoints and mirror files), so the transition needs no explicit
-/// migration step: the next save writes binary over the same key or path.
+/// Bytes without the magic are rejected: autosaves, checkpoints and mirror
+/// files are binary documents, and JSON is only an explicit import format.
 pub fn from_bytes(input: &[u8]) -> Result<Document, SchemaError> {
-    if !envelope::is_binary(input) {
-        let json = std::str::from_utf8(input).map_err(|error| {
-            SchemaError::Invalid(format!(
-                "document is neither a binary envelope nor UTF-8 JSON: {error}"
-            ))
-        })?;
-        return from_json(json);
-    }
     let envelope = envelope::decode(input)?;
     decode_binary(envelope)
 }
@@ -429,11 +421,17 @@ mod tests {
     }
 
     #[test]
-    fn legacy_json_bytes_still_load() {
+    fn non_envelope_bytes_are_rejected() {
         let doc = full_document();
-        for json in [to_json(&doc).unwrap(), to_json_pretty(&doc).unwrap()] {
-            let back = from_bytes(json.as_bytes()).unwrap();
-            assert_eq!(back, doc);
+        for bytes in [
+            to_json(&doc).unwrap().into_bytes(),
+            to_json_pretty(&doc).unwrap().into_bytes(),
+            b"not a document".to_vec(),
+        ] {
+            assert!(matches!(
+                from_bytes(&bytes),
+                Err(SchemaError::Envelope(EnvelopeError::NotBinary))
+            ));
         }
     }
 

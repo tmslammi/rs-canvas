@@ -51,32 +51,6 @@ async function readAutosave(
   }, key);
 }
 
-async function writeLegacyAutosave(
-  page: import("@playwright/test").Page,
-  json: string,
-  key = AUTOSAVE_KEY,
-): Promise<void> {
-  await page.evaluate(async ({ id, legacyJson }) => {
-    const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const request = indexedDB.open("rs-canvas");
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error);
-    });
-    try {
-      await new Promise<void>((resolve, reject) => {
-        const request = db
-          .transaction("documents", "readwrite")
-          .objectStore("documents")
-          .put({ id, json: legacyJson, updated: Date.now() });
-        request.onsuccess = () => resolve();
-        request.onerror = () => reject(request.error);
-      });
-    } finally {
-      db.close();
-    }
-  }, { id: key, legacyJson: json });
-}
-
 test("autosave survives a reload", async ({ page }) => {
   await page.goto("/");
   await page.waitForFunction(() => window.__rsReady === true);
@@ -102,25 +76,6 @@ test("autosaves use the binary envelope", async ({ page }) => {
   expect(stored.magic).toBe("RSCDOC\r\n");
   expect(stored.hasJson, "binary records do not carry a JSON string").toBe(false);
   expect(stored.size).toBeLessThan(jsonBytes);
-});
-
-test("legacy JSON autosaves load and upgrade to binary", async ({ page }) => {
-  await page.goto("/");
-  await page.waitForFunction(() => window.__rsReady === true);
-  await page.evaluate(() => window.__rsEditor!.new_document());
-  await drawRect(page);
-  const json = await page.evaluate(() => window.__rsEditor!.save_json());
-  await writeLegacyAutosave(page, json);
-
-  await page.reload();
-  await page.waitForFunction(() => window.__rsReady === true);
-  expect(await count(page)).toBe(1);
-
-  await page.evaluate(() => window.__rsEditor!.flush_save());
-  await expect.poll(async () => (await readAutosave(page)).hasBytes).toBe(true);
-  const stored = await readAutosave(page);
-  expect(stored.magic).toBe("RSCDOC\r\n");
-  expect(stored.hasJson).toBe(false);
 });
 
 test("named workspaces have separate autosaves and unload checkpoints", async ({ page }) => {

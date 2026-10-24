@@ -114,7 +114,7 @@ fn print_help() {
     println!("Options:");
     println!("  --web <dir>    Serve the front end from <dir> instead of the embedded copy");
     println!("  --port <port>  Listen on 127.0.0.1:<port> (default {DEFAULT_PORT})");
-    println!("  --doc <file>   Persist the default workspace to <file>");
+    println!("  --doc <file>   Persist the default workspace binary document to <file>");
     println!("  --no-sync      Do not persist or sync the document");
     println!("  --open         Open the app in the default browser");
     println!("  --no-open      Do not open a browser");
@@ -129,10 +129,10 @@ fn print_help() {
 #[cfg(feature = "embed-web")]
 fn installed_doc_path() -> Option<PathBuf> {
     if let Some(home) = std::env::var_os("RS_CANVAS_HOME") {
-        return Some(PathBuf::from(home).join("current.json"));
+        return Some(PathBuf::from(home).join("current.rsc"));
     }
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
-    Some(PathBuf::from(home).join(".rs-canvas").join("current.json"))
+    Some(PathBuf::from(home).join(".rs-canvas").join("current.rsc"))
 }
 
 /// Development builds keep the historical behaviour: no `--doc` means no

@@ -1574,40 +1574,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_json_mirrors_load_and_upgrade_on_the_next_save() {
+    async fn json_mirrors_are_ignored() {
         let dir = std::env::temp_dir().join(format!(
-            "rs-canvas-legacy-mirror-{}-{}",
+            "rs-canvas-json-mirror-{}-{}",
             std::process::id(),
             now_ms()
         ));
         tokio::fs::create_dir_all(&dir).await.unwrap();
-        let path = dir.join("document.json");
+        let path = dir.join("document.rsc");
         let mut doc = Document::new();
         add_shape(&mut doc, 10.0, 1);
         tokio::fs::write(&path, serialization::to_json_pretty(&doc).unwrap())
             .await
             .unwrap();
 
-        let state = AppState::new(PathBuf::from("."), Some(path.clone()), true);
+        let state = AppState::new(PathBuf::from("."), Some(path), true);
         let ws = state.workspace(DEFAULT_WORKSPACE).await;
-        assert_eq!(ws.doc.lock().await.live_count(), 1);
-        ws.persist_document().await;
-
-        let bytes = tokio::fs::read(&path).await.unwrap();
-        assert!(
-            canvas_core::envelope::is_binary(&bytes),
-            "the next save rewrites the legacy JSON mirror as binary"
-        );
-        let restored = AppState::new(PathBuf::from("."), Some(path), true);
         assert_eq!(
-            restored
-                .workspace(DEFAULT_WORKSPACE)
-                .await
-                .doc
-                .lock()
-                .await
-                .live_count(),
-            1
+            ws.doc.lock().await.live_count(),
+            0,
+            "a mirror must be a binary document"
         );
         let _ = tokio::fs::remove_dir_all(dir).await;
     }

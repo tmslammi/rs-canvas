@@ -13,9 +13,8 @@
 //!
 //! The envelope is deliberately independent of the payload codec: a future
 //! schema or codec is rejected by id/version before any payload is decoded, and
-//! a future binary format can reuse the header without changing the read path's
-//! auto-detection. `serialization::from_bytes` treats anything without the
-//! magic as legacy JSON.
+//! a future binary format can reuse the header. `serialization::from_bytes`
+//! rejects anything without the magic.
 
 use std::fmt;
 
@@ -48,7 +47,7 @@ impl Codec {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum EnvelopeError {
-    /// The bytes do not carry the binary magic; the caller should try JSON.
+    /// The bytes do not carry the binary magic.
     NotBinary,
     /// Fewer bytes than the fixed header.
     TruncatedHeader,
@@ -154,7 +153,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_json_is_not_binary() {
+    fn json_is_not_binary() {
         let json = br#"{"schemaVersion":1,"elements":{}}"#;
         assert!(!is_binary(json));
         assert_eq!(decode(json), Err(EnvelopeError::NotBinary));

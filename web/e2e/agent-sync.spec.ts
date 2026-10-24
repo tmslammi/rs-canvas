@@ -396,7 +396,7 @@ test("an autosave and the server mirror merge on reconnect", async ({
 
 test("a server restart preserves the document", async ({ request }) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rs-canvas-e2e-"));
-  const docPath = path.join(dir, "document.json");
+  const docPath = path.join(dir, "document.rsc");
   const binary = path.resolve(process.cwd(), "..", "target", "debug", "canvas-server");
 
   const start = () =>
