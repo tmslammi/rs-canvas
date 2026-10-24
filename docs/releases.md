@@ -75,7 +75,7 @@ Release builds:
 - pin the Rust toolchain in `rust-toolchain.toml`;
 - pin `wasm-bindgen-cli` to the version in `Cargo.lock`;
 - build with `--locked`;
-- default to `~/.rs-canvas/current.json`, with workspaces beside it;
+- default to `~/.rs-canvas/current.rsc`, with workspaces beside it;
 - open the browser unless `--no-open` is passed.
 
 ## Installing an older release
