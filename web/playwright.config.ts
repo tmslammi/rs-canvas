@@ -37,5 +37,14 @@ export default defineConfig({
       reuseExistingServer: !process.env.CI && !process.env.RS_CANVAS_TEST_PORT,
       timeout: 120_000,
     },
+    {
+      // Binary wire: two-page/agent sync, legacy JSON fallback and the
+      // no-JSON hot-path probe. Isolated so no other spec's pages count.
+      command:
+        `cargo run --manifest-path ../Cargo.toml -p canvas-server -- --web . --port ${testPort(5)}`,
+      url: testBase(5),
+      reuseExistingServer: !process.env.CI && !process.env.RS_CANVAS_TEST_PORT,
+      timeout: 120_000,
+    },
   ],
 });

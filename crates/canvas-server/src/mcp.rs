@@ -2314,7 +2314,7 @@ mod tests {
         assert_ne!(result.is_error, Some(true));
 
         let message: serde_json::Value =
-            serde_json::from_str(&from_server.recv().await.unwrap().text).unwrap();
+            serde_json::from_str(&from_server.recv().await.unwrap().json.unwrap()).unwrap();
         assert_eq!(message["type"], "view");
         assert_eq!(message["action"], "focus");
         assert_eq!(message["id"], "abc");
@@ -2355,7 +2355,7 @@ mod tests {
             .await
             .unwrap();
         let message: serde_json::Value =
-            serde_json::from_str(&from_server.recv().await.unwrap().text).unwrap();
+            serde_json::from_str(&from_server.recv().await.unwrap().json.unwrap()).unwrap();
         assert_eq!(message["action"], "point");
         assert_eq!(message["id"], "db");
         assert!(message.get("animate").is_none());
@@ -2390,7 +2390,7 @@ mod tests {
         assert!(workspace.doc.lock().await.live_count() == 2);
 
         let frame: serde_json::Value =
-            serde_json::from_str(&from_server.recv().await.unwrap().text).unwrap();
+            serde_json::from_str(&from_server.recv().await.unwrap().json.unwrap()).unwrap();
         assert_eq!(frame["type"], "patch");
         assert_eq!(
             frame["put"].as_array().unwrap().len(),
@@ -2422,7 +2422,7 @@ mod tests {
         assert!(created["id"].is_string());
 
         let frame: serde_json::Value =
-            serde_json::from_str(&from_server.recv().await.unwrap().text).unwrap();
+            serde_json::from_str(&from_server.recv().await.unwrap().json.unwrap()).unwrap();
         assert_eq!(frame["type"], "patch");
         assert_eq!(frame["put"].as_array().unwrap().len(), 1);
         assert!(frame["rev"].as_u64().unwrap() >= 1);
@@ -3908,7 +3908,8 @@ mod tests {
         let (frame_tx, frame_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             while let Ok(message) = from_server.recv().await {
-                let frame: serde_json::Value = serde_json::from_str(&message.text).unwrap();
+                let frame: serde_json::Value =
+                    serde_json::from_str(&message.json.unwrap()).unwrap();
                 if frame["type"] == "present" {
                     let id = frame["id"].as_u64().unwrap();
                     let _ = ack_state.present_acks.send((id, false));
@@ -4031,7 +4032,8 @@ mod tests {
         let ack_state = workspace.clone();
         tokio::spawn(async move {
             while let Ok(message) = from_server.recv().await {
-                let frame: serde_json::Value = serde_json::from_str(&message.text).unwrap();
+                let frame: serde_json::Value =
+                    serde_json::from_str(&message.json.unwrap()).unwrap();
                 if frame["type"] == "present" {
                     let id = frame["id"].as_u64().unwrap();
                     let _ = ack_state.present_acks.send((id, false));
@@ -4136,7 +4138,8 @@ mod tests {
         let reply_state = workspace.clone();
         tokio::spawn(async move {
             while let Ok(message) = from_server.recv().await {
-                let frame: serde_json::Value = serde_json::from_str(&message.text).unwrap();
+                let frame: serde_json::Value =
+                    serde_json::from_str(&message.json.unwrap()).unwrap();
                 if frame["type"] == "screenshot" {
                     let id = frame["id"].as_u64().unwrap();
                     let _ = reply_state
@@ -4387,7 +4390,7 @@ mod tests {
         let page_state = state.clone();
         let page = tokio::spawn(async move {
             let message = from_server.recv().await.unwrap();
-            let frame: serde_json::Value = serde_json::from_str(&message.text).unwrap();
+            let frame: serde_json::Value = serde_json::from_str(&message.json.unwrap()).unwrap();
             assert_eq!(frame["type"], "workspace_changed");
             assert_eq!(frame["action"], "switch");
             let target = page_state
