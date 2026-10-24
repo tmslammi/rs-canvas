@@ -524,15 +524,23 @@ fn image_from_data_url(data_url: &str) -> Result<CallToolResult, McpError> {
 
 /// The `canvas_read(since)` report: change records plus the current state of
 /// everything they touched.
+///
+/// Returns the compact text plus the same report as structured data: one entry
+/// per change record, the handles still live, and the handles removed.
 fn describe_changes(
     doc: &canvas_core::model::Document,
     records: &[crate::state::ChangeRecord],
     since: u64,
     revision: u64,
     ids: &mut dyn canvas_core::describe::IdMap,
-) -> String {
+) -> (String, Vec<serde_json::Value>, Vec<String>, Vec<String>) {
     if records.is_empty() {
-        return format!("revision {revision}\nno changes since revision {since}");
+        return (
+            format!("revision {revision}\nno changes since revision {since}"),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
     }
     let mut text = format!("revision {revision}\nchanges since revision {since}:");
     for record in records {
@@ -574,7 +582,9 @@ fn describe_changes(
         }
     }
     let mut live = Vec::new();
+    let mut changed = Vec::new();
     let mut removed = Vec::new();
+    let mut removed_handles = Vec::new();
     for change in &mut changes {
         change.kinds.sort_unstable();
         change.kinds.dedup();
@@ -584,6 +594,7 @@ fn describe_changes(
             .filter(|element| !element.is_deleted)
         {
             Some(element) => {
+                changed.push(ids.map(&change.id));
                 let line = canvas_core::describe::describe_element_with(doc, element, ids);
                 if kinds.is_empty() {
                     live.push(line);
@@ -593,6 +604,7 @@ fn describe_changes(
             }
             None => {
                 let handle = ids.map(&change.id);
+                removed_handles.push(handle.clone());
                 if kinds.is_empty() {
                     removed.push(handle);
                 } else {
@@ -611,7 +623,23 @@ fn describe_changes(
     if !removed.is_empty() {
         text.push_str(&format!("removed: {}\n", removed.join(" ")));
     }
-    text
+    // Build after the text so handle assignment for the text surface is
+    // unchanged by structured content.
+    let changes: Vec<_> = records
+        .iter()
+        .map(|record| {
+            serde_json::json!({
+                "revision": record.revision,
+                "source": record.source,
+                "changed": record.changed.iter().map(|change| ids.map(&change.id)).collect::<Vec<_>>(),
+                "kinds": record.changed.iter().filter(|change| !change.kinds.is_empty()).map(|change| serde_json::json!({
+                    "handle": ids.map(&change.id),
+                    "kinds": change.kinds.iter().map(|kind| kind.label()).collect::<Vec<_>>(),
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    (text, changes, changed, removed_handles)
 }
 
 fn kind_list(kinds: &[ChangeKind]) -> String {
@@ -1112,9 +1140,11 @@ impl CanvasServer {
             let mut body = canvas_core::bulk::summarize(&doc);
             body["revision"] = serde_json::json!(revision);
             body["context"] = serde_json::json!(workspace.context());
-            return Ok(CallToolResult::success(vec![ContentBlock::text(
-                body.to_string(),
-            )]));
+            let mut structured = body.clone();
+            structured["workspace"] = serde_json::json!(workspace.name);
+            let mut result = CallToolResult::success(vec![ContentBlock::text(body.to_string())]);
+            result.structured_content = Some(structured);
+            return Ok(result);
         }
         if args.since.is_some()
             && args.context.is_none()
@@ -1156,12 +1186,22 @@ impl CanvasServer {
             );
         }
         let mut aliases = workspace.aliases.lock().await;
-        let text = if let Some(since) = args.since {
+        let (text, structured) = if let Some(since) = args.since {
             if !workspace.cursor_valid(since).await {
                 return failure("resync_required: change history no longer covers that cursor; start a full or scoped read");
             }
             let records = workspace.changes_since(since).await;
-            describe_changes(&doc, &records, since, revision, &mut *aliases)
+            let (text, changes, changed, removed) =
+                describe_changes(&doc, &records, since, revision, &mut *aliases);
+            let structured = serde_json::json!({
+                "workspace": workspace.name,
+                "context": workspace.context(),
+                "revision": revision,
+                "changes": changes,
+                "changed": changed,
+                "removed": removed,
+            });
+            (text, structured)
         } else {
             let mut roots = std::collections::BTreeSet::new();
             let has_scope = args.ids.is_some() || args.selected || args.frame.is_some();
@@ -1242,6 +1282,7 @@ impl CanvasServer {
                     ""
                 }
             );
+            let mut elements = Vec::new();
             for element in matches.iter().skip(offset).take(limit) {
                 text.push_str(&canvas_core::describe::describe_element_with(
                     &doc,
@@ -1256,6 +1297,13 @@ impl CanvasServer {
                     );
                     text.push('\n');
                 }
+                let mut element_json =
+                    canvas_core::describe::structured_element(&doc, element, &mut *aliases);
+                if args.detail {
+                    element_json["element"] = serde_json::to_value(element)
+                        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                }
+                elements.push(element_json);
             }
             if offset.saturating_add(limit) < matches.len() {
                 text.push_str(&format!(
@@ -1263,14 +1311,23 @@ impl CanvasServer {
                     offset.saturating_add(limit)
                 ));
             }
-            text
+            let structured = serde_json::json!({
+                "workspace": workspace.name,
+                "context": workspace.context(),
+                "revision": revision,
+                "matched": matches.len(),
+                "elements": elements,
+            });
+            (text, structured)
         };
         *self.observed.lock().await = Some(workspace.context());
-        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+        let mut result = CallToolResult::success(vec![ContentBlock::text(format!(
             "{text}\nworkspace {:?} context {:?}",
             workspace.name,
             workspace.context()
-        ))]))
+        ))]);
+        result.structured_content = Some(structured);
+        Ok(result)
     }
 
     #[tool(
@@ -2127,6 +2184,13 @@ mod tests {
             .clone()
     }
 
+    fn structured(result: &CallToolResult) -> serde_json::Value {
+        result
+            .structured_content
+            .clone()
+            .expect("successful read carries structured content")
+    }
+
     fn point(x: f64, y: f64) -> PenPoint {
         PenPoint {
             x,
@@ -2571,7 +2635,7 @@ mod tests {
             },
         ];
         let mut ids = crate::aliases::Aliases::default();
-        let report = describe_changes(&doc, &records, 12, 14, &mut ids);
+        let (report, _, _, _) = describe_changes(&doc, &records, 12, 14, &mut ids);
 
         assert!(
             report.contains("- rev 13 (agent): 1 changed (1 moved)"),
@@ -3038,6 +3102,273 @@ mod tests {
         for marker in ["view 0,0", "selected", "visible ", "nearby ", "offscreen "] {
             assert!(!text.contains(marker), "unexpected {marker:?} in {text}");
         }
+    }
+
+    #[tokio::test]
+    async fn canvas_read_scoped_result_carries_structured_elements() {
+        let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
+        let workspace = state.workspace(crate::state::DEFAULT_WORKSPACE).await;
+        let server = CanvasServer::new(state);
+        let (frame, sticky, text, outside) = {
+            let mut doc = workspace.doc.lock().await;
+            let frame = doc.add(
+                canvas_core::ElementKind::Frame {
+                    rect: canvas_core::geometry::Rect::new(0.0, 0.0, 400.0, 300.0),
+                    name: "VPC".into(),
+                },
+                1,
+            );
+            let text = doc.add(
+                canvas_core::ElementKind::Text {
+                    rect: canvas_core::geometry::Rect::new(10.0, 10.0, 40.0, 20.0),
+                    text: "DB".into(),
+                    align: canvas_core::model::TextAlign::Center,
+                    fixed_width: false,
+                    container_id: None,
+                    style: canvas_core::model::Style::default(),
+                },
+                2,
+            );
+            let sticky = doc.add(
+                canvas_core::ElementKind::Shape {
+                    shape: canvas_core::model::ShapeKind::Sticky,
+                    rect: canvas_core::geometry::Rect::new(10.0, 10.0, 140.0, 140.0),
+                    style: canvas_core::model::Style::default(),
+                    bound_text_id: Some(text.clone()),
+                },
+                3,
+            );
+            doc.element_mut(&sticky).unwrap().frame_id = Some(frame.clone());
+            if let canvas_core::ElementKind::Text { container_id, .. } =
+                &mut doc.element_mut(&text).unwrap().kind
+            {
+                *container_id = Some(sticky.clone());
+            }
+            let outside = doc.add(
+                canvas_core::ElementKind::Shape {
+                    shape: canvas_core::model::ShapeKind::Rectangle,
+                    rect: canvas_core::geometry::Rect::new(600.0, 0.0, 80.0, 40.0),
+                    style: canvas_core::model::Style::default(),
+                    bound_text_id: None,
+                },
+                4,
+            );
+            (frame, sticky, text, outside)
+        };
+
+        let result = server
+            .canvas_read(Parameters(ReadArgs {
+                frame: Some(frame.clone()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let body = structured(&result);
+        assert_eq!(body["workspace"], "default");
+        assert_eq!(body["context"], workspace.context());
+        assert_eq!(body["revision"], 0);
+        assert_eq!(body["matched"], 3, "frame, sticky and its bound label");
+        let elements = body["elements"].as_array().unwrap();
+        assert_eq!(elements.len(), 3);
+        assert_eq!(elements[0]["id"], frame);
+        assert_eq!(elements[0]["kind"], "frame");
+        assert_eq!(
+            elements[0]["bounds"],
+            serde_json::json!([0.0, 0.0, 400.0, 300.0])
+        );
+        assert_eq!(elements[0]["label"], "VPC");
+        assert!(elements[0]["frame"].is_null());
+        let sticky_json = elements.iter().find(|e| e["id"] == sticky).unwrap();
+        assert_eq!(sticky_json["kind"], "sticky");
+        assert_eq!(sticky_json["label"], "DB");
+        assert_eq!(sticky_json["frame"], elements[0]["handle"]);
+        let text_json = elements.iter().find(|e| e["id"] == text).unwrap();
+        assert_eq!(text_json["kind"], "text");
+        assert_eq!(text_json["label"], "DB");
+        assert!(
+            elements.iter().all(|e| e["id"] != outside),
+            "scoped reads exclude elements outside the frame"
+        );
+        assert!(
+            elements.iter().all(|e| e.get("element").is_none()),
+            "exact element JSON is detail-only"
+        );
+        let text_output = error_text(&result);
+        assert!(
+            text_output.starts_with("revision 0\n3 elements matched\n"),
+            "{text_output}"
+        );
+        assert!(
+            text_output.ends_with(&format!(
+                "\nworkspace {:?} context {:?}",
+                "default",
+                workspace.context()
+            )),
+            "{text_output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn canvas_read_detail_carries_the_exact_element_json() {
+        let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
+        let workspace = state.workspace(crate::state::DEFAULT_WORKSPACE).await;
+        let server = CanvasServer::new(state);
+        let drawn = server
+            .canvas_draw(Parameters(DrawArgs {
+                kind: "rectangle".into(),
+                text: Some("API".into()),
+                name: None,
+                glyph: None,
+                x: Some(0.0),
+                y: Some(0.0),
+                w: None,
+                h: None,
+                near: None,
+                side: None,
+            }))
+            .await
+            .unwrap();
+        let created: serde_json::Value = serde_json::from_str(&error_text(&drawn)).unwrap();
+        let handle = created["id"].as_str().unwrap().to_string();
+        let id = workspace.resolve_id(&handle).await;
+
+        let result = server
+            .canvas_read(Parameters(ReadArgs {
+                ids: Some(vec![handle.clone()]),
+                detail: true,
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let body = structured(&result);
+        assert_eq!(body["matched"], 2, "the rectangle and its bound label");
+        let elements = body["elements"].as_array().unwrap();
+        assert_eq!(elements.len(), 2);
+        assert!(
+            elements.iter().all(|e| e.get("element").is_some()),
+            "detail attaches the exact element JSON"
+        );
+        let shape = elements.iter().find(|e| e["id"] == id).unwrap();
+        let exact = {
+            let doc = workspace.doc.lock().await;
+            serde_json::to_value(doc.element(&id).unwrap()).unwrap()
+        };
+        assert_eq!(shape["element"], exact);
+        assert_eq!(shape["handle"], handle);
+        assert_eq!(shape["label"], "API");
+    }
+
+    #[tokio::test]
+    async fn canvas_read_summary_carries_structured_counts() {
+        let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
+        let workspace = state.workspace(crate::state::DEFAULT_WORKSPACE).await;
+        let server = CanvasServer::new(state);
+        let draw = |kind: &str| DrawArgs {
+            kind: kind.into(),
+            text: None,
+            name: None,
+            glyph: None,
+            x: None,
+            y: None,
+            w: None,
+            h: None,
+            near: None,
+            side: None,
+        };
+        server
+            .canvas_draw(Parameters(draw("rectangle")))
+            .await
+            .unwrap();
+        server
+            .canvas_draw(Parameters(draw("ellipse")))
+            .await
+            .unwrap();
+
+        let result = server
+            .canvas_read(Parameters(ReadArgs {
+                summary: true,
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let body = structured(&result);
+        assert_eq!(body["workspace"], "default");
+        assert_eq!(body["context"], workspace.context());
+        assert_eq!(body["revision"], 2);
+        assert_eq!(body["live"], 2);
+        assert_eq!(body["rectangles"], 1);
+        assert_eq!(body["ellipses"], 1);
+        assert!(
+            body.get("elements").is_none(),
+            "summary is the summary object, not an element page"
+        );
+        let text_body: serde_json::Value = serde_json::from_str(&error_text(&result)).unwrap();
+        assert_eq!(text_body["live"], body["live"]);
+        assert_eq!(text_body["revision"], body["revision"]);
+        assert!(
+            text_body.get("workspace").is_none(),
+            "text summary output is unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn canvas_read_since_carries_structured_changes_and_removals() {
+        let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
+        let workspace = state.workspace(crate::state::DEFAULT_WORKSPACE).await;
+        let server = CanvasServer::new(state);
+        let draw = |kind: &str| DrawArgs {
+            kind: kind.into(),
+            text: None,
+            name: None,
+            glyph: None,
+            x: None,
+            y: None,
+            w: None,
+            h: None,
+            near: None,
+            side: None,
+        };
+        let first = server
+            .canvas_draw(Parameters(draw("rectangle")))
+            .await
+            .unwrap();
+        let first: serde_json::Value = serde_json::from_str(&error_text(&first)).unwrap();
+        let removed_handle = first["id"].as_str().unwrap().to_string();
+        let baseline = workspace.revision.load(Ordering::SeqCst);
+
+        let second = server
+            .canvas_draw(Parameters(draw("ellipse")))
+            .await
+            .unwrap();
+        let second: serde_json::Value = serde_json::from_str(&error_text(&second)).unwrap();
+        let changed_handle = second["id"].as_str().unwrap().to_string();
+        let cleared = server
+            .canvas_clear(Parameters(ElementIdsArgs {
+                ids: vec![removed_handle.clone()],
+            }))
+            .await
+            .unwrap();
+        assert_ne!(cleared.is_error, Some(true), "{}", error_text(&cleared));
+
+        let result = server
+            .canvas_read(Parameters(ReadArgs {
+                since: Some(baseline),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let body = structured(&result);
+        assert_eq!(body["workspace"], "default");
+        assert_eq!(body["context"], workspace.context());
+        assert_eq!(body["revision"], workspace.revision.load(Ordering::SeqCst));
+        let changes = body["changes"].as_array().unwrap();
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0]["source"], "agent");
+        assert_eq!(changes[0]["changed"], serde_json::json!([changed_handle]));
+        assert_eq!(changes[1]["changed"], serde_json::json!([removed_handle]));
+        assert_eq!(body["changed"], serde_json::json!([changed_handle]));
+        assert_eq!(body["removed"], serde_json::json!([removed_handle]));
+        assert!(error_text(&result).contains("changed now:"));
     }
 
     #[tokio::test]
