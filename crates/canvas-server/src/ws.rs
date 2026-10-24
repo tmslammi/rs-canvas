@@ -20,12 +20,20 @@ use serde_json::Value;
 use tokio::sync::broadcast::error::RecvError;
 
 use canvas_core::model::Element;
+use canvas_core::wire;
 
-use crate::state::{now_ms, valid_workspace_name, AppState, Workspace, DEFAULT_WORKSPACE};
+use crate::state::{
+    now_ms, valid_workspace_name, AppState, PageMessage, Workspace, DEFAULT_WORKSPACE,
+};
 
+/// `wire=json` suppresses the binary capability advertisement so a test (or a
+/// deliberately conservative client) can exercise the legacy JSON path
+/// against this server. An old server simply never advertises in the first
+/// place; the page falls back the same way.
 #[derive(serde::Deserialize)]
 pub struct WsQuery {
     ws: Option<String>,
+    wire: Option<String>,
 }
 
 pub async fn handler(
@@ -44,11 +52,17 @@ pub async fn handler(
         )
             .into_response();
     }
+    let binary_allowed = query.wire.as_deref() != Some("json");
     let workspace = state.workspace(&name).await;
-    ws.on_upgrade(move |socket| connected(socket, state, workspace))
+    ws.on_upgrade(move |socket| connected(socket, state, workspace, binary_allowed))
 }
 
-async fn connected(mut socket: WebSocket, state: Arc<AppState>, workspace: Arc<Workspace>) {
+async fn connected(
+    mut socket: WebSocket,
+    state: Arc<AppState>,
+    workspace: Arc<Workspace>,
+    binary_allowed: bool,
+) {
     let id = state.new_page_id();
     if !state.register_page(&workspace).await {
         return;
@@ -60,7 +74,7 @@ async fn connected(mut socket: WebSocket, state: Arc<AppState>, workspace: Arc<W
     let mut to_pages = workspace.to_pages.subscribe();
 
     let settings = state.current_settings().await;
-    let hello = serde_json::json!({
+    let mut hello = serde_json::json!({
         "type": "hello",
         "server": "rs-canvas",
         "version": env!("CARGO_PKG_VERSION"),
@@ -69,8 +83,13 @@ async fn connected(mut socket: WebSocket, state: Arc<AppState>, workspace: Arc<W
         "settings": settings,
         "discussion": workspace.discussion.lock().await.clone(),
         "discussion_persisted": workspace.doc_path.is_some(),
-    })
-    .to_string();
+    });
+    if binary_allowed {
+        // Capability negotiation: a page that sees this sends document frames
+        // as binary; a page that does not keeps sending and receiving JSON.
+        hello["binary_sync"] = wire::VERSION.into();
+    }
+    let hello = hello.to_string();
 
     // The page uploads its document first (every boot sends a snapshot);
     // the server only sends its mirror back when the page actually needs
@@ -81,6 +100,11 @@ async fn connected(mut socket: WebSocket, state: Arc<AppState>, workspace: Arc<W
 
     if ready {
         let mut page_sync = crate::state::PageSync::default();
+        // The connection starts on the JSON path; its first binary document
+        // frame promotes it. New pages wait for hello before uploading, so
+        // this happens before any document frame the server sends them.
+        let mut binary_wire = false;
+        let mut binary_guard = None;
         // First upload not yet reconciled; a fallback timer below covers
         // clients that connect without ever uploading.
         let mut first_sync_pending = state.sync;
@@ -96,15 +120,14 @@ async fn connected(mut socket: WebSocket, state: Arc<AppState>, workspace: Arc<W
                         if message.except == Some(id) {
                             continue;
                         }
-                        if socket.send(Message::Text(message.text.into())).await.is_err() {
+                        if !send_page_message(&mut socket, message, binary_wire).await {
                             break;
                         }
                     }
                     Err(RecvError::Lagged(_)) => {
                         // Frames were dropped: only a full snapshot can repair
                         // the page, so send one now.
-                        let snapshot = workspace.snapshot_frame().await;
-                        if socket.send(Message::Text(snapshot.into())).await.is_err() {
+                        if !send_snapshot(&mut socket, &workspace, binary_wire).await {
                             break;
                         }
                         let discussion = serde_json::json!({
@@ -137,11 +160,37 @@ async fn connected(mut socket: WebSocket, state: Arc<AppState>, workspace: Arc<W
                                         // upload just merged in, so one
                                         // snapshot covers both worlds. A
                                         // converged page gets no download.
-                                        let snapshot = workspace.snapshot_frame().await;
-                                        if socket.send(Message::Text(snapshot.into())).await.is_err() {
+                                        if !send_snapshot(&mut socket, &workspace, binary_wire).await {
                                             break;
                                         }
                                     }
+                                }
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Binary(bytes))) => {
+                        if !state.sync || !binary_allowed {
+                            continue;
+                        }
+                        if workspace.retired.load(Ordering::SeqCst) { break; }
+                        if !binary_wire {
+                            // Set the local flag before the workspace count:
+                            // a broadcast that sees the count must also see a
+                            // connection ready to read the binary frame.
+                            binary_wire = true;
+                            binary_guard = Some(workspace.promote_binary_page());
+                        }
+                        workspace.note_page_activity();
+                        let synced =
+                            handle_binary_frame(&workspace, &mut page_sync, id, &bytes).await;
+                        if first_sync_pending {
+                            if let Some(mirror_leads) = synced {
+                                first_sync_pending = false;
+                                fallback_armed = false;
+                                if mirror_leads
+                                    && !send_snapshot(&mut socket, &workspace, binary_wire).await
+                                {
+                                    break;
                                 }
                             }
                         }
@@ -153,21 +202,114 @@ async fn connected(mut socket: WebSocket, state: Arc<AppState>, workspace: Arc<W
                     // snapshot so old or quiet clients still converge.
                     fallback_armed = false;
                     first_sync_pending = false;
-                    if state.sync {
-                        let snapshot = workspace.snapshot_frame().await;
-                        if socket.send(Message::Text(snapshot.into())).await.is_err() {
-                            break;
-                        }
+                    if state.sync && !send_snapshot(&mut socket, &workspace, binary_wire).await {
+                        break;
                     }
                 },
             }
         }
+        drop(binary_guard);
     }
 
     workspace.pages.fetch_sub(1, Ordering::SeqCst);
     state.release_workspace(&workspace).await;
     let remaining = workspace.pages.load(Ordering::SeqCst);
     tracing::info!(pages = remaining, workspace = %workspace.name, "page disconnected");
+}
+
+/// Send one broadcast frame in an encoding this page can read. A binary page
+/// falls back to JSON for a frame encoded before it was promoted; a legacy
+/// page always gets JSON.
+async fn send_page_message(socket: &mut WebSocket, message: PageMessage, binary: bool) -> bool {
+    if binary {
+        if let Some(bytes) = message.binary {
+            return socket.send(Message::Binary(bytes.into())).await.is_ok();
+        }
+    }
+    match message.json {
+        Some(json) => socket.send(Message::Text(json.into())).await.is_ok(),
+        None => true,
+    }
+}
+
+/// Send the mirror snapshot as a binary frame to a capable page, or JSON to a
+/// legacy one. A binary encoding failure falls back to JSON rather than
+/// dropping the resync.
+async fn send_snapshot(socket: &mut WebSocket, workspace: &Workspace, binary: bool) -> bool {
+    if binary {
+        match workspace.snapshot_frame_bytes().await {
+            Ok(bytes) => return socket.send(Message::Binary(bytes.into())).await.is_ok(),
+            Err(error) => {
+                tracing::warn!(%error, "could not encode binary snapshot; sending JSON instead");
+            }
+        }
+    }
+    let snapshot = workspace.snapshot_frame().await;
+    socket.send(Message::Text(snapshot.into())).await.is_ok()
+}
+
+/// One incoming binary frame. Returns `Some(mirror_leads)` for snapshots, with
+/// the same meaning as the JSON handler.
+async fn handle_binary_frame(
+    workspace: &Arc<Workspace>,
+    page_sync: &mut crate::state::PageSync,
+    id: u64,
+    bytes: &[u8],
+) -> Option<bool> {
+    match wire::kind(bytes) {
+        Ok(wire::FrameKind::Snapshot) => {
+            let Ok((_, incoming)) = wire::decode_snapshot(bytes) else {
+                tracing::warn!("ignoring malformed binary snapshot frame");
+                return None;
+            };
+            Some(absorb_page_snapshot(workspace, page_sync, id, incoming).await)
+        }
+        Ok(wire::FrameKind::Patch) => {
+            match wire::decode_patch(bytes) {
+                Ok((_, put)) => {
+                    workspace.absorb_patch(put, id).await;
+                }
+                Err(error) => tracing::warn!(%error, "ignoring malformed binary patch frame"),
+            }
+            None
+        }
+        Err(error) => {
+            tracing::warn!(%error, "ignoring malformed binary frame");
+            None
+        }
+    }
+}
+
+/// Merge one page snapshot into the mirror and update the per-connection
+/// purge base. Returns whether the mirror holds live elements the page lacks,
+/// which means the page needs a download.
+async fn absorb_page_snapshot(
+    workspace: &Arc<Workspace>,
+    page_sync: &mut crate::state::PageSync,
+    id: u64,
+    mut incoming: canvas_core::Document,
+) -> bool {
+    // The page's doc as it actually is: purged elements are absent, so
+    // diffing against the previous snapshot is what makes a deletion
+    // expressible on the wire.
+    let page_document = incoming.clone();
+    // Does the mirror hold any live element the page lacks? It does when the
+    // page left with content and the server carried on (agent edits with no
+    // page connected) — such a page must catch up with a download. An
+    // in-sync boot already holds everything and stays silent; deletions made
+    // while the page was away reach it through the patch-correction path.
+    let mirror_leads = {
+        let mirror = workspace.doc.lock().await;
+        mirror
+            .elements
+            .values()
+            .filter(|element| !element.is_deleted)
+            .any(|element| page_document.element(&element.id).is_none())
+    };
+    page_sync.prepare(&mut incoming, now_ms());
+    workspace.absorb_document(&incoming, Some(id)).await;
+    page_sync.commit(page_document);
+    mirror_leads
 }
 
 /// One incoming page frame. Patches merge per element; snapshots go through
@@ -188,31 +330,10 @@ async fn handle_frame(
     match frame.get("type").and_then(|value| value.as_str()) {
         Some("snapshot") => {
             let doc = frame.get("doc")?;
-            let Ok(mut incoming) = canvas_core::serialization::from_value(doc.clone()) else {
+            let Ok(incoming) = canvas_core::serialization::from_value(doc.clone()) else {
                 return None;
             };
-            // The page's doc as it actually is: purged elements are absent,
-            // so diffing against the previous snapshot is what makes a
-            // deletion expressible on the wire.
-            let page_document = incoming.clone();
-            // Does the mirror hold any live element the page lacks? It does
-            // when the page left with content and the server carried on
-            // (agent edits with no page connected) — such a page must catch
-            // up with a download. An in-sync boot already holds everything
-            // and stays silent; deletions made while the page was away
-            // reach it through the patch-correction path instead.
-            let mirror_leads = {
-                let mirror = workspace.doc.lock().await;
-                mirror
-                    .elements
-                    .values()
-                    .filter(|element| !element.is_deleted)
-                    .any(|element| page_document.element(&element.id).is_none())
-            };
-            page_sync.prepare(&mut incoming, now_ms());
-            workspace.absorb_document(&incoming, Some(id)).await;
-            page_sync.commit(page_document);
-            Some(mirror_leads)
+            Some(absorb_page_snapshot(workspace, page_sync, id, incoming).await)
         }
         Some("patch") => {
             let put = frame.get("put")?;

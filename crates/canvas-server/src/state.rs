@@ -73,22 +73,46 @@ pub fn valid_workspace_name(name: &str) -> bool {
 
 /// One broadcast frame plus the page that must not receive it (the origin of
 /// a patch never gets its own change echoed back).
+///
+/// Control frames carry only `json`. Document frames may carry both encodings:
+/// the workspace builds JSON only while legacy pages are connected and binary
+/// only while capable pages are connected, so a binary-only workspace never
+/// pays a JSON snapshot/patch pass.
 #[derive(Clone, Debug)]
 pub struct PageMessage {
-    pub text: String,
+    pub json: Option<String>,
+    pub binary: Option<Vec<u8>>,
     pub except: Option<u64>,
 }
 
 impl PageMessage {
     pub fn all(text: String) -> Self {
-        Self { text, except: None }
+        Self {
+            json: Some(text),
+            binary: None,
+            except: None,
+        }
     }
 
-    pub fn except(text: String, page: u64) -> Self {
+    /// A document frame: whichever encodings the connected page mix needs.
+    pub fn document(json: Option<String>, binary: Option<Vec<u8>>, except: Option<u64>) -> Self {
         Self {
-            text,
-            except: Some(page),
+            json,
+            binary,
+            except,
         }
+    }
+}
+
+/// Drops a page's binary capability when its connection ends, including a
+/// cancelled socket task.
+pub struct BinaryPageGuard<'a> {
+    workspace: &'a Workspace,
+}
+
+impl Drop for BinaryPageGuard<'_> {
+    fn drop(&mut self) {
+        self.workspace.binary_pages.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -245,7 +269,14 @@ pub struct Workspace {
     pub doc_path: Option<PathBuf>,
     /// Connected pages on this workspace.
     pub pages: AtomicUsize,
-    /// Server-to-page messages (JSON text over the WebSocket).
+    /// Connected pages that negotiated the binary wire. Pages start as JSON
+    /// and are promoted when they send their first binary frame.
+    binary_pages: AtomicUsize,
+    /// Serializes page joins with document-frame encoding and broadcast, so a
+    /// page can never join between the capability check and the send and
+    /// receive a frame with no encoding it can read.
+    wire_gate: Mutex<()>,
+    /// Server-to-page messages (JSON text or binary frames over the WebSocket).
     pub to_pages: broadcast::Sender<PageMessage>,
     /// A persist is queued; bursts coalesce into one write.
     persist_pending: AtomicBool,
@@ -292,6 +323,8 @@ impl Workspace {
             doc: Mutex::new(Document::new()),
             doc_path,
             pages: AtomicUsize::new(0),
+            binary_pages: AtomicUsize::new(0),
+            wire_gate: Mutex::new(()),
             to_pages,
             persist_pending: AtomicBool::new(false),
             persist_write: Mutex::new(()),
@@ -365,12 +398,19 @@ impl Workspace {
         names.iter().map(|name| aliases.resolve(name)).collect()
     }
 
-    /// The `{"type":"snapshot","rev":N,"doc":{...}}` frame for the mirror.
-    /// The document is embedded as an object, not an escaped string: one
-    /// parse on the page and no escaping overhead.
+    /// The legacy `{"type":"snapshot","rev":N,"doc":{...}}` frame for the
+    /// mirror. The document is embedded as an object, not an escaped string:
+    /// one parse on the page and no escaping overhead.
     pub async fn snapshot_frame(&self) -> String {
         let revision = self.revision.load(Ordering::SeqCst);
         self.snapshot_json(revision).await
+    }
+
+    /// The same snapshot as a binary wire frame, without a JSON pass.
+    pub async fn snapshot_frame_bytes(&self) -> Result<Vec<u8>, canvas_core::wire::WireError> {
+        let revision = self.revision.load(Ordering::SeqCst);
+        let doc = self.doc.lock().await;
+        canvas_core::wire::encode_snapshot(revision, &doc)
     }
 
     async fn snapshot_json(&self, revision: u64) -> String {
@@ -390,7 +430,7 @@ impl Workspace {
         .unwrap_or_default()
     }
 
-    /// The `{"type":"patch","rev":N,"put":[...]}` frame.
+    /// The legacy `{"type":"patch","rev":N,"put":[...]}` frame.
     pub fn patch_frame(revision: u64, put: &[Element]) -> String {
         #[derive(serde::Serialize)]
         struct Patch<'a> {
@@ -405,6 +445,38 @@ impl Workspace {
             put,
         })
         .unwrap_or_default()
+    }
+
+    /// Whether any connected page reads the binary wire.
+    fn binary_pages(&self) -> usize {
+        self.binary_pages.load(Ordering::SeqCst)
+    }
+
+    /// Promote a connection to the binary wire. The guard decrements the
+    /// capability count when the connection future is dropped, even if the
+    /// socket is cancelled before its cleanup path runs.
+    pub fn promote_binary_page(&self) -> BinaryPageGuard<'_> {
+        self.binary_pages.fetch_add(1, Ordering::SeqCst);
+        BinaryPageGuard { workspace: self }
+    }
+
+    /// Broadcast a patch to every page but `except`, in the encodings the
+    /// connected mix needs. Holds the wire gate so a page joining during
+    /// encoding is counted before the JSON skip decision.
+    async fn broadcast_patch(&self, revision: u64, put: &[Element], except: Option<u64>) {
+        let _gate = self.wire_gate.lock().await;
+        let pages = self.pages.load(Ordering::SeqCst);
+        if pages == 0 {
+            return;
+        }
+        let binary_pages = self.binary_pages();
+        let json = (binary_pages < pages).then(|| Self::patch_frame(revision, put));
+        let binary = (binary_pages > 0)
+            .then(|| canvas_core::wire::encode_patch(revision, put).ok())
+            .flatten();
+        let _ = self
+            .to_pages
+            .send(PageMessage::document(json, binary, except));
     }
 
     /// Merge an already-parsed page document into the mirror. Returns whether
@@ -464,22 +536,15 @@ impl Workspace {
 
         if changed_ids.is_empty() {
             // Nothing moved in the mirror; only the origin needs the truth.
-            let _ = self
-                .to_pages
-                .send(PageMessage::all(Self::patch_frame(revision, &corrections)));
+            self.broadcast_patch(revision, &corrections, None).await;
         } else if corrections.is_empty() {
             // Normal case: the origin already holds these changes.
-            let _ = self.to_pages.send(PageMessage::except(
-                Self::patch_frame(revision, &winners),
-                origin,
-            ));
+            self.broadcast_patch(revision, &winners, Some(origin)).await;
         } else {
             // The page's copy lost to a concurrent edit; converge everyone.
             let mut all = winners;
             all.extend(corrections);
-            let _ = self
-                .to_pages
-                .send(PageMessage::all(Self::patch_frame(revision, &all)));
+            self.broadcast_patch(revision, &all, None).await;
         }
         if !changed_ids.is_empty() {
             self.schedule_persist().await;
@@ -489,21 +554,44 @@ impl Workspace {
 
     /// Broadcast an agent-side edit as a patch and queue the persist.
     pub async fn publish_patch(&self, revision: u64, put: Vec<Element>) {
-        let _ = self
-            .to_pages
-            .send(PageMessage::all(Self::patch_frame(revision, &put)));
+        self.broadcast_patch(revision, &put, None).await;
         self.schedule_persist().await;
     }
 
     /// Broadcast the whole mirror to every page but `except` (the uploader
     /// already holds what it sent) and queue the persist.
     pub async fn broadcast_snapshot_except(&self, revision: u64, except: Option<u64>) {
-        let frame = self.snapshot_json(revision).await;
-        let message = match except {
-            Some(id) => PageMessage::except(frame, id),
-            None => PageMessage::all(frame),
-        };
-        let _ = self.to_pages.send(message);
+        // Hold the gate through encoding and send: a page joining meanwhile
+        // must be counted before we decide to skip the JSON encoding. The
+        // document lock is acquired after the gate everywhere, never before.
+        let _gate = self.wire_gate.lock().await;
+        let pages = self.pages.load(Ordering::SeqCst);
+        if pages > 0 {
+            let binary_pages = self.binary_pages();
+            let doc = self.doc.lock().await;
+            let json = (binary_pages < pages).then(|| {
+                #[derive(serde::Serialize)]
+                struct Snapshot<'a> {
+                    #[serde(rename = "type")]
+                    kind: &'static str,
+                    rev: u64,
+                    doc: &'a Document,
+                }
+                serde_json::to_string(&Snapshot {
+                    kind: "snapshot",
+                    rev: revision,
+                    doc: &doc,
+                })
+                .unwrap_or_default()
+            });
+            let binary = (binary_pages > 0)
+                .then(|| canvas_core::wire::encode_snapshot(revision, &doc).ok())
+                .flatten();
+            drop(doc);
+            let _ = self
+                .to_pages
+                .send(PageMessage::document(json, binary, except));
+        }
         self.schedule_persist().await;
     }
 
@@ -818,6 +906,9 @@ impl AppState {
         if workspace.retired.load(Ordering::SeqCst) {
             return false;
         }
+        // Count the page under the wire gate so a document broadcast can
+        // never encode for the old page mix and then send to this newcomer.
+        let _gate = workspace.wire_gate.lock().await;
         workspace.pages.fetch_add(1, Ordering::SeqCst);
         workspace.note_page_activity();
         true
@@ -1288,8 +1379,8 @@ mod tests {
             !state.register_page(&old).await,
             "retired connections cannot rejoin"
         );
-        let frame: serde_json::Value =
-            serde_json::from_str(&messages.recv().await.unwrap().text).unwrap();
+        let message = messages.recv().await.unwrap();
+        let frame: serde_json::Value = serde_json::from_str(&message.json.unwrap()).unwrap();
         assert_eq!(frame["action"], "rename");
         assert_eq!(frame["workspace"], "beta");
         old.persist_document().await;
@@ -1496,13 +1587,14 @@ mod tests {
     async fn patches_merge_and_broadcast_to_everyone_but_the_origin() {
         let state = AppState::new(PathBuf::from("."), None, true);
         let ws = state.workspace(DEFAULT_WORKSPACE).await;
+        ws.pages.store(1, Ordering::SeqCst);
         let mut from_server = ws.to_pages.subscribe();
         let element = Element::new(shape_at(0.0), "a0".into(), 1).with_id("one");
 
         assert!(ws.absorb_patch(vec![element.clone()], 7).await);
         let message = from_server.recv().await.unwrap();
         assert_eq!(message.except, Some(7), "the origin page is skipped");
-        let frame: serde_json::Value = serde_json::from_str(&message.text).unwrap();
+        let frame: serde_json::Value = serde_json::from_str(&message.json.unwrap()).unwrap();
         assert_eq!(frame["type"], "patch");
         assert_eq!(frame["put"].as_array().unwrap().len(), 1);
         assert_eq!(ws.revision.load(Ordering::SeqCst), 1);
@@ -1518,6 +1610,7 @@ mod tests {
     async fn a_stale_patch_cannot_clobber_a_newer_mirror() {
         let state = AppState::new(PathBuf::from("."), None, true);
         let ws = state.workspace(DEFAULT_WORKSPACE).await;
+        ws.pages.store(1, Ordering::SeqCst);
         let mut newer = Element::new(shape_at(5.0), "a0".into(), 1).with_id("one");
         newer.version = 4;
         ws.absorb_patch(vec![newer], 1).await;
@@ -1532,7 +1625,7 @@ mod tests {
 
         // The page that sent the stale copy is corrected back to the winner.
         let frame: serde_json::Value =
-            serde_json::from_str(&from_server.recv().await.unwrap().text).unwrap();
+            serde_json::from_str(&from_server.recv().await.unwrap().json.unwrap()).unwrap();
         assert_eq!(frame["type"], "patch");
         let put = frame["put"].as_array().unwrap();
         assert_eq!(put.len(), 1);
@@ -1548,6 +1641,96 @@ mod tests {
         assert_eq!(frame["type"], "snapshot");
         assert!(frame["doc"]["elements"].is_object());
         assert_eq!(frame["rev"], 0);
+    }
+
+    #[tokio::test]
+    async fn binary_only_workspaces_broadcast_patches_without_json() {
+        let state = AppState::new(PathBuf::from("."), None, true);
+        let ws = state.workspace(DEFAULT_WORKSPACE).await;
+        ws.pages.store(1, Ordering::SeqCst);
+        let _binary = ws.promote_binary_page();
+        let mut from_server = ws.to_pages.subscribe();
+        let element = Element::new(shape_at(0.0), "a0".into(), 1).with_id("one");
+
+        assert!(ws.absorb_patch(vec![element.clone()], 9).await);
+        let message = from_server.recv().await.unwrap();
+        assert!(
+            message.json.is_none(),
+            "a binary-only page mix must not pay the JSON patch encoding"
+        );
+        let bytes = message.binary.expect("binary patch");
+        let (revision, put) = canvas_core::wire::decode_patch(&bytes).unwrap();
+        assert_eq!(revision, 1);
+        assert_eq!(put, vec![element]);
+    }
+
+    #[tokio::test]
+    async fn legacy_workspaces_broadcast_patches_as_json() {
+        let state = AppState::new(PathBuf::from("."), None, true);
+        let ws = state.workspace(DEFAULT_WORKSPACE).await;
+        ws.pages.store(1, Ordering::SeqCst);
+        let mut from_server = ws.to_pages.subscribe();
+        let element = Element::new(shape_at(0.0), "a0".into(), 1).with_id("one");
+
+        assert!(ws.absorb_patch(vec![element], 9).await);
+        let message = from_server.recv().await.unwrap();
+        assert!(
+            message.binary.is_none(),
+            "a legacy-only page mix must not pay the binary encoding"
+        );
+        let frame: serde_json::Value = serde_json::from_str(&message.json.unwrap()).unwrap();
+        assert_eq!(frame["type"], "patch");
+    }
+
+    #[tokio::test]
+    async fn mixed_workspaces_broadcast_both_patch_encodings() {
+        let state = AppState::new(PathBuf::from("."), None, true);
+        let ws = state.workspace(DEFAULT_WORKSPACE).await;
+        ws.pages.store(2, Ordering::SeqCst);
+        let _binary = ws.promote_binary_page();
+        let mut from_server = ws.to_pages.subscribe();
+        let element = Element::new(shape_at(0.0), "a0".into(), 1).with_id("one");
+
+        assert!(ws.absorb_patch(vec![element], 9).await);
+        let message = from_server.recv().await.unwrap();
+        assert!(message.json.is_some(), "the legacy page needs JSON");
+        assert!(message.binary.is_some(), "the binary page needs bytes");
+        let frame: serde_json::Value = serde_json::from_str(&message.json.unwrap()).unwrap();
+        assert_eq!(frame["type"], "patch");
+        let (_, put) = canvas_core::wire::decode_patch(&message.binary.unwrap()).unwrap();
+        assert_eq!(put.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn binary_snapshot_broadcasts_carry_the_document_envelope_only() {
+        let state = AppState::new(PathBuf::from("."), None, true);
+        let ws = state.workspace(DEFAULT_WORKSPACE).await;
+        add_shape(&mut *ws.doc.lock().await, 3.0, 1);
+        ws.pages.store(1, Ordering::SeqCst);
+        let _binary = ws.promote_binary_page();
+        let mut from_server = ws.to_pages.subscribe();
+
+        ws.broadcast_snapshot_except(42, None).await;
+        let message = from_server.recv().await.unwrap();
+        assert!(
+            message.json.is_none(),
+            "a binary-only page mix must not pay the JSON snapshot encoding"
+        );
+        let (revision, doc) = canvas_core::wire::decode_snapshot(&message.binary.unwrap()).unwrap();
+        assert_eq!(revision, 42);
+        assert_eq!(doc.live_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn direct_binary_snapshots_carry_the_current_revision() {
+        let state = AppState::new(PathBuf::from("."), None, true);
+        let ws = state.workspace(DEFAULT_WORKSPACE).await;
+        add_shape(&mut *ws.doc.lock().await, 3.0, 1);
+        ws.revision.store(5, Ordering::SeqCst);
+        let bytes = ws.snapshot_frame_bytes().await.unwrap();
+        let (revision, doc) = canvas_core::wire::decode_snapshot(&bytes).unwrap();
+        assert_eq!(revision, 5);
+        assert_eq!(doc.live_count(), 1);
     }
 
     #[test]
