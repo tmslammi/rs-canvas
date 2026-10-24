@@ -3,8 +3,10 @@
 //! `Scene::update` rebuilds only the layers for changed elements and reports
 //! the world-space rectangles that must be repainted (old bounds union new
 //! bounds, expanded for stroke and jitter overflow). This is what keeps
-//! Canvas2D smooth on large documents.
+//! Canvas2D smooth on large documents. Large changed sets take a bulk rebuild
+//! path so mass delete/restore stays linear in the layer count.
 
+use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::collections::{HashMap, HashSet};
 
@@ -63,6 +65,40 @@ fn margin(element: &Element) -> f64 {
         }
         _ => 8.0,
     }
+}
+
+/// Layer order key: document z-order, ties broken by id.
+fn layer_order(a: &SceneLayer, b: &SceneLayer) -> Ordering {
+    a.index
+        .cmp(&b.index)
+        .then_with(|| a.element_id.cmp(&b.element_id))
+}
+
+/// Merge two `(index, id)`-sorted layer vectors in one pass.
+fn merge_layers(existing: Vec<SceneLayer>, added: Vec<SceneLayer>) -> Vec<SceneLayer> {
+    if added.is_empty() {
+        return existing;
+    }
+    if existing.is_empty() {
+        return added;
+    }
+    let mut merged = Vec::with_capacity(existing.len() + added.len());
+    let mut existing = existing.into_iter().peekable();
+    let mut added = added.into_iter().peekable();
+    loop {
+        let take_added = match (existing.peek(), added.peek()) {
+            (Some(old), Some(new)) => layer_order(new, old) == Ordering::Less,
+            (Some(_), None) => false,
+            (None, Some(_)) => true,
+            (None, None) => break,
+        };
+        merged.push(if take_added {
+            added.next().expect("peeked")
+        } else {
+            existing.next().expect("peeked")
+        });
+    }
+    merged
 }
 
 /// Bounds of the geometry the draw ops actually touch. This is the truth the
@@ -180,6 +216,13 @@ pub struct SceneLayer {
     pub lod: Option<u32>,
 }
 
+/// Smallest changed set that may take the bulk rebuild path. Below this,
+/// per-id splicing is cheap enough and avoids rebuilding the position map.
+const BULK_MIN_CHANGED: usize = 128;
+/// Estimated per-id splice/reindex pairs (`changed × layers`) above which one
+/// rebuild pass beats removing and reinserting layers one by one.
+const BULK_WORK_PAIRS: usize = 1 << 21;
+
 /// The renderable scene, kept in document z-order.
 #[derive(Clone, Debug, Default)]
 pub struct Scene {
@@ -197,9 +240,9 @@ pub struct Scene {
     /// path reads bounds only and skips the flush, keeping bulk drift at
     /// O(bounds) per frame instead of O(points).
     pending_ops: (f64, f64),
-    /// Element id -> position in `layers`. Rebuilt on full rebuilds;
-    /// maintained incrementally on structural edits (adds/removes/reorders
-    /// pay one O(n) reindex, never per frame).
+    /// Element id -> position in `layers`. Rebuilt on full rebuilds and large
+    /// bulk updates; maintained incrementally on ordinary structural edits
+    /// (adds/removes/reorders pay one O(n) reindex, never per frame).
     positions: HashMap<ElementId, u32>,
     /// Layers whose draw ops are not built yet (bounds are approximate).
     /// Full-detail use builds them on demand; the overview never does.
@@ -272,11 +315,7 @@ impl Scene {
                 lod,
             });
         }
-        self.layers.sort_unstable_by(|a, b| {
-            a.index
-                .cmp(&b.index)
-                .then_with(|| a.element_id.cmp(&b.element_id))
-        });
+        self.layers.sort_unstable_by(layer_order);
         self.reindex();
         self.unbuilt = self.layers.len();
         dirty.extend(self.layers.iter().map(|l| l.bounds));
@@ -433,8 +472,10 @@ impl Scene {
     /// elements), keep the rest, and report dirty rectangles in world space.
     ///
     /// Layers stay sorted by `(index, id)`, so an element whose order key did
-    /// not change is replaced in place in `O(log n)` with no re-sort. Only
-    /// structural changes (adds, deletes, reorders) touch the vector shape.
+    /// not change is replaced in place in `O(log n)` with no re-sort. Small
+    /// changed sets splice incrementally; large ones (mass delete, undo, paste)
+    /// rebuild the layer vector and position map in one pass so cost stays
+    /// roughly linear instead of `O(changed × layers)`.
     pub fn update(
         &mut self,
         doc: &Document,
@@ -442,17 +483,52 @@ impl Scene {
         measurer: &dyn TextMeasurer,
         obstacles: &ObstacleIndex,
     ) -> Vec<Rect> {
+        let bulk = self.should_rebuild_bulk(changed.len());
+        self.update_with(doc, changed, measurer, obstacles, bulk)
+    }
+
+    fn update_with(
+        &mut self,
+        doc: &Document,
+        changed: &BTreeSet<ElementId>,
+        measurer: &dyn TextMeasurer,
+        obstacles: &ObstacleIndex,
+        bulk: bool,
+    ) -> Vec<Rect> {
         // Incremental rebuilds produce ops at current positions: flush any
         // deferred drift first so the rebuilt layer and its neighbours agree.
         // Correctness over speed here; edits are infrequent next to drift
         // frames, and the flush runs at most once per edit burst.
         self.flush_pending_ops();
         // Preview-shifted layers from the in-flight gesture carry over as
-        // dirty; the per-id loop below reports the rest.
+        // dirty; the rebuild path below reports the rest.
         let mut dirty: Vec<Rect> = std::mem::take(&mut self.pending_dirty);
+        if bulk {
+            self.update_bulk(doc, changed, measurer, obstacles, &mut dirty);
+        } else {
+            self.update_incremental(doc, changed, measurer, obstacles, &mut dirty);
+        }
+        dirty
+    }
+
+    /// Whether a changed set is large enough that splicing each layer
+    /// separately would move/reindex the vector far more than one rebuild.
+    fn should_rebuild_bulk(&self, changed: usize) -> bool {
+        changed >= BULK_MIN_CHANGED
+            && changed.saturating_mul(self.layers.len().max(changed)) >= BULK_WORK_PAIRS
+    }
+
+    fn update_incremental(
+        &mut self,
+        doc: &Document,
+        changed: &BTreeSet<ElementId>,
+        measurer: &dyn TextMeasurer,
+        obstacles: &ObstacleIndex,
+        dirty: &mut Vec<Rect>,
+    ) {
         for id in changed {
             let Some(element) = doc.element(id).filter(|e| !e.is_deleted) else {
-                self.remove_layer(id, &mut dirty);
+                self.remove_layer(id, dirty);
                 continue;
             };
             // Already current from the gesture preview: bring deferred
@@ -529,6 +605,9 @@ impl Scene {
             match self.positions.get(id).copied().map(|pos| pos as usize) {
                 Some(old) if old < self.layers.len() && self.layers[old].element_id == *id => {
                     dirty.push(self.layers[old].bounds);
+                    if !self.layers[old].ops_built {
+                        self.unbuilt = self.unbuilt.saturating_sub(1);
+                    }
                     self.layers.remove(old);
                     self.positions.remove(id);
                     let insert_at = if old < insert_at {
@@ -547,7 +626,107 @@ impl Scene {
                 }
             }
         }
-        dirty
+    }
+
+    /// Rebuild the layer vector and position map in one pass for large changed
+    /// sets. Keeps unchanged layers (with their cached ops, LOD tags and unbuilt
+    /// state), rebuilds changed live elements exactly like the incremental path,
+    /// drops tombstones, and merges the new layers into z-order with one linear
+    /// merge instead of per-id `Vec::remove`/`insert` memmoves and reindexes.
+    fn update_bulk(
+        &mut self,
+        doc: &Document,
+        changed: &BTreeSet<ElementId>,
+        measurer: &dyn TextMeasurer,
+        obstacles: &ObstacleIndex,
+        dirty: &mut Vec<Rect>,
+    ) {
+        // Layers that a gesture preview already brought up to date are kept
+        // as-is: only their deferred ops points need the gesture-total shift.
+        // This mirrors the per-id skip in `update_incremental`.
+        let preview_total = self.preview_total;
+        let mut keep: HashSet<ElementId> = HashSet::new();
+        for id in changed {
+            if doc.element(id).is_none_or(|e| e.is_deleted) {
+                self.preview_current.remove(id);
+                self.preview_stale.remove(id);
+                continue;
+            }
+            if self.preview_current.remove(id) {
+                let pos = self
+                    .positions
+                    .get(id)
+                    .copied()
+                    .map(|pos| pos as usize)
+                    .filter(|&pos| {
+                        pos < self.layers.len()
+                            && self.layers[pos].element_id == *id
+                            && self.layers[pos].ops_built
+                    });
+                if let Some(pos) = pos {
+                    if self.preview_stale.remove(id) {
+                        shift_ops_points(
+                            &mut self.layers[pos].ops,
+                            preview_total.0,
+                            preview_total.1,
+                        );
+                    }
+                    keep.insert(id.clone());
+                }
+            }
+        }
+        if self.preview_stale.is_empty() {
+            self.preview_total = (0.0, 0.0);
+        }
+
+        // Build the replacement layers before touching the vector so the
+        // bound cache and palette can be updated without split borrows.
+        let mut added = Vec::with_capacity(changed.len().saturating_sub(keep.len()));
+        for id in changed {
+            if keep.contains(id) {
+                continue;
+            }
+            self.preview_stale.remove(id);
+            let Some(element) = doc.element(id).filter(|e| !e.is_deleted) else {
+                continue;
+            };
+            let ops = build_element_ops(element, doc, measurer, obstacles);
+            let bounds = layer_bounds(element, &ops, measurer);
+            let lod = lod_color_for(element).map(|c| self.intern_color(c));
+            // Grow-only cache, same semantics as the incremental path.
+            self.bounds_cache = Some(match self.bounds_cache {
+                Some(acc) => acc.union(&bounds),
+                None => bounds,
+            });
+            added.push(SceneLayer {
+                element_id: id.clone(),
+                index: element.index.clone(),
+                version: element.version,
+                bounds,
+                ops,
+                ops_built: true,
+                lod,
+            });
+        }
+
+        // One pass over the old layers: drop changed ids (reporting their old
+        // bounds) and keep everything else, including preview marks.
+        let mut layers = Vec::with_capacity(self.layers.len() + added.len());
+        for layer in std::mem::take(&mut self.layers) {
+            if changed.contains(&layer.element_id) && !keep.contains(&layer.element_id) {
+                dirty.push(layer.bounds);
+            } else {
+                layers.push(layer);
+            }
+        }
+        for layer in &added {
+            dirty.push(layer.bounds);
+        }
+
+        added.sort_unstable_by(layer_order);
+        self.layers = merge_layers(layers, added);
+        self.reindex();
+        self.unbuilt = self.layers.iter().filter(|layer| !layer.ops_built).count();
     }
 
     /// Rigid bulk translation for the all-elements-moving workload: shift
@@ -987,6 +1166,175 @@ mod tests {
                 &ObstacleIndex::new(),
             );
             let _ = &mut doc;
+        }
+    }
+
+    /// Normalize dirty rects for order-insensitive comparison.
+    fn dirty_key(rects: &[Rect]) -> Vec<(u64, u64, u64, u64)> {
+        let mut keys: Vec<_> = rects
+            .iter()
+            .map(|r| (r.x.to_bits(), r.y.to_bits(), r.w.to_bits(), r.h.to_bits()))
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// A mixed mass edit: tombstones, moved geometry, changed z-order and new
+    /// elements. Exercises every structural branch the bulk path must mirror.
+    fn mass_edit(doc: &mut Document) {
+        let ids: Vec<ElementId> = doc.ordered_live().iter().map(|e| e.id.clone()).collect();
+        for (i, id) in ids.iter().enumerate() {
+            let element = doc.element_mut(id).expect("live");
+            element.touch(100);
+            match i % 9 {
+                0 | 4 => element.is_deleted = true,
+                2 => {
+                    if let ElementKind::Shape { rect, .. } = &mut element.kind {
+                        rect.x += 700.0;
+                        rect.y += 300.0;
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Swap order keys pairwise so some layers move instead of just rebuild.
+        for pair in ids.chunks(2).filter(|pair| pair.len() == 2) {
+            let a_index = doc.element(&pair[0]).expect("live").index.clone();
+            let b_index = doc.element(&pair[1]).expect("live").index.clone();
+            doc.element_mut(&pair[0]).expect("live").index = b_index;
+            doc.element_mut(&pair[1]).expect("live").index = a_index;
+        }
+        for i in 0..12 {
+            doc.add(shape(5000.0 + i as f64), 101);
+        }
+    }
+
+    #[test]
+    fn bulk_update_matches_incremental_layers_and_dirty() {
+        let base = crate::benchmark_fixture(300);
+        let mut doc = base.clone();
+        mass_edit(&mut doc);
+        let changed: BTreeSet<ElementId> = doc.elements.keys().cloned().collect();
+        let measurer = crate::text::ApproxMeasurer;
+        let obstacles = ObstacleIndex::new();
+
+        let mut incremental = Scene::new();
+        incremental.rebuild_all(&base, &measurer, &obstacles);
+        let mut bulk = Scene::new();
+        bulk.rebuild_all(&base, &measurer, &obstacles);
+
+        let incremental_dirty =
+            incremental.update_with(&doc, &changed, &measurer, &obstacles, false);
+        let bulk_dirty = bulk.update_with(&doc, &changed, &measurer, &obstacles, true);
+
+        assert_eq!(bulk.layers, incremental.layers);
+        assert_eq!(bulk.unbuilt_count(), incremental.unbuilt_count());
+        assert_eq!(bulk.cached_bounds(), incremental.cached_bounds());
+        assert_eq!(bulk.palette(), incremental.palette());
+        assert_eq!(dirty_key(&bulk_dirty), dirty_key(&incremental_dirty));
+        for (pos, layer) in bulk.layers.iter().enumerate() {
+            assert_eq!(
+                bulk.slot_for(&layer.element_id),
+                Some(pos as u32),
+                "position map agrees with z-order"
+            );
+        }
+    }
+
+    #[test]
+    fn bulk_update_keeps_preview_layers_current() {
+        const N: usize = 240;
+        const MOVED: usize = 180;
+        let base = crate::benchmark_fixture(N);
+        let mut doc = base.clone();
+        let ids: Vec<ElementId> = doc
+            .ordered_live()
+            .iter()
+            .take(MOVED)
+            .map(|e| e.id.clone())
+            .collect();
+        let measurer = crate::text::ApproxMeasurer;
+        let obstacles = ObstacleIndex::new();
+        let everywhere = Rect::new(-1e9, -1e9, 2e9, 2e9);
+
+        let mut incremental = Scene::new();
+        incremental.rebuild_all(&base, &measurer, &obstacles);
+        incremental.ensure_area(&base, everywhere, &measurer, &obstacles);
+        let mut bulk = Scene::new();
+        bulk.rebuild_all(&base, &measurer, &obstacles);
+        bulk.ensure_area(&base, everywhere, &measurer, &obstacles);
+        let slots: Vec<u32> = ids
+            .iter()
+            .map(|id| incremental.slot_for(id).expect("preview slot"))
+            .collect();
+        incremental.shift_slots(&slots, 12.0, -7.0);
+        bulk.shift_slots(&slots, 12.0, -7.0);
+
+        // Release-time document: the previewed motion, one previewed delete.
+        for (i, id) in ids.iter().enumerate() {
+            let element = doc.element_mut(id).expect("live");
+            if i == 0 {
+                element.is_deleted = true;
+            } else {
+                crate::translate_element(element, 12.0, -7.0);
+                element.touch(50);
+            }
+        }
+        let changed: BTreeSet<ElementId> = ids.iter().cloned().collect();
+        let incremental_dirty =
+            incremental.update_with(&doc, &changed, &measurer, &obstacles, false);
+        let bulk_dirty = bulk.update_with(&doc, &changed, &measurer, &obstacles, true);
+
+        assert_eq!(bulk.layers, incremental.layers);
+        assert_eq!(dirty_key(&bulk_dirty), dirty_key(&incremental_dirty));
+        assert_eq!(bulk.unbuilt_count(), 0);
+        // Previewed layers were kept as-is: no exact rebuild bumped their
+        // version, and the deleted one is gone.
+        for id in ids.iter().skip(1) {
+            let layer = bulk.layer_for(id).expect("preview layer kept");
+            assert_eq!(layer.version, base.element(id).unwrap().version);
+        }
+        assert!(bulk.layer_for(&ids[0]).is_none());
+    }
+
+    #[test]
+    fn mass_delete_and_restore_keep_z_order_and_dirty_coverage() {
+        let base = crate::benchmark_fixture(400);
+        let mut doc = base.clone();
+        let ids: Vec<ElementId> = doc.ordered_live().iter().map(|e| e.id.clone()).collect();
+        let measurer = crate::text::ApproxMeasurer;
+        let obstacles = ObstacleIndex::new();
+        let mut scene = Scene::new();
+        scene.rebuild_all(&base, &measurer, &obstacles);
+        let old_bounds: Vec<Rect> = scene.layers.iter().map(|l| l.bounds).collect();
+        let changed: BTreeSet<ElementId> = ids.iter().cloned().collect();
+
+        for id in &ids {
+            doc.element_mut(id).unwrap().is_deleted = true;
+        }
+        let dirty = scene.update(&doc, &changed, &measurer, &obstacles);
+        assert!(scene.layers.is_empty());
+        assert_eq!(scene.unbuilt_count(), 0);
+        for bounds in old_bounds {
+            assert!(dirty.contains(&bounds), "deleted layer bounds are dirty");
+        }
+
+        // Undo restores the original store; layers come back in document order.
+        doc = base.clone();
+        let dirty = scene.update(&doc, &changed, &measurer, &obstacles);
+        let expected: Vec<ElementId> = base.ordered_live().iter().map(|e| e.id.clone()).collect();
+        assert_eq!(
+            scene
+                .layers
+                .iter()
+                .map(|l| l.element_id.clone())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(scene.unbuilt_count(), 0);
+        for layer in &scene.layers {
+            assert!(layer.ops_built);
+            assert!(dirty.contains(&layer.bounds), "restored bounds are dirty");
         }
     }
 }
