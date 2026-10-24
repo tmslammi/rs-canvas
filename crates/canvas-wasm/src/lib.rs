@@ -32,6 +32,14 @@ const PULSE_MS: u64 = 1100;
 const DEFAULT_FOCUS_MAX_ZOOM: f64 = 2.0;
 /// A focus target already inside the viewport by this margin is left alone.
 const FOCUS_MARGIN_PX: f64 = 32.0;
+/// Below this zoom the renderer switches to the batched overview (LOD) path:
+/// one filled rect per element, grouped by color into a single fill each,
+/// text skipped. At 0.25 a 140-unit shape covers 35 screen px and hachure
+/// gaps are sub-pixel, so rough detail is imperceptible — while full ops
+/// would submit ~5 Canvas2D calls per element (500k calls at 100k elements).
+/// Interaction and hit-testing still use full geometry; zooming back in
+/// restores exact hand-drawn rendering with no invalidation lag (same frame).
+const LOD_ZOOM: f64 = 0.25;
 
 fn default_zoom_cap() -> f64 {
     DEFAULT_FOCUS_MAX_ZOOM
@@ -498,6 +506,22 @@ impl Editor {
         self.apply(effects);
     }
 
+    /// Benchmark driver for the all-elements-moving workload: uniform rigid
+    /// drift of the whole document (simulation + scene prep, no draw). The
+    /// caller times this separately from `render()` to report app-side CPU
+    /// as simulation vs draw submission. History is untouched: this is
+    /// motion, not an undoable edit.
+    pub fn benchmark_tick(&mut self, dx: f64, dy: f64) {
+        if !dx.is_finite() || !dy.is_finite() {
+            return;
+        }
+        self.core.benchmark_tick(dx, dy);
+        // The pixel-shift cache no longer describes the canvas contents:
+        // element motion (unlike camera motion) changes what each pixel
+        // shows, so the next pan must full-render.
+        self.last_paint = None;
+    }
+
     /// Serialize the document for saving to a file.
     pub fn save_json(&self) -> String {
         canvas_core::serialization::to_json_pretty(&self.core.doc).unwrap_or_default()
@@ -580,7 +604,7 @@ impl Editor {
     }
 
     /// Export the drawing as a PNG data URL at the requested scale.
-    pub fn export_png(&self, scale: f64) -> Result<String, JsValue> {
+    pub fn export_png(&mut self, scale: f64) -> Result<String, JsValue> {
         if !scale.is_finite() || scale <= 0.0 {
             return Err(JsValue::from_str(
                 "export scale must be a positive, finite number",
@@ -614,6 +638,11 @@ impl Editor {
         let mut renderer = Canvas2dRenderer::new(ctx);
         renderer.clear(BACKGROUND);
         renderer.set_transform(Affine::translate(-bounds.x, -bounds.y).then(Affine::scale(scale)));
+        self.core.scene.flush_pending_ops();
+        if let Some(all) = self.core.scene.cached_bounds() {
+            self.core.ensure_area(all);
+        }
+        self.core.scene.flush_all_preview_stale();
         for layer in &self.core.scene.layers {
             renderer.draw_ops(&layer.ops);
         }
@@ -624,7 +653,7 @@ impl Editor {
     /// looking at, camera included. Overlay decorations (selection, captions)
     /// are excluded — this is the drawing, not the UI. The long edge is
     /// capped so the image stays a sane size for the model.
-    pub fn export_viewport_png(&self, scale: f64) -> Result<String, JsValue> {
+    pub fn export_viewport_png(&mut self, scale: f64) -> Result<String, JsValue> {
         if !scale.is_finite() || scale <= 0.0 {
             return Err(JsValue::from_str(
                 "viewport scale must be a positive, finite number",
@@ -650,17 +679,17 @@ impl Editor {
             .ok_or_else(|| JsValue::from_str("no 2d context"))?
             .dyn_into::<CanvasRenderingContext2d>()?;
 
-        let hidden = self
-            .presentation
-            .as_ref()
-            .map(|presentation| presentation.hidden.clone())
-            .unwrap_or_default();
+        let hidden = self.presentation.as_ref().map(|p| &p.hidden);
+        let hidden_active = hidden.is_some_and(|s| !s.is_empty());
         let mut renderer = Canvas2dRenderer::new(ctx);
         renderer.clear(BACKGROUND);
         renderer.set_transform(self.core.camera.transform().then(Affine::scale(scale)));
         let viewport = self.core.camera.viewport(css_w, css_h);
+        self.core.scene.flush_pending_ops();
+        self.core.ensure_area(viewport);
+        self.core.scene.flush_preview_stale(viewport);
         for layer in self.core.scene.visible(viewport) {
-            if hidden.contains(&layer.element_id) {
+            if hidden_active && hidden.unwrap().contains(&layer.element_id) {
                 continue;
             }
             renderer.draw_ops(&layer.ops);
@@ -824,15 +853,23 @@ impl Editor {
 
     /// Draw everything visible for this frame.
     pub fn render(&mut self) {
+        if self.core.camera.zoom < LOD_ZOOM {
+            self.render_lod();
+            return;
+        }
+        // Bulk drift defers cached-point shifts (bounds move eagerly); the
+        // first full-detail frame after a drift pays one flush. LOD frames
+        // never touch ops, so drift loops at overview zoom skip it entirely.
+        self.core.scene.flush_pending_ops();
         let (w, h) = self.core.viewport_size();
         let viewport = self.core.camera.viewport(w, h);
+        self.core.ensure_area(viewport);
+        self.core.scene.flush_preview_stale(viewport);
         // During playback, unrevealed elements stay off the canvas. The
         // document is final the whole time; this is view state only.
-        let hidden = self
-            .presentation
-            .as_ref()
-            .map(|presentation| presentation.hidden.clone())
-            .unwrap_or_default();
+        // Borrowed, never cloned: the old per-frame BTreeSet clone cost
+        // O(hidden) allocations on every frame even when idle.
+        let hidden = self.presentation.as_ref().map(|p| &p.hidden);
         let transform = self.core.camera.transform().then(Affine::scale(self.dpr));
         {
             let scene = &self.core.scene;
@@ -840,14 +877,145 @@ impl Editor {
             renderer.begin_frame();
             renderer.clear(BACKGROUND);
             renderer.set_transform(transform);
-            for layer in scene.visible(viewport) {
-                if hidden.contains(&layer.element_id) {
-                    continue;
+            // Contains-all fast path: the cached union makes the check O(1);
+            // overviews skip 100k per-layer intersection tests.
+            let all_visible = scene
+                .cached_bounds()
+                .is_some_and(|b| viewport_contains(&viewport, &b));
+            if all_visible {
+                match hidden {
+                    Some(set) if !set.is_empty() => {
+                        for layer in scene.all_layers() {
+                            if set.contains(&layer.element_id) {
+                                continue;
+                            }
+                            renderer.draw_ops(&layer.ops);
+                        }
+                    }
+                    _ => {
+                        for layer in scene.all_layers() {
+                            renderer.draw_ops(&layer.ops);
+                        }
+                    }
                 }
-                renderer.draw_ops(&layer.ops);
+            } else {
+                match hidden {
+                    Some(set) if !set.is_empty() => {
+                        for layer in scene.visible(viewport) {
+                            if set.contains(&layer.element_id) {
+                                continue;
+                            }
+                            renderer.draw_ops(&layer.ops);
+                        }
+                    }
+                    _ => {
+                        for layer in scene.visible(viewport) {
+                            renderer.draw_ops(&layer.ops);
+                        }
+                    }
+                }
             }
             renderer.end_frame();
         }
+        self.draw_overlay();
+        self.remember_view();
+    }
+
+    /// Zoomed-out overview: batched rects grouped by color, text skipped.
+    /// Same layout and palette as full rendering at a fraction of the
+    /// submission cost; zooming back in flushes the deferred drift once and
+    /// restores exact ink (full ops stay cached, bounds stay exact throughout).
+    fn render_lod(&mut self) {
+        let (w, h) = self.core.viewport_size();
+        let viewport = self.core.camera.viewport(w, h);
+        let hidden = self.presentation.as_ref().map(|p| &p.hidden);
+        let hidden_active = hidden.is_some_and(|s| !s.is_empty());
+        let transform = self.core.camera.transform().then(Affine::scale(self.dpr));
+        let renderer = &mut self.renderer;
+        renderer.begin_frame();
+        renderer.clear(BACKGROUND);
+        renderer.set_transform(transform);
+        // Collect the palette indices present in this view (a handful for
+        // diagram boards) so each color submits exactly one fill. Integer
+        // compares only — no per-frame string work. Two passes over layers,
+        // zero per-rect allocation.
+        let all_visible = self
+            .core
+            .scene
+            .cached_bounds()
+            .is_some_and(|b| viewport_contains(&viewport, &b));
+        // Pass 1: distinct palette indices, in first-seen (z) order.
+        let mut lod_present: Vec<u32> = Vec::new();
+        if all_visible {
+            for layer in self.core.scene.all_layers() {
+                let Some(idx) = layer.lod else {
+                    continue;
+                };
+                if hidden_active && hidden.unwrap().contains(&layer.element_id) {
+                    continue;
+                }
+                if !lod_present.contains(&idx) {
+                    lod_present.push(idx);
+                    if lod_present.len() >= 64 {
+                        break;
+                    }
+                }
+            }
+        } else {
+            for layer in self.core.scene.visible(viewport) {
+                let Some(idx) = layer.lod else {
+                    continue;
+                };
+                if hidden_active && hidden.unwrap().contains(&layer.element_id) {
+                    continue;
+                }
+                if !lod_present.contains(&idx) {
+                    lod_present.push(idx);
+                    if lod_present.len() >= 64 {
+                        break;
+                    }
+                }
+            }
+        }
+        // Pass 2: one path + fill per palette entry. `rect` calls stay in
+        // world space under the scene transform; sub-pixel boxes still paint
+        // a hairline so dense overviews read solid instead of sparkling.
+        // Palette strings are cloned once per color per frame (a handful of
+        // small allocs); rects stream with no allocation.
+        let palette: Vec<String> = self.core.scene.palette().to_vec();
+        for idx in &lod_present {
+            let Some(color) = palette.get(*idx as usize) else {
+                continue;
+            };
+            renderer.ctx.begin_path();
+            if all_visible {
+                for layer in self.core.scene.all_layers() {
+                    if layer.lod != Some(*idx) {
+                        continue;
+                    }
+                    if hidden_active && hidden.unwrap().contains(&layer.element_id) {
+                        continue;
+                    }
+                    let b = layer.bounds;
+                    renderer.ctx.rect(b.x, b.y, b.w.max(0.5), b.h.max(0.5));
+                }
+            } else {
+                for layer in self.core.scene.visible(viewport) {
+                    if layer.lod != Some(*idx) {
+                        continue;
+                    }
+                    if hidden_active && hidden.unwrap().contains(&layer.element_id) {
+                        continue;
+                    }
+                    let b = layer.bounds;
+                    renderer.ctx.rect(b.x, b.y, b.w.max(0.5), b.h.max(0.5));
+                }
+            }
+            renderer.ctx.set_fill_style_str(color);
+            renderer.ctx.set_global_alpha(1.0);
+            renderer.ctx.fill();
+        }
+        renderer.end_frame();
         self.draw_overlay();
         self.remember_view();
     }
@@ -1501,6 +1669,12 @@ impl Editor {
     /// Cost is proportional to the freshly exposed edge pixels, not to the
     /// number of visible elements.
     fn try_paint_pan_current(&mut self) -> bool {
+        // At overview zoom the LOD full render is cheaper than pixel-shifting
+        // plus per-strip full-detail repaints (which would also mismatch the
+        // LOD main image). Fall back to `render()` there.
+        if self.core.camera.zoom < LOD_ZOOM {
+            return false;
+        }
         let Some(from) = self.last_paint else {
             return false;
         };
@@ -1582,6 +1756,13 @@ impl Editor {
         self.renderer.clip_rects(&strips);
         self.renderer
             .set_transform(camera.transform().then(Affine::scale(self.dpr)));
+        // Non-LOD only (LOD pans fall back to render before reaching here):
+        // deferred drift points must be flushed so strips paint new positions.
+        self.core.scene.flush_pending_ops();
+        for strip in world.iter().copied() {
+            self.core.ensure_area(strip);
+            self.core.scene.flush_preview_stale(strip);
+        }
         for layer in self.core.scene.layers.iter() {
             if world.iter().any(|rect| layer.bounds.intersects(rect)) {
                 self.renderer.draw_ops(&layer.ops);
@@ -1610,6 +1791,17 @@ impl Editor {
             let can_pan = !effects.document_changed && effects.changed.is_empty();
             if !(can_pan && self.try_paint_pan_current()) {
                 self.render();
+            }
+        } else if effects.preview {
+            // Selection-drag preview: caches already shifted in place, so
+            // repaint the drained dirty regions without rebuilding layers or
+            // touching indexes. The release pass settles everything exactly.
+            let dirty = self.core.preview_dirty();
+            if !dirty.is_empty() {
+                self.paint_dirty(&dirty);
+            }
+            if effects.overlay_changed {
+                self.draw_overlay();
             }
         } else {
             if !effects.changed.is_empty() {
@@ -1650,6 +1842,12 @@ impl Editor {
     }
 
     fn paint_dirty(&mut self, dirty: &[Rect]) {
+        // At overview zoom a single LOD pass is cheaper and keeps the whole
+        // frame on the same detail level (no full-ink island in an LOD sea).
+        if self.core.camera.zoom < LOD_ZOOM {
+            self.render();
+            return;
+        }
         if let Some(from) = self.last_paint {
             if from.scroll != self.core.camera.scroll || from.zoom != self.core.camera.zoom {
                 // The canvas no longer corresponds to the snapshot; the next
@@ -1699,6 +1897,11 @@ impl Editor {
         self.renderer.clip_rects(&cleared);
         self.renderer
             .set_transform(self.core.camera.transform().then(Affine::scale(self.dpr)));
+        // Non-LOD only (LOD edits full-render before reaching here): flush
+        // deferred drift so repainted layers draw at new positions.
+        self.core.scene.flush_pending_ops();
+        self.core.ensure_area(union);
+        self.core.scene.flush_preview_stale(union);
         for layer in self.core.scene.layers.iter() {
             if !layer.bounds.intersects(&union) {
                 continue;
@@ -1956,6 +2159,15 @@ pub async fn delete_saved_workspace(workspace: String) -> Result<(), JsValue> {
 #[wasm_bindgen]
 pub fn glyph_catalog() -> String {
     serde_json::to_string(&canvas_core::glyph_catalog()).unwrap_or_else(|_| "[]".into())
+}
+
+/// Whether `outer` fully contains `inner`. Used for the renderer's
+/// contains-all fast path against the scene's cached union.
+fn viewport_contains(outer: &Rect, inner: &Rect) -> bool {
+    outer.x <= inner.x
+        && outer.y <= inner.y
+        && outer.max_x() >= inner.max_x()
+        && outer.max_y() >= inner.max_y()
 }
 
 /// Merge overlapping dirty rectangles so a repaint clears and redraws each

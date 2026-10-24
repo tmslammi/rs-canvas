@@ -537,6 +537,23 @@ async function boot() {
     updateCursor();
   });
 
+  // Pointer moves arrive faster than frames (up to hundreds per second);
+  // the core answers each in microseconds now, but every crossing still pays
+  // a wasm round trip plus cursor/overlay work. Coalesce to one forward per
+  // animation frame: only the latest position matters. Down/up stay immediate
+  // so clicks never wait a frame.
+  let pendingMove = null;
+  let moveScheduled = false;
+  const flushMove = () => {
+    moveScheduled = false;
+    if (!pendingMove) return;
+    const event = pendingMove;
+    pendingMove = null;
+    if (pinching) return;
+    editor.set_pressure(event.pressure);
+    editor.pointer_move(event.offsetX, event.offsetY, modifiers(event));
+    updateCursor();
+  };
   scene.addEventListener("pointermove", (event) => {
     if (activePointers.has(event.pointerId)) {
       activePointers.set(event.pointerId, { x: event.offsetX, y: event.offsetY });
@@ -554,9 +571,19 @@ async function boot() {
     // Wait until every finger has lifted after a pinch. The remaining finger
     // must not resume the drawing gesture that was cancelled on takeover.
     if (pinching) return;
-    editor.set_pressure(event.pressure);
-    editor.pointer_move(event.offsetX, event.offsetY, modifiers(event));
-    updateCursor();
+    pendingMove = {
+      pressure: event.pressure,
+      offsetX: event.offsetX,
+      offsetY: event.offsetY,
+      shiftKey: event.shiftKey,
+      altKey: event.altKey,
+      ctrlKey: event.ctrlKey,
+      metaKey: event.metaKey,
+    };
+    if (!moveScheduled) {
+      moveScheduled = true;
+      requestAnimationFrame(flushMove);
+    }
   });
 
   const endPointer = (event) => {

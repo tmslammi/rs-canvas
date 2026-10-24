@@ -38,6 +38,8 @@ declare global {
       snap_enabled(): boolean;
       route_for(id: string): Float64Array;
       wheel(x: number, y: number, dx: number, dy: number, ctrl: boolean): void;
+      render(): void;
+      benchmark_tick(dx: number, dy: number): void;
       presentation_state(): string;
       presentation_outcomes(): string;
     };

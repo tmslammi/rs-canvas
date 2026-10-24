@@ -72,18 +72,22 @@ async fn connected(mut socket: WebSocket, state: Arc<AppState>, workspace: Arc<W
     })
     .to_string();
 
-    // Hand the page the current mirror; it reconciles with its local
-    // document, so an autosave and the server copy never clobber each other.
-    let ready = if state.sync {
-        let snapshot = workspace.snapshot_frame().await;
-        socket.send(Message::Text(hello.into())).await.is_ok()
-            && socket.send(Message::Text(snapshot.into())).await.is_ok()
-    } else {
-        socket.send(Message::Text(hello.into())).await.is_ok()
-    };
+    // The page uploads its document first (every boot sends a snapshot);
+    // the server only sends its mirror back when the page actually needs
+    // it — an in-sync reload exchanges hello plus a small upload, never a
+    // full download. Previously every connect downloaded the whole mirror
+    // even when the page already held it (tens of MB on huge boards).
+    let ready = socket.send(Message::Text(hello.into())).await.is_ok();
 
     if ready {
         let mut page_sync = crate::state::PageSync::default();
+        // First upload not yet reconciled; a fallback timer below covers
+        // clients that connect without ever uploading.
+        let mut first_sync_pending = state.sync;
+        let fallback = tokio::time::sleep(std::time::Duration::from_secs(10));
+        tokio::pin!(fallback);
+        // Avoid an allocation per loop lap: only needed until first sync.
+        let mut fallback_armed = state.sync;
         loop {
             tokio::select! {
                 outgoing = to_pages.recv() => match outgoing {
@@ -122,10 +126,39 @@ async fn connected(mut socket: WebSocket, state: Arc<AppState>, workspace: Arc<W
                         if workspace.retired.load(Ordering::SeqCst) { break; }
                         if let Ok(frame) = serde_json::from_str::<Value>(&text) {
                             workspace.note_page_activity();
-                            handle_frame(&state, &workspace, &mut page_sync, id, &frame).await;
+                            let synced = handle_frame(&state, &workspace, &mut page_sync, id, &frame).await;
+                            if first_sync_pending {
+                                if let Some(mirror_leads) = synced {
+                                    first_sync_pending = false;
+                                    fallback_armed = false;
+                                    if mirror_leads {
+                                        // The page lacks live elements the
+                                        // server kept while it was away: the
+                                        // upload just merged in, so one
+                                        // snapshot covers both worlds. A
+                                        // converged page gets no download.
+                                        let snapshot = workspace.snapshot_frame().await;
+                                        if socket.send(Message::Text(snapshot.into())).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                     Some(Ok(_)) => {}
+                },
+                _ = &mut fallback, if fallback_armed => {
+                    // No upload arrived: fall back to the legacy eager
+                    // snapshot so old or quiet clients still converge.
+                    fallback_armed = false;
+                    first_sync_pending = false;
+                    if state.sync {
+                        let snapshot = workspace.snapshot_frame().await;
+                        if socket.send(Message::Text(snapshot.into())).await.is_err() {
+                            break;
+                        }
+                    }
                 },
             }
         }
@@ -140,36 +173,53 @@ async fn connected(mut socket: WebSocket, state: Arc<AppState>, workspace: Arc<W
 /// One incoming page frame. Patches merge per element; snapshots go through
 /// the full reconcile, with `PageSync` synthesizing tombstones for elements
 /// the page purged (undo of a creation).
+///
+/// Returns `Some(mirror_leads)` for snapshot frames — whether the mirror
+/// holds live elements the page's upload lacks — so the connection can skip
+/// the initial download when the page is already in sync; `None` for
+/// everything else.
 async fn handle_frame(
     state: &Arc<AppState>,
     workspace: &Arc<Workspace>,
     page_sync: &mut crate::state::PageSync,
     id: u64,
     frame: &Value,
-) {
+) -> Option<bool> {
     match frame.get("type").and_then(|value| value.as_str()) {
         Some("snapshot") => {
-            let Some(doc) = frame.get("doc") else {
-                return;
-            };
+            let doc = frame.get("doc")?;
             let Ok(mut incoming) = canvas_core::serialization::from_value(doc.clone()) else {
-                return;
+                return None;
             };
             // The page's doc as it actually is: purged elements are absent,
             // so diffing against the previous snapshot is what makes a
             // deletion expressible on the wire.
             let page_document = incoming.clone();
+            // Does the mirror hold any live element the page lacks? It does
+            // when the page left with content and the server carried on
+            // (agent edits with no page connected) — such a page must catch
+            // up with a download. An in-sync boot already holds everything
+            // and stays silent; deletions made while the page was away
+            // reach it through the patch-correction path instead.
+            let mirror_leads = {
+                let mirror = workspace.doc.lock().await;
+                mirror
+                    .elements
+                    .values()
+                    .filter(|element| !element.is_deleted)
+                    .any(|element| page_document.element(&element.id).is_none())
+            };
             page_sync.prepare(&mut incoming, now_ms());
-            workspace.absorb_document(&incoming).await;
+            workspace.absorb_document(&incoming, Some(id)).await;
             page_sync.commit(page_document);
+            Some(mirror_leads)
         }
         Some("patch") => {
-            let Some(put) = frame.get("put") else {
-                return;
-            };
+            let put = frame.get("put")?;
             if let Ok(elements) = serde_json::from_value::<Vec<Element>>(put.clone()) {
                 workspace.absorb_patch(elements, id).await;
             }
+            None
         }
         Some("present_done") => {
             if let Some(id) = frame.get("id").and_then(|v| v.as_u64()) {
@@ -179,6 +229,7 @@ async fn handle_frame(
                     .unwrap_or(false);
                 let _ = workspace.present_acks.send((id, cancelled));
             }
+            None
         }
         Some("screenshot_done") => {
             if let Some(id) = frame.get("id").and_then(|v| v.as_u64()) {
@@ -188,11 +239,13 @@ async fn handle_frame(
                     .map(str::to_string);
                 let _ = workspace.screenshot_replies.send((id, data_url));
             }
+            None
         }
         Some("hint") => {
             if let Ok(hint) = serde_json::from_value::<crate::state::ViewHint>(frame.clone()) {
                 *workspace.view_hint.lock().await = Some(hint);
             }
+            None
         }
         Some("settings") => {
             if let Some(patch) = frame.get("patch") {
@@ -200,7 +253,8 @@ async fn handle_frame(
                     tracing::warn!(%error, "rejected settings patch");
                 }
             }
+            None
         }
-        _ => {}
+        _ => None,
     }
 }

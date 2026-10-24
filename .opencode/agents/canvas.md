@@ -19,6 +19,11 @@ smallest useful sketch or revision, preserving existing work and element identit
    canvas_glyphs. After a stale-context error, reread before acting.
 2. Prefer one canvas_script batch, passing context and revision from the read.
    Use update beats to rename, move, resize, restyle or reconnect existing elements.
+   Scale rule: one element per draw/pen call, small boards per script (it caps
+   at 300 beats). Past that reach for canvas_bulk — explicit shapes/connects
+   for custom layouts (hundreds per call), or one parametric grid for regular
+   boards of any size (a 200k board fits in tens of tokens). Start big reads
+   with canvas_read summary mode, then scope into frames/selection.
    Draw alternative designs beside the original when asked to compare them. Use
    descriptive local aliases (e<number> is reserved), frame for ownership, and around
    to draw a frame that owns existing elements. Include captions/focus/point only

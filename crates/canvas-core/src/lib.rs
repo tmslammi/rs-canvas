@@ -4,6 +4,7 @@
 //! No browser dependencies; everything here is testable natively.
 
 pub mod benchmark;
+pub mod bulk;
 pub mod camera;
 pub mod connector;
 pub mod delta;
@@ -31,6 +32,7 @@ pub mod text;
 pub mod tool;
 
 pub use benchmark::benchmark_fixture;
+pub use bulk::{BulkStats, BulkStyle, GridSpec, KeyChain, LinkMode, ShapeCode, ShapeSpec};
 pub use camera::{Camera, CameraTween};
 pub use connector::{anchor_points, nearest_anchor, resolve_endpoint, route, AnchorSide};
 pub use delta::{Delta, EditError};
@@ -46,7 +48,9 @@ pub use editor::{
 pub use geometry::{Affine, Point, Rect};
 pub use glyphs::{catalog as glyph_catalog, lookup as glyph_lookup, GlyphCategory, GlyphInfo};
 pub use history::{History, Transaction};
-pub use hit::{elements_in_rect, hit_test};
+pub use hit::{
+    elements_in_rect, elements_in_rect_indexed, hit_test, hit_test_indexed, hit_test_raw_indexed,
+};
 pub use merge::reconcile;
 pub use model::{
     Binding, Document, Element, ElementId, ElementKind, Endpoint, FillPattern, Routing, ShapeKind,
@@ -55,6 +59,7 @@ pub use model::{
 pub use nav::NavigationState;
 pub use patch::{merge_element, Patch};
 pub use scene::{Scene, SceneLayer};
+pub use spatial::HitIndex;
 pub use spatial::ObstacleIndex;
 pub use text::{layout_text, ApproxMeasurer, TextLayout, TextMeasurer};
 pub use tool::Tool;

@@ -38,4 +38,4 @@ The Agent panel shows the note; persistence requires a workspace backed by a fil
 url = "http://127.0.0.1:5173/mcp"
 startup_timeout_sec = 30
 tool_timeout_sec = 120
-enabled_tools = ["canvas_status", "canvas_read", "canvas_screenshot", "canvas_focus", "canvas_point", "canvas_zoom", "canvas_glyphs", "canvas_draw", "canvas_pen", "canvas_script", "canvas_clear", "canvas_annotate", "canvas_emphasis", "canvas_tidy", "canvas_revert", "canvas_remember"]
+enabled_tools = ["canvas_status", "canvas_read", "canvas_screenshot", "canvas_focus", "canvas_point", "canvas_zoom", "canvas_glyphs", "canvas_draw", "canvas_pen", "canvas_script", "canvas_bulk", "canvas_clear", "canvas_annotate", "canvas_emphasis", "canvas_tidy", "canvas_revert", "canvas_remember"]

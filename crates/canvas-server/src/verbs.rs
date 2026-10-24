@@ -268,6 +268,23 @@ pub fn clear(doc: &mut Document, ids: &[String], now_ms: u64) -> Result<usize, S
         }
         doomed.push(id);
     }
+    // Connectors bound to doomed elements go with them: a bound arrow whose
+    // target is gone would otherwise linger on stale coordinates. Arrows can
+    // never be bind targets themselves, so one pass closes the set.
+    let attached: Vec<ElementId> = doc
+        .ordered_live()
+        .iter()
+        .filter(|element| {
+            !doomed.contains(&element.id)
+                && matches!(&element.kind, ElementKind::Arrow { start, end, .. }
+                    if start.binding.as_ref().is_some_and(|b| doomed.contains(&b.element_id))
+                        || end.binding.as_ref().is_some_and(|b| doomed.contains(&b.element_id)))
+        })
+        .map(|element| element.id.clone())
+        .collect();
+    for id in attached {
+        doomed.push(id);
+    }
     for id in &doomed {
         if let Some(element) = doc.element_mut(id) {
             element.is_deleted = true;
@@ -449,5 +466,44 @@ mod tests {
         let cleared = clear(&mut doc, std::slice::from_ref(&frame), 2).unwrap();
         assert_eq!(cleared, 2);
         assert!(doc.element(&child).unwrap().is_deleted);
+    }
+
+    #[test]
+    fn clearing_takes_arrows_bound_to_the_cleared() {
+        use canvas_core::model::{Binding, ElementKind, Endpoint, Routing, Style};
+        let mut doc = Document::new();
+        let shape = draw(&mut doc, "rectangle", None);
+        let other = draw(&mut doc, "rectangle", None);
+        let arrow = doc.add(
+            ElementKind::Arrow {
+                start: Endpoint {
+                    x: 0.0,
+                    y: 0.0,
+                    binding: Some(Binding {
+                        element_id: shape.clone(),
+                        focus: None,
+                    }),
+                },
+                end: Endpoint {
+                    x: 500.0,
+                    y: 0.0,
+                    binding: Some(Binding {
+                        element_id: other.clone(),
+                        focus: None,
+                    }),
+                },
+                routing: Routing::Elbow,
+                start_arrowhead: false,
+                end_arrowhead: true,
+                style: Style::default(),
+                waypoints: Vec::new(),
+                label_id: None,
+            },
+            2,
+        );
+        let cleared = clear(&mut doc, std::slice::from_ref(&shape), 3).unwrap();
+        assert_eq!(cleared, 2, "the shape and its bound arrow");
+        assert!(doc.element(&arrow).unwrap().is_deleted);
+        assert!(!doc.element(&other).unwrap().is_deleted);
     }
 }

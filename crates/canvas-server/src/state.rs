@@ -409,7 +409,9 @@ impl Workspace {
     /// Merge an already-parsed page document into the mirror. Returns whether
     /// the mirror changed. Connect-time path: the merged result is broadcast
     /// as a full snapshot, because the page may be missing server-side edits.
-    pub async fn absorb_document(&self, remote: &Document) -> bool {
+    /// `origin` excludes the uploading page from that broadcast: it already
+    /// holds the state it just sent.
+    pub async fn absorb_document(&self, remote: &Document, origin: Option<u64>) -> bool {
         let mut doc = self.doc.lock().await;
         let before = doc.clone();
         let merged = canvas_core::merge::reconcile(&doc, remote);
@@ -419,7 +421,7 @@ impl Workspace {
         *doc = merged;
         let (revision, _) = self.record_change(&before, &doc, "page").await;
         drop(doc);
-        self.broadcast_snapshot(revision).await;
+        self.broadcast_snapshot_except(revision, origin).await;
         true
     }
 
@@ -492,10 +494,15 @@ impl Workspace {
         self.schedule_persist().await;
     }
 
-    /// Broadcast the whole mirror (connect/resync path) and queue the persist.
-    pub async fn broadcast_snapshot(&self, revision: u64) {
+    /// Broadcast the whole mirror to every page but `except` (the uploader
+    /// already holds what it sent) and queue the persist.
+    pub async fn broadcast_snapshot_except(&self, revision: u64, except: Option<u64>) {
         let frame = self.snapshot_json(revision).await;
-        let _ = self.to_pages.send(PageMessage::all(frame));
+        let message = match except {
+            Some(id) => PageMessage::except(frame, id),
+            None => PageMessage::all(frame),
+        };
+        let _ = self.to_pages.send(message);
         self.schedule_persist().await;
     }
 
@@ -529,6 +536,14 @@ impl Workspace {
         }
         let revision = self.record_ids(changed, source).await;
         (revision, put)
+    }
+
+    /// Record an additions-only bulk commit: bump the revision and change log
+    /// without per-element receipt work. Bulk boards skip the revert history
+    /// (which would retain every element); wrap them in a frame to remove
+    /// them later with one clear.
+    pub async fn record_bulk(&self, changed: Vec<String>) -> u64 {
+        self.record_ids(changed, "agent").await
     }
 
     /// Record a change by the ids it touched.

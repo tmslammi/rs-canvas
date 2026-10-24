@@ -196,6 +196,9 @@ mod tests {
         obstacles.rebuild(&doc);
         scene.rebuild_all(&doc, &ApproxMeasurer, &obstacles);
         assert_eq!(scene.layers.len(), live.len());
+        // Ops build on demand: ensure the whole board, then check.
+        let everywhere = crate::geometry::Rect::new(-1e9, -1e9, 2e9, 2e9);
+        scene.ensure_area(&doc, everywhere, &ApproxMeasurer, &obstacles);
         for layer in &scene.layers {
             assert!(
                 !layer.ops.is_empty(),

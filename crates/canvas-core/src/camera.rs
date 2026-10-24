@@ -20,7 +20,10 @@ impl Default for Camera {
 }
 
 impl Camera {
-    pub const MIN_ZOOM: f64 = 0.1;
+    /// Minimum zoom: 0.005 shows a ~70k-unit board in an 800px viewport, so
+    /// 100k-element overviews stay reachable. Grid doubling and the LOD fast
+    /// path keep tiny zooms cheap; text below legibility is skipped at LOD.
+    pub const MIN_ZOOM: f64 = 0.005;
     pub const MAX_ZOOM: f64 = 8.0;
 
     pub fn transform(&self) -> Affine {

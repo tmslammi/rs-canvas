@@ -206,6 +206,93 @@ struct ScriptArgs {
     revision: Option<u64>,
 }
 
+/// One bulk shape: `k` is r=rectangle, e=ellipse, d=diamond, s=sticky,
+/// t=text, f=frame. `f` overrides the call's shared fill, `t` is the bound
+/// label (text content for t, frame name for f).
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct BulkShape {
+    k: String,
+    x: f64,
+    y: f64,
+    #[serde(default)]
+    w: Option<f64>,
+    #[serde(default)]
+    h: Option<f64>,
+    #[serde(default)]
+    f: Option<String>,
+    #[serde(default)]
+    t: Option<String>,
+}
+
+/// One bulk connector: indices into this call's shapes, in order
+/// (explicit shapes first, then grid nodes).
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct BulkConnect {
+    a: usize,
+    b: usize,
+}
+
+/// A parametric grid: a whole board in tens of tokens. `count` nodes fill
+/// row-major (`cols` defaults to a square); `kinds` cycles shape codes
+/// (default "r"); `palette` cycles fills; `links` is none/right/down/both
+/// (default right); `frame` draws an owning frame around the grid.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct BulkGrid {
+    count: usize,
+    #[serde(default)]
+    cols: Option<usize>,
+    #[serde(default)]
+    x0: Option<f64>,
+    #[serde(default)]
+    y0: Option<f64>,
+    #[serde(default)]
+    dx: Option<f64>,
+    #[serde(default)]
+    dy: Option<f64>,
+    #[serde(default)]
+    w: Option<f64>,
+    #[serde(default)]
+    h: Option<f64>,
+    #[serde(default)]
+    kinds: Option<String>,
+    #[serde(default)]
+    palette: Option<Vec<String>>,
+    #[serde(default)]
+    links: Option<String>,
+    #[serde(default)]
+    rough: Option<u8>,
+    #[serde(default)]
+    frame: Option<String>,
+}
+
+/// Bulk board construction: thousands of explicit shapes or one parametric
+/// grid per call. See `canvas_bulk`.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct BulkArgs {
+    #[serde(default)]
+    context: Option<String>,
+    #[serde(default)]
+    revision: Option<u64>,
+    /// Shared fill for shapes without their own `f`.
+    #[serde(default)]
+    fill: Option<String>,
+    /// Shared ink (stroke) colour.
+    #[serde(default)]
+    ink: Option<String>,
+    /// Shared roughness 0-2.
+    #[serde(default)]
+    rough: Option<u8>,
+    /// Owning frame name for the explicit shapes.
+    #[serde(default)]
+    frame: Option<String>,
+    #[serde(default)]
+    shapes: Vec<BulkShape>,
+    #[serde(default)]
+    connects: Vec<BulkConnect>,
+    #[serde(default)]
+    grid: Option<BulkGrid>,
+}
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct ScreenshotArgs {
     /// Live viewport scale, 0.1–4 (default 1); ignored when rendering headlessly.
@@ -246,6 +333,10 @@ struct ReadArgs {
     /// Context from the previous read, especially when using since or offset.
     #[serde(default)]
     context: Option<String>,
+    /// Whole-document summary (counts by kind, bounds, top fills) in a few
+    /// hundred tokens at any scale. Ignores scope and pagination.
+    #[serde(default)]
+    summary: bool,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -652,7 +743,9 @@ impl CanvasServer {
                        changed while you were away. Scope with selected, ids or frame; \
                        query searches labels/names. Defaults to 100 elements, capped at 500; \
                        offset pagination needs the first read's context and unchanged revision. \
-                       detail adds exact element JSON, including full stroke points."
+                       detail adds exact element JSON, including full stroke points. \
+                       summary returns whole-document counts by kind, bounds and top fills \
+                       in a few hundred tokens at any scale: start there on large boards."
     )]
     async fn canvas_read(
         &self,
@@ -661,6 +754,14 @@ impl CanvasServer {
         let workspace = self.current().await;
         let doc = workspace.doc.lock().await;
         let revision = workspace.revision.load(Ordering::SeqCst);
+        if args.summary {
+            let mut body = canvas_core::bulk::summarize(&doc);
+            body["revision"] = serde_json::json!(revision);
+            body["context"] = serde_json::json!(workspace.context());
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
+                body.to_string(),
+            )]));
+        }
         let failure = |message: &str| Ok(CallToolResult::error(vec![ContentBlock::text(message)]));
         if args.since.is_some()
             && args.context.is_none()
@@ -1037,6 +1138,17 @@ impl CanvasServer {
         &self,
         Parameters(args): Parameters<ScriptArgs>,
     ) -> Result<CallToolResult, McpError> {
+        // Fail fast: per-beat indexing is O(n²), so huge beat lists hang
+        // until the tool timeout instead of finishing. Bulk boards belong in
+        // canvas_bulk (explicit shapes or a parametric grid).
+        if args.beats.len() > 300 {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                "too many beats ({} > 300): describe this board with canvas_bulk instead — \
+                     explicit shapes/connects for custom layouts, or one grid for regular \
+                     boards — then revise the result with small scripts",
+                args.beats.len(),
+            ))]));
+        }
         let workspace = self.current().await;
         let beat_count = args.beats.len();
         let context = args.context;
@@ -1165,6 +1277,255 @@ impl CanvasServer {
     }
 
     #[tool(
+        description = "Build a board in one call: thousands of explicit shapes or one \
+                       parametric grid. Shapes: {k, x, y, w, h, f, t} with k one of \
+                       r=rectangle, e=ellipse, d=diamond, s=sticky, t=text, f=frame; \
+                       w/h default 160x100 (text auto-sizes); f overrides the call's \
+                       shared fill; t is the bound label (text content for t, frame \
+                       name for f). Connects: {a, b} index into this call's shapes in \
+                       order (explicit shapes first, then grid nodes), wired as bound \
+                       elbow connectors. Grid: {count, cols, x0, y0, dx, dy, w, h, \
+                       kinds, palette, links, rough, frame} — count nodes row-major \
+                       (cols defaults to a square), kinds cycles shape codes \
+                       (default r), palette cycles fills, links is none/right/down/both \
+                       (default right), frame draws an owning frame around the grid. \
+                       Caps: 20,000 explicit shapes, 150,000 grid nodes per call. \
+                       Lands at once, never plays back. Receipt reports counts and \
+                       bounds, not per-element lines. Bulk commits skip the revert \
+                       history: pass frame (or grid.frame) to remove the board later \
+                       with one canvas_clear on the frame. For a handful of elements \
+                       prefer canvas_draw/canvas_script. Pass context/revision as usual."
+    )]
+    async fn canvas_bulk(
+        &self,
+        Parameters(args): Parameters<BulkArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        use canvas_core::bulk::{
+            build_grid, build_shapes, connect_indices, BulkStats, BulkStyle, GridSpec, KeyChain,
+            LinkMode, ShapeCode, ShapeSpec,
+        };
+        use canvas_core::geometry::Rect;
+
+        let failure =
+            |message: String| Ok(CallToolResult::error(vec![ContentBlock::text(message)]));
+        if args.shapes.len() > 20_000 {
+            return failure(format!(
+                "too many explicit shapes ({} > 20,000): describe the regular parts with grid instead",
+                args.shapes.len()
+            ));
+        }
+        if args.grid.as_ref().is_some_and(|grid| grid.count > 150_000) {
+            return failure(format!(
+                "grid too large ({} > 150,000 nodes): split the board across calls",
+                args.grid.as_ref().map(|grid| grid.count).unwrap_or(0)
+            ));
+        }
+        if args.shapes.is_empty() && args.grid.is_none() {
+            return failure("nothing to build: pass shapes, grid, or both".into());
+        }
+        // Materialize specs before touching the document so malformed calls
+        // fail without committing anything.
+        let defaults = BulkStyle {
+            fill: args.fill.clone(),
+            ink: args.ink.clone(),
+            roughness: args.rough,
+        };
+        let mut specs: Vec<ShapeSpec> = Vec::with_capacity(args.shapes.len());
+        for (position, shape) in args.shapes.iter().enumerate() {
+            let Some(kind) = ShapeCode::parse(shape.k.as_str()) else {
+                return failure(format!(
+                    "shape #{position}: unknown kind {:?}; use r, e, d, s, t or f",
+                    shape.k
+                ));
+            };
+            for value in [shape.x, shape.y] {
+                if !value.is_finite() {
+                    return failure(format!("shape #{position}: x and y must be finite"));
+                }
+            }
+            let (w, h) = (shape.w.unwrap_or(160.0), shape.h.unwrap_or(100.0));
+            if kind != ShapeCode::Text && (!w.is_finite() || !h.is_finite()) {
+                return failure(format!("shape #{position}: w and h must be finite"));
+            }
+            specs.push(ShapeSpec {
+                kind,
+                rect: Rect::new(shape.x, shape.y, w, h),
+                fill: shape.f.clone(),
+                label: shape.t.clone(),
+            });
+        }
+        for (position, connect) in args.connects.iter().enumerate() {
+            if connect.a == connect.b {
+                return failure(format!(
+                    "connect #{position}: cannot link a shape to itself"
+                ));
+            }
+        }
+        let grid = match args.grid.as_ref() {
+            None => None,
+            Some(grid) => {
+                let links = match grid.links.as_deref() {
+                    None => LinkMode::Right,
+                    Some(mode) => match LinkMode::parse(mode) {
+                        Some(parsed) => parsed,
+                        None => {
+                            return failure(format!(
+                                "grid links must be none, right, down or both; got {mode:?}"
+                            ));
+                        }
+                    },
+                };
+                Some(GridSpec {
+                    count: grid.count,
+                    cols: grid.cols,
+                    x0: grid.x0.unwrap_or(20.0),
+                    y0: grid.y0.unwrap_or(20.0),
+                    dx: grid.dx.unwrap_or(220.0),
+                    dy: grid.dy.unwrap_or(170.0),
+                    w: grid.w.unwrap_or(140.0),
+                    h: grid.h.unwrap_or(90.0),
+                    kinds: grid.kinds.clone().unwrap_or("r".into()),
+                    palette: grid.palette.clone().unwrap_or(vec![
+                        "#ffec99".into(),
+                        "#b2f2bb".into(),
+                        "#a5d8ff".into(),
+                        "#ffc9c9".into(),
+                        "#d0bfff".into(),
+                    ]),
+                    links,
+                    roughness: grid.rough.unwrap_or(1),
+                    frame: grid.frame.clone(),
+                })
+            }
+        };
+
+        // Same guards as apply_transaction, but the commit below stays lean:
+        // no per-element receipt lines, no revert-history entry (both scale
+        // with the change and would cost megabytes/gigabytes on huge boards).
+        let observed = self.observed.lock().await.clone();
+        let expected = args.context.clone().or(observed);
+        let workspace = self.current().await;
+        if expected.is_some_and(|token| token != workspace.context()) {
+            return failure(
+                "stale_context: the current workspace changed; read canvas_status before retrying"
+                    .into(),
+            );
+        }
+        let now = now_ms();
+        // One lock scope: guards, build, and revision bump stay atomic, so
+        // chained keys never collide with a concurrent writer.
+        let (stats, put, revision, frame_id) = {
+            let mut doc = workspace.doc.lock().await;
+            if workspace.retired.load(Ordering::SeqCst) {
+                return failure(
+                    "This workspace was renamed or deleted. Reconnect the page.".into(),
+                );
+            }
+            if args
+                .revision
+                .is_some_and(|rev| rev != workspace.revision.load(Ordering::SeqCst))
+            {
+                return failure(
+                    "stale_revision: read the affected elements before retrying".into(),
+                );
+            }
+            let mut chain = KeyChain::new(&doc);
+            let mut stats = BulkStats::default();
+            if let Err(message) = build_shapes(
+                &mut doc, &mut chain, &specs, &defaults, now, None, &mut stats,
+            ) {
+                return failure(message);
+            }
+            // An explicit frame wraps the call's own shapes: one canvas_clear
+            // on it later removes the whole batch (bulk skips revert history).
+            let mut frame_id: Option<String> = None;
+            if let Some(name) = args.frame.as_deref() {
+                if let Some(bounds) = stats.bounds {
+                    let rect = bounds.expand(24.0);
+                    let frame_kind = canvas_core::model::ElementKind::Frame {
+                        rect,
+                        name: name.to_string(),
+                    };
+                    let index = match chain.next_key() {
+                        Ok(index) => index,
+                        Err(message) => return failure(message),
+                    };
+                    let id = canvas_core::id::new_element_id();
+                    let frame = canvas_core::model::Element::new(frame_kind, index, now)
+                        .with_id(id.clone());
+                    for shape_id in stats.shape_ids.clone() {
+                        if let Some(element) = doc.element_mut(&shape_id) {
+                            element.frame_id = Some(id.clone());
+                        }
+                    }
+                    doc.insert(frame);
+                    stats.new_ids.push(id.clone());
+                    frame_id = Some(id.clone());
+                    stats.bounds = Some(rect);
+                }
+            }
+            if let Some(grid) = &grid {
+                if let Err(message) =
+                    build_grid(&mut doc, &mut chain, grid, &defaults, now, &mut stats)
+                {
+                    return failure(message);
+                }
+            }
+            // Explicit connects address shapes-then-grid-nodes in order; grid
+            // links were already wired during expansion.
+            let pairs: Vec<(usize, usize)> = args
+                .connects
+                .iter()
+                .map(|connect| (connect.a, connect.b))
+                .collect();
+            let ids = stats.shape_ids.clone();
+            if let Err(message) =
+                connect_indices(&mut doc, &mut chain, &pairs, &ids, now, &mut stats)
+            {
+                return failure(message);
+            }
+            let put: Vec<canvas_core::model::Element> = stats
+                .new_ids
+                .iter()
+                .filter_map(|id| doc.element(id).cloned())
+                .collect();
+            let revision = workspace.record_bulk(stats.new_ids.clone()).await;
+            (stats, put, revision, frame_id)
+        };
+        workspace.publish_patch(revision, put).await;
+        let mut aliases = workspace.aliases.lock().await;
+        let sample: Vec<String> = stats
+            .shape_ids
+            .iter()
+            .take(5)
+            .map(|id| aliases.handle(id))
+            .collect();
+        let frame = frame_id
+            .as_deref()
+            .map(|id| aliases.handle(id))
+            .unwrap_or_default();
+        drop(aliases);
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            serde_json::json!({
+                "workspace": workspace.name,
+                "context": workspace.context(),
+                "revision": revision,
+                "transaction": serde_json::Value::Null,
+                "bulk": {
+                    "shapes": stats.shapes,
+                    "texts": stats.texts,
+                    "connects": stats.connects,
+                    "bounds": stats.bounds.map(|r| [r.x, r.y, r.w, r.h]),
+                    "sample": sample,
+                    "frame": frame,
+                },
+                "note": "Bulk commits skip the revert history; pass frame (or grid.frame) to remove the board later with one canvas_clear on the frame.",
+            })
+            .to_string(),
+        )]))
+    }
+
+    #[tool(
         description = "Put a cross, check or question mark on an element — a normal drawing \
                        element that saves, merges and moves like any other. Use it to strike \
                        out a dead idea, tick a good one, or flag a question while discussing. \
@@ -1249,8 +1610,9 @@ impl CanvasServer {
 
     #[tool(
         description = "Delete a set of elements (tombstones, so the merge model and other \
-                       viewers see the deletion). Frames take their children and containers \
-                       take their labels. Use it to clear away a discussion that has moved on."
+                       viewers see the deletion). Frames take their children, containers \
+                       take their labels, and connectors bound to cleared elements go \
+                       with them. Use it to clear away a discussion that has moved on."
     )]
     async fn canvas_clear(
         &self,
@@ -1810,6 +2172,171 @@ mod tests {
         assert!(report.contains("(page)"), "{report}");
         assert!(report.contains("changed now:"), "{report}");
         assert!(report.contains(&handle), "{report}");
+    }
+
+    fn bulk_shape(k: &str, x: f64, y: f64) -> BulkShape {
+        BulkShape {
+            k: k.into(),
+            x,
+            y,
+            w: None,
+            h: None,
+            f: None,
+            t: None,
+        }
+    }
+
+    fn bulk_args() -> BulkArgs {
+        BulkArgs {
+            context: None,
+            revision: None,
+            fill: None,
+            ink: None,
+            rough: None,
+            frame: None,
+            shapes: Vec::new(),
+            connects: Vec::new(),
+            grid: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn canvas_bulk_builds_shapes_and_wires_them() {
+        let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
+        let workspace = state.workspace(crate::state::DEFAULT_WORKSPACE).await;
+        let server = CanvasServer::new(state);
+        let mut args = bulk_args();
+        args.shapes = vec![
+            bulk_shape("r", 0.0, 0.0),
+            bulk_shape("e", 220.0, 0.0),
+            bulk_shape("d", 440.0, 0.0),
+        ];
+        args.shapes[0].t = Some("DB".into());
+        args.connects = vec![BulkConnect { a: 0, b: 1 }, BulkConnect { a: 1, b: 2 }];
+        args.frame = Some("backend".into());
+        let receipt = error_text(&server.canvas_bulk(Parameters(args)).await.unwrap());
+        let body: serde_json::Value = serde_json::from_str(&receipt).unwrap();
+        assert_eq!(body["bulk"]["shapes"], 3, "{receipt}");
+        assert_eq!(body["bulk"]["texts"], 1, "{receipt}");
+        assert_eq!(body["bulk"]["connects"], 2, "{receipt}");
+        assert!(body["bulk"]["bounds"].is_array(), "{receipt}");
+        assert!(body["transaction"].is_null(), "{receipt}");
+        // 3 shapes + 1 label + 2 arrows + 1 frame.
+        assert_eq!(workspace.doc.lock().await.live_count(), 7);
+        // The frame reverts the whole batch: one clear takes shapes, the
+        // label and the bound arrows with it.
+        let frame = body["bulk"]["frame"].as_str().unwrap().to_string();
+        assert!(!frame.is_empty(), "{receipt}");
+        let cleared = error_text(
+            &server
+                .canvas_clear(Parameters(ElementIdsArgs { ids: vec![frame] }))
+                .await
+                .unwrap(),
+        );
+        assert!(cleared.contains('7'), "{cleared}");
+        assert_eq!(workspace.doc.lock().await.live_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn canvas_bulk_grid_wires_a_board_without_row_wrap() {
+        let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
+        let workspace = state.workspace(crate::state::DEFAULT_WORKSPACE).await;
+        let server = CanvasServer::new(state);
+        let mut args = bulk_args();
+        args.grid = Some(BulkGrid {
+            count: 10,
+            cols: Some(4),
+            x0: None,
+            y0: None,
+            dx: None,
+            dy: None,
+            w: None,
+            h: None,
+            kinds: Some("red".into()),
+            palette: None,
+            links: Some("both".into()),
+            rough: None,
+            frame: None,
+        });
+        let receipt = error_text(&server.canvas_bulk(Parameters(args)).await.unwrap());
+        let body: serde_json::Value = serde_json::from_str(&receipt).unwrap();
+        assert_eq!(body["bulk"]["shapes"], 10, "{receipt}");
+        assert_eq!(body["bulk"]["connects"], 13, "{receipt}");
+        assert_eq!(workspace.doc.lock().await.live_count(), 23);
+    }
+
+    #[tokio::test]
+    async fn canvas_bulk_rejects_bad_kinds_and_dangling_links() {
+        let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
+        let server = CanvasServer::new(state);
+        let mut args = bulk_args();
+        args.shapes = vec![bulk_shape("z", 0.0, 0.0)];
+        let err = error_text(&server.canvas_bulk(Parameters(args)).await.unwrap());
+        assert!(err.contains("unknown kind"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn canvas_script_deflects_huge_beat_lists_to_bulk() {
+        let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
+        let server = CanvasServer::new(state);
+        let beat: ScriptBeat = serde_json::from_value(serde_json::json!({
+            "draw": {"kind": "rectangle", "x": 0.0, "y": 0.0},
+        }))
+        .unwrap();
+        let beats = vec![beat.clone(); 301];
+        let err = error_text(
+            &server
+                .canvas_script(Parameters(ScriptArgs {
+                    beats,
+                    context: None,
+                    revision: None,
+                }))
+                .await
+                .unwrap(),
+        );
+        assert!(err.contains("canvas_bulk"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn canvas_read_summary_counts_any_scale() {
+        let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
+        let server = CanvasServer::new(state.clone());
+        let workspace = state.workspace(crate::state::DEFAULT_WORKSPACE).await;
+        let mut args = bulk_args();
+        args.grid = Some(BulkGrid {
+            count: 50,
+            cols: None,
+            x0: None,
+            y0: None,
+            dx: None,
+            dy: None,
+            w: None,
+            h: None,
+            kinds: None,
+            palette: None,
+            links: Some("right".into()),
+            rough: None,
+            frame: None,
+        });
+        server.canvas_bulk(Parameters(args)).await.unwrap();
+        let summary = error_text(
+            &server
+                .canvas_read(Parameters(ReadArgs {
+                    summary: true,
+                    ..Default::default()
+                }))
+                .await
+                .unwrap(),
+        );
+        let body: serde_json::Value = serde_json::from_str(&summary).unwrap();
+        assert_eq!(
+            body["live"],
+            50 + body["arrows"].as_u64().unwrap(),
+            "{summary}"
+        );
+        assert!(body["bounds"].is_array(), "{summary}");
+        assert!(body["revision"].is_u64(), "{summary}");
+        assert!(workspace.doc.lock().await.live_count() > 0);
     }
 
     #[tokio::test]

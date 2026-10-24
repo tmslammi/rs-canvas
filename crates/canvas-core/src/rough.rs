@@ -613,6 +613,67 @@ fn batch(segments: Vec<[Point; 2]>, style: &Style) -> Vec<DrawOp> {
     }]
 }
 
+/// Transient drag preview for an attached arrow: one straight geometric
+/// segment plus head, no routing, no rough passes, no text measuring. The
+/// release pass rebuilds the exact routed ops; this only has to look
+/// attached while the pointer moves.
+pub fn rubber_band_ops(start: Point, end: Point, style: &Style) -> (Vec<DrawOp>, Rect) {
+    let mut ops = vec![DrawOp::Path(PathOp {
+        points: vec![start, end],
+        closed: false,
+        stroke: Some(stroke_of(style, style.stroke_width)),
+        fill: None,
+    })];
+    ops.push(head_op(end, start, style));
+    let bounds = rubber_band_bounds(start, end, style.stroke_width);
+    (ops, bounds)
+}
+
+/// The head op for a rubber band: a real head, or a degenerate triple that
+/// draws nothing, so the op shape stays stable for in-place refresh.
+fn head_op(tip: Point, from: Point, style: &Style) -> DrawOp {
+    let mut head = connector::arrowhead(tip, from, style.stroke_width);
+    if head.len() < 3 {
+        head = vec![tip, tip, tip];
+    }
+    DrawOp::Path(PathOp {
+        points: head,
+        closed: true,
+        stroke: None,
+        fill: Some(FillStyle::Solid {
+            color: style.stroke_color.clone(),
+            opacity: style.opacity,
+        }),
+    })
+}
+
+/// Refresh preview ops in place: same op shape, new points, zero allocation
+/// past the first build (point buffers are reused).
+pub fn rubber_band_refresh(ops: &mut [DrawOp], start: Point, end: Point, width: f64) {
+    let mut it = ops.iter_mut();
+    if let Some(DrawOp::Path(seg)) = it.next() {
+        seg.points.clear();
+        seg.points.push(start);
+        seg.points.push(end);
+    }
+    if let Some(DrawOp::Path(head)) = it.next() {
+        let fresh = connector::arrowhead(end, start, width);
+        head.points.clear();
+        if fresh.len() >= 3 {
+            head.points.extend(fresh);
+        } else {
+            head.points.push(end);
+            head.points.push(end);
+            head.points.push(end);
+        }
+    }
+}
+
+/// Bounds for a rubber band without touching its ops.
+pub fn rubber_band_bounds(start: Point, end: Point, width: f64) -> Rect {
+    Rect::from_points(start, end).expand(width + 12.0)
+}
+
 /// Build the drawing instructions for one element.
 pub fn build_element_ops(
     element: &Element,

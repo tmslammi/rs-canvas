@@ -4,14 +4,14 @@
 //! selection. Everything here is browser-free; the wasm façade only forwards
 //! input and paints the effects.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::camera::Camera;
 use crate::connector;
 use crate::delta::Delta;
 use crate::geometry::{Point, Rect};
 use crate::history::{History, Transaction};
-use crate::hit::{elements_in_rect, hit_test, hit_test_raw};
+use crate::hit::{elements_in_rect_indexed, hit_test_indexed, hit_test_raw_indexed};
 use crate::id::{new_element_id, new_version_nonce};
 use crate::model::{
     Binding, Document, Element, ElementId, ElementKind, Endpoint, Routing, ShapeKind, Style,
@@ -19,7 +19,7 @@ use crate::model::{
 };
 use crate::nav::NavigationState;
 use crate::scene::Scene;
-use crate::spatial::ObstacleIndex;
+use crate::spatial::{HitIndex, ObstacleIndex};
 use crate::text::{layout_text, ApproxMeasurer, TextMeasurer};
 use crate::tool::Tool;
 
@@ -57,6 +57,10 @@ pub struct Effects {
     /// The document itself changed, as opposed to only the camera: this is
     /// what makes an autosave due. Camera pans repaint without saving.
     pub document_changed: bool,
+    /// Mid-gesture preview (selection drags): caches already shifted, so the
+    /// shell must repaint dirty regions WITHOUT rebuilding layers, and must
+    /// skip obstacle/hit maintenance until release. Never persisted.
+    pub preview: bool,
     /// Shell actions to dispatch (text editor, later: dialogs).
     pub actions: Vec<ShellAction>,
 }
@@ -76,6 +80,7 @@ impl Effects {
         self.repaint_all |= other.repaint_all;
         self.overlay_changed |= other.overlay_changed;
         self.document_changed |= other.document_changed;
+        self.preview |= other.preview;
         self.actions.extend(other.actions);
     }
 }
@@ -235,6 +240,25 @@ enum WaypointDrag {
     },
 }
 
+/// Attached (non-selected) arrow preview state, computed once when a move
+/// gesture starts. Ends bound to selected targets advance arithmetically
+/// with the drag (uniform translation never flips the anchor side); other
+/// ends freeze. The document is untouched until release.
+#[derive(Clone, Debug, PartialEq)]
+struct AttachedDrag {
+    id: ElementId,
+    a: Point,
+    b: Point,
+    a_follows: bool,
+    b_follows: bool,
+    style: Style,
+    /// Pre-gesture element for the release undo step.
+    pre: Element,
+    /// Whether this arrow's rubber band is installed (later moves refresh
+    /// the layer's points in place instead of rebuilding).
+    built: bool,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 enum Interaction {
     #[default]
@@ -249,9 +273,8 @@ enum Interaction {
     Moving {
         start: Point,
         originals: Vec<Element>,
-        /// Arrows whose endpoints must re-resolve as the drag proceeds,
-        /// found once when the gesture starts so each move stays O(1) in the
-        /// document size.
+        /// Arrows bound to moved elements but not moved themselves: stretched
+        /// by the drag, rubber-banded per move, re-routed on release.
         arrow_ids: Vec<ElementId>,
         /// True when the drag began on empty space inside the selection's
         /// bounding box: a click with no movement then clears the selection
@@ -310,6 +333,9 @@ pub struct Editor {
     pub scene: Scene,
     /// Spatial index of routing obstacles, kept in sync with `doc`.
     pub obstacles: ObstacleIndex,
+    /// Packed hit-test index over all live elements: hover, click and marquee
+    /// must never scan the document per pointer event.
+    pub hit: HitIndex,
     pub history: History,
     pub nav: NavigationState,
     pub tool: Tool,
@@ -322,6 +348,30 @@ pub struct Editor {
     /// World-space grid spacing (the snap step when snapping is enabled).
     pub grid_size: f64,
     pub selection: BTreeSet<ElementId>,
+    /// Cached selection bounds: shifted (not recomputed) on preview moves,
+    /// cleared on any selection or structural change. Overlay reads this per
+    /// frame during drags; recomputing over thousands of elements per move
+    /// is what made big drags stutter the marching ants.
+    selection_bounds_cache: Option<Rect>,
+    /// Total snapped drag delta already previewed (see `Interaction::Moving`):
+    /// preview moves translate incrementally, clone-free. Reset whenever a
+    /// move gesture starts.
+    drag_applied: Point,
+    /// Scene-layer slots of the dragged selection, resolved once when the
+    /// gesture starts (no structural edits mid-drag, so they stay valid).
+    /// Lets every preview move shift caches without per-id map lookups.
+    drag_slots: Vec<u32>,
+    /// Contiguous preview truth for the in-flight drag: translated in place
+    /// every move (no clones, no map lookups), written back to the document
+    /// once on release, dropped on cancel. The document is never touched
+    /// mid-gesture, so cancel needs no restore.
+    drag_working: Vec<Element>,
+    /// Selected-arrow endpoints frozen to static anchors:
+    /// (working index, start freeze, end freeze). Ends bound to selected
+    /// targets ride the drag rigidly and need no entry.
+    drag_frozen: Vec<(usize, Option<Point>, Option<Point>)>,
+    /// Attached-arrow preview state for the in-flight drag.
+    drag_attached: Vec<AttachedDrag>,
     interaction: Interaction,
     tx: Option<Transaction>,
     marquee_current: Option<Point>,
@@ -344,6 +394,7 @@ impl Editor {
             camera: Camera::default(),
             scene: Scene::new(),
             obstacles: ObstacleIndex::new(),
+            hit: HitIndex::new(),
             history: History::new(),
             nav: NavigationState::new(),
             tool: Tool::default(),
@@ -353,6 +404,12 @@ impl Editor {
             snap_to_grid: false,
             grid_size: GRID_SIZE,
             selection: BTreeSet::new(),
+            selection_bounds_cache: None,
+            drag_applied: Point::ZERO,
+            drag_slots: Vec::new(),
+            drag_working: Vec::new(),
+            drag_frozen: Vec::new(),
+            drag_attached: Vec::new(),
             interaction: Interaction::Idle,
             tx: None,
             marquee_current: None,
@@ -460,7 +517,11 @@ impl Editor {
 
     /// Rebuild the whole scene cache.
     pub fn refresh_scene(&mut self) -> Vec<Rect> {
-        self.obstacles.rebuild(&self.doc);
+        // Loading skips the obstacle build (tens of ms plus megabytes on huge
+        // documents); the first edit or route that needs it builds once.
+        self.obstacles.invalidate();
+        self.hit.rebuild(&self.doc);
+        self.selection_bounds_cache = None;
         self.scene
             .rebuild_all(&self.doc, self.measurer.as_ref(), &self.obstacles)
     }
@@ -468,8 +529,58 @@ impl Editor {
     /// Rebuild the changed elements' layers, returning dirty world rects.
     pub fn rebuild_changed(&mut self, changed: &BTreeSet<ElementId>) -> Vec<Rect> {
         self.obstacles.apply(&self.doc, changed);
+        self.hit.apply(&self.doc, changed);
+        self.selection_bounds_cache = None;
         self.scene
             .update(&self.doc, changed, self.measurer.as_ref(), &self.obstacles)
+    }
+
+    /// Dirty regions for a preview move: caches already shifted in place, so
+    /// this repaints without rebuilding layers or touching indexes.
+    pub fn preview_dirty(&mut self) -> Vec<Rect> {
+        self.scene.preview_dirty()
+    }
+
+    /// Build draw ops for unbuilt layers touching `area` (and obstacles on
+    /// first use). Full-detail paint, repaint and export call this before
+    /// drawing ops; the LOD overview never does, so huge boards open without
+    /// ever paying the rough-geometry pass for off-screen detail.
+    pub fn ensure_area(&mut self, area: Rect) {
+        if self.scene.unbuilt_count() == 0 {
+            return;
+        }
+        self.obstacles.ensure(&self.doc);
+        self.scene
+            .ensure_area(&self.doc, area, self.measurer.as_ref(), &self.obstacles);
+    }
+
+    /// Scene-layer slots for a set of ids, resolved once per gesture.
+    fn scene_slot_subset(&self, ids: &BTreeSet<ElementId>) -> Vec<u32> {
+        ids.iter()
+            .filter_map(|id| self.scene.slot_for(id))
+            .collect()
+    }
+
+    /// Rigid bulk translation for the all-elements-moving benchmark: shift
+    /// every document element and every cached scene point by `(dx, dy)` in
+    /// place, with no layer rebuilds, no history entries, no obstacle
+    /// rebucketing (deferred to the next routing query). Exact for uniform
+    /// drift: deterministic rough geometry translates identically, and bound
+    /// connectors shift with their targets so bindings stay valid. Returns
+    /// nothing; the caller repaints.
+    pub fn benchmark_tick(&mut self, dx: f64, dy: f64) {
+        if !dx.is_finite() || !dy.is_finite() || (dx == 0.0 && dy == 0.0) {
+            return;
+        }
+        for element in self.doc.elements.values_mut() {
+            if element.is_deleted {
+                continue;
+            }
+            translate_element(element, dx, dy);
+        }
+        self.scene.shift_all(dx, dy);
+        self.obstacles.shift_all(dx, dy);
+        self.hit.shift_all(dx, dy);
     }
 
     /// The text measurer in use (for SVG export).
@@ -523,6 +634,12 @@ impl Editor {
 
     pub fn select(&mut self, ids: impl IntoIterator<Item = ElementId>) -> Effects {
         self.selection = ids.into_iter().collect();
+        self.selection_bounds_cache = self
+            .selection
+            .iter()
+            .filter_map(|id| self.doc.element(id))
+            .map(|e| e.bounds())
+            .reduce(|a, b| a.union(&b));
         Effects {
             overlay_changed: true,
             ..Effects::default()
@@ -534,6 +651,7 @@ impl Editor {
             return Effects::default();
         }
         self.selection.clear();
+        self.selection_bounds_cache = None;
         Effects {
             overlay_changed: true,
             ..Effects::default()
@@ -555,6 +673,9 @@ impl Editor {
 
     /// Bounds of the current selection, in world space.
     pub fn selection_bounds(&self) -> Option<Rect> {
+        if let Some(cached) = self.selection_bounds_cache {
+            return Some(cached);
+        }
         self.selection
             .iter()
             .filter_map(|id| self.doc.element(id))
@@ -778,8 +899,9 @@ impl Editor {
             Interaction::Moving {
                 start,
                 originals,
-                arrow_ids,
+                arrow_ids: _,
                 started_in_selection: _,
+                ..
             } => {
                 let current = self.camera.screen_to_world(screen);
                 let (dx, dy) = (current.x - start.x, current.y - start.y);
@@ -787,64 +909,76 @@ impl Editor {
                     return Effects::default();
                 }
                 let (dx, dy) = self.snap_delta(originals, dx, dy);
-                let moved_ids: BTreeSet<ElementId> =
-                    originals.iter().map(|o| o.id.clone()).collect();
-                let mut effects = Effects::default();
-                for original in originals {
-                    let mut translated = original.clone();
-                    // Bound endpoints stay glued to their element; only free
-                    // endpoints follow the drag. A fully bound connector
-                    // therefore holds still — drag one of its endpoints to
-                    // rewire or detach it.
-                    translate_element_keeping_bindings(&self.doc, &mut translated, dx, dy);
-                    let kind = translated.kind;
-                    if let Some(tx) = self.tx.as_mut() {
-                        if let Err(err) = tx.update(&mut self.doc, &original.id, now, |element| {
-                            element.kind = kind;
-                        }) {
-                            debug_assert!(false, "moving update failed: {err}");
-                        }
-                    }
-                    effects.changed.insert(original.id.clone());
+                // Incremental since the last preview: the document already
+                // holds everything up to `applied`, so this move shifts by
+                // the difference only — no per-move clones, no rebuilds.
+                let (inc_x, inc_y) = (dx - self.drag_applied.x, dy - self.drag_applied.y);
+                if inc_x.abs() < 1e-9 && inc_y.abs() < 1e-9 {
+                    return Effects::default();
                 }
-                let updates = self.arrow_updates_for(arrow_ids);
-                let mut reflow_targets: BTreeSet<ElementId> = BTreeSet::new();
-                if let Some(tx) = self.tx.as_mut() {
-                    for (arrow_id, start_point, end_point) in &updates {
-                        let _ = tx.update(&mut self.doc, arrow_id, now, |element| {
-                            if let ElementKind::Arrow { start, end, .. } = &mut element.kind {
-                                start.x = start_point.x;
-                                start.y = start_point.y;
-                                end.x = end_point.x;
-                                end.y = end_point.y;
-                            }
-                        });
-                        reflow_targets.insert(arrow_id.clone());
-                        effects.changed.insert(arrow_id.clone());
+                self.drag_applied = Point::new(dx, dy);
+                // Preview truth lives in `drag_working` (contiguous,
+                // cache-hot): translate it in place, snap frozen ends back
+                // to their static anchors. No clones, no map lookups, and
+                // no doc writes until release.
+                for element in self.drag_working.iter_mut() {
+                    translate_element(element, inc_x, inc_y);
+                }
+                for (idx, freeze_start, freeze_end) in self.drag_frozen.iter() {
+                    let Some(element) = self.drag_working.get_mut(*idx) else {
+                        continue;
+                    };
+                    let ElementKind::Arrow { start, end, .. } = &mut element.kind else {
+                        continue;
+                    };
+                    if let Some(point) = freeze_start {
+                        start.x = point.x;
+                        start.y = point.y;
+                    }
+                    if let Some(point) = freeze_end {
+                        end.x = point.x;
+                        end.y = point.y;
                     }
                 }
-                // Arrows in the dragged set re-resolve their bound endpoints,
-                // so a rigid translate leaves their labels off the midpoint.
-                for id in &moved_ids {
-                    if self
-                        .doc
-                        .element(id)
-                        .is_some_and(|e| matches!(e.kind, ElementKind::Arrow { .. }))
-                    {
-                        reflow_targets.insert(id.clone());
+                // Attached arrows: following ends advance arithmetically
+                // (uniform translation never flips the anchor side), frozen
+                // ends stay. The first rubber band per arrow installs fresh
+                // ops; later moves refresh the layer's points in place: one
+                // small head-polygon allocation per arrow, nothing else.
+                for meta in self.drag_attached.iter_mut() {
+                    if meta.a_follows {
+                        meta.a.x += inc_x;
+                        meta.a.y += inc_y;
+                    }
+                    if meta.b_follows {
+                        meta.b.x += inc_x;
+                        meta.b.y += inc_y;
+                    }
+                    let width = meta.style.stroke_width;
+                    let bounds = crate::rough::rubber_band_bounds(meta.a, meta.b, width);
+                    if meta.built {
+                        self.scene
+                            .refresh_preview_ops(&meta.id, meta.a, meta.b, width, bounds);
+                    } else {
+                        let style = meta.style.clone();
+                        let (ops, _) = crate::rough::rubber_band_ops(meta.a, meta.b, &style);
+                        self.scene.set_preview_ops(&meta.id, ops, bounds);
+                        meta.built = true;
                     }
                 }
-                for (text_id, rect) in self.bound_text_reflows(&reflow_targets) {
-                    if let Some(tx) = self.tx.as_mut() {
-                        let _ = tx.update(&mut self.doc, &text_id, now, |element| {
-                            if let ElementKind::Text { rect: r, .. } = &mut element.kind {
-                                *r = rect;
-                            }
-                        });
-                        effects.changed.insert(text_id);
-                    }
+                // Scene: rigid-shift the selection by gesture-stable slots.
+                // The changed set stays empty: preview paints from the drained
+                // dirty rects, and release recomputes the full set for settle.
+                self.scene.shift_slots(&self.drag_slots, inc_x, inc_y);
+                if let Some(cached) = self.selection_bounds_cache.as_mut() {
+                    cached.x += inc_x;
+                    cached.y += inc_y;
                 }
-                effects
+                Effects {
+                    preview: true,
+                    overlay_changed: true,
+                    ..Effects::default()
+                }
             }
             Interaction::Resizing {
                 handle,
@@ -1207,7 +1341,7 @@ impl Editor {
                 let end = self.camera.screen_to_world(screen);
                 let rect = Rect::from_points(start, end);
                 self.marquee_current = None;
-                let hits: Vec<ElementId> = elements_in_rect(&self.doc, rect)
+                let hits: Vec<ElementId> = elements_in_rect_indexed(&self.doc, &self.hit, rect)
                     .into_iter()
                     .map(|id| crate::hit::resolve_container(&self.doc, &id))
                     // A marquee inside a frame selects its contents; enclosing
@@ -1242,15 +1376,97 @@ impl Editor {
             }
             Interaction::Moving {
                 start,
+                originals,
+                arrow_ids,
                 started_in_selection,
                 ..
             } => {
                 let end = self.camera.screen_to_world(screen);
                 let moved = end.distance(start) > 0.5 / self.camera.zoom;
-                self.sync_frame_membership(now);
-                if let Some(tx) = self.tx.take() {
-                    let changed: BTreeSet<ElementId> =
-                        tx.deltas().iter().map(|d| d.element_id().clone()).collect();
+                // Preview ran iff the pointer actually moved the drag total.
+                let previewed =
+                    self.drag_applied.x.abs() > 1e-9 || self.drag_applied.y.abs() > 1e-9;
+                // Commit the preview truth: write working + attached endpoints
+                // back (single pass each), unless this was a click.
+                let mut attached_pres: Vec<(ElementId, Element)> = Vec::new();
+                if previewed {
+                    for element in std::mem::take(&mut self.drag_working) {
+                        if let Some(slot) = self.doc.element_mut(&element.id) {
+                            *slot = element;
+                            slot.touch(now);
+                        }
+                    }
+                    for meta in std::mem::take(&mut self.drag_attached) {
+                        attached_pres.push((meta.id.clone(), meta.pre.clone()));
+                        if let Some(element) = self.doc.element_mut(&meta.id) {
+                            if let ElementKind::Arrow { start, end, .. } = &mut element.kind {
+                                start.x = meta.a.x;
+                                start.y = meta.a.y;
+                                end.x = meta.b.x;
+                                end.y = meta.b.y;
+                            }
+                            element.touch(now);
+                        }
+                    }
+                }
+                self.sync_frame_membership_for(
+                    &originals
+                        .iter()
+                        .map(|o| o.id.clone())
+                        .chain(arrow_ids.iter().cloned())
+                        .collect(),
+                    now,
+                );
+                // Exact settle for rubber-banded arrows: reflow their labels
+                // now so the staged undo step covers routes + labels.
+                // Rigid-shifted shapes and selected arrows are already exact.
+                let attached: BTreeSet<ElementId> = arrow_ids.iter().cloned().collect();
+                if previewed && !attached.is_empty() {
+                    let reflows = self.bound_text_reflows(&attached);
+                    if let Some(tx) = self.tx.as_mut() {
+                        for (text_id, rect) in &reflows {
+                            let _ = tx.update(&mut self.doc, text_id, now, |element| {
+                                if let ElementKind::Text { rect: r, .. } = &mut element.kind {
+                                    *r = *rect;
+                                }
+                            });
+                        }
+                    }
+                    // Reflowed labels changed geometry after the rigid shift:
+                    // rebuild them exactly instead of skipping as previewed.
+                    for (text_id, _) in &reflows {
+                        self.scene.unmark_preview(text_id);
+                    }
+                }
+                if let Some(mut tx) = self.tx.take() {
+                    // Stage the whole gesture as one undo step: pre-gesture
+                    // befores plus afters from the just-written document.
+                    // (Preview moves bypass per-move staging.)
+                    if previewed {
+                        for original in &originals {
+                            if let Some(current) = self.doc.element(&original.id).cloned() {
+                                let mut after = current;
+                                after.touch(now);
+                                tx.push(Delta::Update {
+                                    before: original.clone(),
+                                    after,
+                                });
+                            }
+                        }
+                        for (id, pre) in attached_pres {
+                            if let Some(current) = self.doc.element(&id).cloned() {
+                                let mut after = current;
+                                after.touch(now);
+                                tx.push(Delta::Update { before: pre, after });
+                            }
+                        }
+                    }
+                    let mut changed: BTreeSet<ElementId> =
+                        originals.iter().map(|o| o.id.clone()).collect();
+                    changed.extend(arrow_ids.iter().cloned());
+                    for delta in tx.deltas().iter() {
+                        changed.insert(delta.element_id().clone());
+                    }
                     tx.commit(&mut self.history);
                     effects.merge(Effects {
                         changed,
@@ -1263,6 +1479,9 @@ impl Editor {
                 if started_in_selection && !moved {
                     effects.merge(self.clear_selection());
                 }
+                self.drag_applied = Point::ZERO;
+                self.drag_slots.clear();
+                self.drag_frozen.clear();
             }
             Interaction::Resizing { .. } => {
                 let changed: BTreeSet<ElementId> = self
@@ -1525,7 +1744,7 @@ impl Editor {
             };
         }
         let tolerance = self.tolerance();
-        let Some(id) = hit_test_raw(&self.doc, world, tolerance) else {
+        let Some(id) = hit_test_raw_indexed(&self.doc, &self.hit, world, tolerance) else {
             return Effects::default();
         };
         enum Target {
@@ -1621,7 +1840,7 @@ impl Editor {
     /// starts a new point-text element.
     fn begin_text_tool(&mut self, world: Point, now: u64) -> Effects {
         let tolerance = self.tolerance();
-        if let Some(id) = hit_test_raw(&self.doc, world, tolerance) {
+        if let Some(id) = hit_test_raw_indexed(&self.doc, &self.hit, world, tolerance) {
             match self.doc.element(&id).map(|e| &e.kind) {
                 Some(ElementKind::Text { .. }) => {
                     return self.begin_text_edit(self.doc.element(&id).cloned(), now);
@@ -2210,11 +2429,42 @@ impl Editor {
                 overlay_changed: true,
                 ..Effects::default()
             },
-            Interaction::Moving { .. }
-            | Interaction::Resizing { .. }
+            Interaction::Moving { .. } => {
+                self.hover_anchors = None;
+                // Preview never touched the document: unshift the rigid scene
+                // preview and rebuild the rubber-banded arrows exactly. The
+                // unshift restores bounds; ops points were deferred all
+                // along, so nothing else needs restoring.
+                let total = self.drag_applied;
+                let attached: BTreeSet<ElementId> = self
+                    .drag_attached
+                    .iter()
+                    .map(|meta| meta.id.clone())
+                    .collect();
+                self.drag_working.clear();
+                self.drag_frozen.clear();
+                self.drag_attached.clear();
+                let _ = self.tx.take();
+                self.drag_applied = Point::ZERO;
+                if total.x.abs() > 1e-9 || total.y.abs() > 1e-9 {
+                    let slots = std::mem::take(&mut self.drag_slots);
+                    self.scene.shift_slots(&slots, -total.x, -total.y);
+                } else {
+                    self.drag_slots.clear();
+                }
+                Effects {
+                    changed: attached,
+                    overlay_changed: true,
+                    ..Effects::default()
+                }
+            }
+            Interaction::Resizing { .. }
             | Interaction::ArrowEndpoint { .. }
             | Interaction::ArrowWaypoint { .. } => {
                 self.hover_anchors = None;
+                // Drop gesture-preview caches (rigid shifts, rubber bands):
+                // the changed set below rebuilds everything exactly.
+                self.scene.discard_preview();
                 if let Some(tx) = self.tx.take() {
                     for delta in tx.deltas().iter().rev() {
                         let _ = self.doc.apply(&delta.invert());
@@ -2372,6 +2622,93 @@ impl Editor {
 
     // -- tool helpers ------------------------------------------------------
 
+    /// Begin a selection drag: snapshot contiguous preview truth, precompute
+    /// frozen ends and attached-arrow state, resolve scene slots. One setup
+    /// pass so every move stays allocation-free over contiguous memory.
+    fn begin_move(
+        &mut self,
+        world: Point,
+        originals: Vec<Element>,
+        arrow_ids: Vec<ElementId>,
+        started_in_selection: bool,
+    ) -> Effects {
+        let moved: HashSet<&str> = originals.iter().map(|e| e.id.as_str()).collect();
+        // Selected arrows bound to static targets freeze those ends to the
+        // anchor resolved once here; everything else rides rigidly.
+        let mut frozen: Vec<(usize, Option<Point>, Option<Point>)> = Vec::new();
+        for (idx, original) in originals.iter().enumerate() {
+            let ElementKind::Arrow { start, end, .. } = &original.kind else {
+                continue;
+            };
+            let freeze = |endpoint: &Endpoint, other: Point| -> Option<Point> {
+                match &endpoint.binding {
+                    Some(binding) if !moved.contains(binding.element_id.as_str()) => {
+                        let (point, _) = connector::resolve_endpoint(endpoint, other, &self.doc);
+                        Some(point)
+                    }
+                    _ => None,
+                }
+            };
+            let start_point = start.point();
+            let frozen_start = freeze(start, end.point());
+            let frozen_end = freeze(end, start_point);
+            if frozen_start.is_some() || frozen_end.is_some() {
+                frozen.push((idx, frozen_start, frozen_end));
+            }
+        }
+        // Attached arrows: snapshot ends, style and pre-gesture element.
+        let mut attached: Vec<AttachedDrag> = Vec::new();
+        for arrow_id in &arrow_ids {
+            let Some(element) = self.doc.element(arrow_id) else {
+                continue;
+            };
+            let ElementKind::Arrow {
+                start, end, style, ..
+            } = &element.kind
+            else {
+                continue;
+            };
+            let follows = |endpoint: &Endpoint| {
+                endpoint
+                    .binding
+                    .as_ref()
+                    .is_some_and(|b| moved.contains(b.element_id.as_str()))
+            };
+            attached.push(AttachedDrag {
+                id: arrow_id.clone(),
+                a: start.point(),
+                b: end.point(),
+                a_follows: follows(start),
+                b_follows: follows(end),
+                style: style.clone(),
+                pre: element.clone(),
+                built: false,
+            });
+        }
+        let working = originals.clone();
+        self.tx = Some(Transaction::begin());
+        self.drag_applied = Point::ZERO;
+        self.drag_slots = self.scene_slot_subset(
+            &originals
+                .iter()
+                .map(|e| e.id.clone())
+                .collect::<BTreeSet<ElementId>>(),
+        );
+        self.drag_working = working;
+        self.drag_frozen = frozen;
+        self.drag_attached = attached;
+        self.interaction = Interaction::Moving {
+            start: world,
+            originals,
+            arrow_ids,
+            started_in_selection,
+        };
+        Effects {
+            overlay_changed: true,
+            ..Effects::default()
+        }
+    }
+
     fn begin_select(&mut self, screen: Point, world: Point, mods: Modifiers, now: u64) -> Effects {
         if mods.command() {
             return Effects::default();
@@ -2416,19 +2753,9 @@ impl Editor {
             // and resizing a zero-height or zero-width box is a no-op, so the
             // arrow would seem glued in place.
             if let Some(originals) = self.lone_arrow_shaft_hit(world) {
-                let arrow_ids =
-                    self.arrows_touching(&originals.iter().map(|e| e.id.clone()).collect());
-                self.tx = Some(Transaction::begin());
-                self.interaction = Interaction::Moving {
-                    start: world,
-                    originals,
-                    arrow_ids,
-                    started_in_selection: false,
-                };
-                return Effects {
-                    overlay_changed: true,
-                    ..Effects::default()
-                };
+                let moved: BTreeSet<ElementId> = originals.iter().map(|e| e.id.clone()).collect();
+                let arrow_ids = self.attached_arrows(&moved);
+                return self.begin_move(world, originals, arrow_ids, false);
             }
         }
         // Resize handles win over connection nodes: the nodes float outside
@@ -2466,7 +2793,7 @@ impl Editor {
             }
         }
         let tolerance = self.tolerance();
-        match hit_test(&self.doc, world, tolerance) {
+        match hit_test_indexed(&self.doc, &self.hit, world, tolerance) {
             Some(id) => {
                 if mods.shift {
                     if self.selection.contains(&id) {
@@ -2474,6 +2801,7 @@ impl Editor {
                     } else {
                         self.selection.insert(id);
                     }
+                    self.selection_bounds_cache = None;
                     return Effects {
                         overlay_changed: true,
                         ..Effects::default()
@@ -2481,21 +2809,12 @@ impl Editor {
                 }
                 if !self.selection.contains(&id) {
                     self.selection = [id].into_iter().collect();
+                    self.selection_bounds_cache = None;
                 }
                 let originals: Vec<Element> = self.selection_with_followers();
-                let arrow_ids =
-                    self.arrows_touching(&originals.iter().map(|e| e.id.clone()).collect());
-                self.tx = Some(Transaction::begin());
-                self.interaction = Interaction::Moving {
-                    start: world,
-                    originals,
-                    arrow_ids,
-                    started_in_selection: false,
-                };
-                Effects {
-                    overlay_changed: true,
-                    ..Effects::default()
-                }
+                let moved: BTreeSet<ElementId> = originals.iter().map(|e| e.id.clone()).collect();
+                let arrow_ids = self.attached_arrows(&moved);
+                self.begin_move(world, originals, arrow_ids, false)
             }
             None => {
                 // Dragging from empty space inside the selection's bounding
@@ -2505,19 +2824,10 @@ impl Editor {
                     if let Some(bounds) = self.selection_bounds() {
                         if bounds.contains(world) {
                             let originals = self.selection_with_followers();
-                            let arrow_ids = self
-                                .arrows_touching(&originals.iter().map(|e| e.id.clone()).collect());
-                            self.tx = Some(Transaction::begin());
-                            self.interaction = Interaction::Moving {
-                                start: world,
-                                originals,
-                                arrow_ids,
-                                started_in_selection: true,
-                            };
-                            return Effects {
-                                overlay_changed: true,
-                                ..Effects::default()
-                            };
+                            let moved: BTreeSet<ElementId> =
+                                originals.iter().map(|e| e.id.clone()).collect();
+                            let arrow_ids = self.attached_arrows(&moved);
+                            return self.begin_move(world, originals, arrow_ids, true);
                         }
                     }
                 }
@@ -2621,11 +2931,20 @@ impl Editor {
     ) -> Option<(ElementId, connector::AnchorSide, Point)> {
         let reach = (CONNECTION_NODE_PX + HANDLE_HIT_PX) / self.camera.zoom;
         let grab = self.node_grab();
-        let mut best: Option<&Element> = None;
-        for element in self.doc.elements.values() {
-            if element.is_deleted || exclude == Some(element.id.as_str()) {
+        // Grid candidates instead of a full scan: same model-bounds reject.
+        let pad = reach + crate::spatial::hit_pad();
+        let area = crate::geometry::Rect::new(world.x - pad, world.y - pad, pad * 2.0, pad * 2.0);
+        let mut best: Option<ElementId> = None;
+        for row in self.hit.query(area) {
+            let Some((id, _, _)) = self.hit.row(row) else {
+                continue;
+            };
+            if exclude == Some(id) {
                 continue;
             }
+            let Some(element) = self.doc.element(id).filter(|e| !e.is_deleted) else {
+                continue;
+            };
             // Bound text is not a node source, but it still occludes the
             // nodes that float over its container — a click on a label
             // selects the container instead of pulling a connector.
@@ -2642,14 +2961,18 @@ impl Editor {
             if !element.bounds().expand(reach).contains(world) {
                 continue;
             }
-            let topmost = best.is_none_or(|b| {
-                (element.index.as_str(), element.id.as_str()) > (b.index.as_str(), b.id.as_str())
+            let topmost = best.as_ref().is_none_or(|b| {
+                let (ka, kb) = (
+                    element.index.as_str(),
+                    self.doc.element(b).map(|e| e.index.as_str()).unwrap_or(""),
+                );
+                (ka, element.id.as_str()) > (kb, b.as_str())
             });
             if topmost {
-                best = Some(element);
+                best = Some(element.id.clone());
             }
         }
-        let element = best?;
+        let element = self.doc.element(best.as_deref()?)?;
         if !Self::is_connectable(element) {
             return None;
         }
@@ -2683,7 +3006,7 @@ impl Editor {
                 return effects;
             }
         }
-        let next = hit_test(&self.doc, world, self.tolerance())
+        let next = hit_test_indexed(&self.doc, &self.hit, world, self.tolerance())
             .and_then(|id| self.doc.element(&id).cloned())
             .filter(Self::is_connectable)
             .map(|element| {
@@ -2719,7 +3042,7 @@ impl Editor {
     /// The sticky stack whose pull zone (everything but the border ring) is
     /// under `world`, if any.
     fn stack_pull_at(&self, world: Point) -> Option<ElementId> {
-        let id = hit_test(&self.doc, world, self.tolerance())?;
+        let id = hit_test_indexed(&self.doc, &self.hit, world, self.tolerance())?;
         let element = self.doc.element(&id)?;
         if !element.is_sticky_stack() {
             return None;
@@ -2999,7 +3322,7 @@ impl Editor {
     /// start a new note (click for the default size, drag to size it).
     fn begin_sticky(&mut self, world: Point, now: u64) -> Effects {
         let tolerance = self.tolerance();
-        if let Some(id) = hit_test(&self.doc, world, tolerance) {
+        if let Some(id) = hit_test_indexed(&self.doc, &self.hit, world, tolerance) {
             if self.doc.element(&id).is_some_and(|e| e.is_sticky_stack()) {
                 return self.begin_pull_from_stack(&id, world, now);
             }
@@ -3342,6 +3665,32 @@ impl Editor {
         arrows
     }
 
+    /// Arrows bound to moved elements but not moved themselves: the attached
+    /// set a selection drag stretches. Selected arrows ride the drag rigidly
+    /// (exact under translation), so only these need rubber-band previews
+    /// and an exact re-route on release.
+    fn attached_arrows(&self, moved: &BTreeSet<ElementId>) -> Vec<ElementId> {
+        let mut arrows = Vec::new();
+        for element in self.doc.elements.values() {
+            let ElementKind::Arrow { start, end, .. } = &element.kind else {
+                continue;
+            };
+            if element.is_deleted || moved.contains(&element.id) {
+                continue;
+            }
+            let binds_moved = |endpoint: &Endpoint| {
+                endpoint
+                    .binding
+                    .as_ref()
+                    .is_some_and(|b| moved.contains(&b.element_id))
+            };
+            if binds_moved(start) || binds_moved(end) {
+                arrows.push(element.id.clone());
+            }
+        }
+        arrows
+    }
+
     /// Fresh endpoint positions for the given arrows.
     fn arrow_updates_for(&self, arrow_ids: &[ElementId]) -> Vec<(ElementId, Point, Point)> {
         let mut updates = Vec::with_capacity(arrow_ids.len());
@@ -3417,7 +3766,17 @@ impl Editor {
             return;
         };
         let ids: BTreeSet<ElementId> = tx.deltas().iter().map(|d| d.element_id().clone()).collect();
-        let updates = self.frame_membership_updates(&ids);
+        self.sync_frame_membership_for(&ids, now);
+    }
+
+    /// Reconcile frame membership for an explicit id set (used when the
+    /// transaction does not yet hold the staged ids, e.g. drag release after
+    /// preview moves bypassed per-move staging).
+    fn sync_frame_membership_for(&mut self, ids: &BTreeSet<ElementId>, now: u64) {
+        if self.tx.is_none() {
+            return;
+        }
+        let updates = self.frame_membership_updates(ids);
         if let Some(tx) = self.tx.as_mut() {
             for (id, frame_id) in updates {
                 let _ = tx.update(&mut self.doc, &id, now, |element| {
@@ -3468,7 +3827,7 @@ impl Editor {
         now: u64,
     ) {
         let tolerance = self.tolerance();
-        if let Some(id) = hit_test(&self.doc, world, tolerance) {
+        if let Some(id) = hit_test_indexed(&self.doc, &self.hit, world, tolerance) {
             let targets: Vec<ElementId> = std::iter::once(id.clone())
                 .chain(self.followers(&id))
                 .collect();
@@ -4156,15 +4515,31 @@ mod tests {
     }
 
     fn press(editor: &mut Editor, key: &str, mods: Modifiers, now: u64) -> Effects {
-        editor.key_down(key, mods, now)
+        let fx = editor.key_down(key, mods, now);
+        pump(editor, &fx);
+        fx
+    }
+
+    /// Mirror the shell: effects must be pumped into the scene/hit caches.
+    /// Without this the interaction tests read stale caches — exactly as a
+    /// page that ignored its repaint effects would.
+    fn pump(editor: &mut Editor, fx: &Effects) {
+        if fx.repaint_all {
+            editor.refresh_scene();
+        } else if !fx.changed.is_empty() {
+            editor.rebuild_changed(&fx.changed);
+        }
     }
 
     fn drag_shape(editor: &mut Editor, from: Point, to: Point, now: u64) {
         let mods = Modifiers::default();
         press(editor, "r", mods, now);
-        editor.pointer_down(from, 0, mods, now);
-        editor.pointer_move(to, mods, now + 1);
-        editor.pointer_up(to, mods, now + 2);
+        let fx = editor.pointer_down(from, 0, mods, now);
+        pump(editor, &fx);
+        let fx = editor.pointer_move(to, mods, now + 1);
+        pump(editor, &fx);
+        let fx = editor.pointer_up(to, mods, now + 2);
+        pump(editor, &fx);
     }
 
     #[test]
@@ -4263,9 +4638,18 @@ mod tests {
         press(&mut e, "v", Modifiers::default(), 2);
         e.snap_to_grid = true;
         let mods = Modifiers::default();
-        e.pointer_down(Point::new(50.0, 25.0), 0, mods, 3);
-        e.pointer_move(Point::new(63.0, 25.0), mods, 4);
-        e.pointer_up(Point::new(63.0, 25.0), mods, 5);
+        {
+            let fx = e.pointer_down(Point::new(50.0, 25.0), 0, mods, 3);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(63.0, 25.0), mods, 4);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(63.0, 25.0), mods, 5);
+            pump(&mut e, &fx);
+        }
         assert_eq!(e.doc.ordered_live()[0].bounds().x, 20.0);
     }
 
@@ -4276,9 +4660,18 @@ mod tests {
         press(&mut e, "v", Modifiers::default(), 2);
         e.snap_to_grid = true;
         let mods = Modifiers::default();
-        e.pointer_down(Point::new(100.0, 100.0), 0, mods, 3);
-        e.pointer_move(Point::new(153.0, 147.0), mods, 4);
-        e.pointer_up(Point::new(153.0, 147.0), mods, 5);
+        {
+            let fx = e.pointer_down(Point::new(100.0, 100.0), 0, mods, 3);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(153.0, 147.0), mods, 4);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(153.0, 147.0), mods, 5);
+            pump(&mut e, &fx);
+        }
         let bounds = e.doc.ordered_live()[0].bounds();
         assert_eq!(bounds.w, 160.0);
         assert_eq!(bounds.h, 140.0);
@@ -4299,9 +4692,18 @@ mod tests {
         e.clear_selection();
 
         let mods = Modifiers::default();
-        e.pointer_down(Point::new(50.0, 25.0), 0, mods, 3);
-        e.pointer_move(Point::new(80.0, 45.0), mods, 4);
-        e.pointer_up(Point::new(80.0, 45.0), mods, 5);
+        {
+            let fx = e.pointer_down(Point::new(50.0, 25.0), 0, mods, 3);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(80.0, 45.0), mods, 4);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(80.0, 45.0), mods, 5);
+            pump(&mut e, &fx);
+        }
 
         let moved = e.doc.ordered_live()[0];
         assert_eq!(moved.bounds(), Rect::new(30.0, 20.0, 100.0, 50.0));
@@ -4315,11 +4717,20 @@ mod tests {
         press(&mut e, "v", Modifiers::default(), 2);
         let mods = Modifiers::default();
 
-        e.pointer_down(Point::new(50.0, 25.0), 0, mods, 3);
-        for step in 0..10 {
-            e.pointer_move(Point::new(50.0 + step as f64, 25.0), mods, 4 + step);
+        {
+            let fx = e.pointer_down(Point::new(50.0, 25.0), 0, mods, 3);
+            pump(&mut e, &fx);
         }
-        e.pointer_up(Point::new(60.0, 25.0), mods, 20);
+        for step in 0..10 {
+            {
+                let fx = e.pointer_move(Point::new(50.0 + step as f64, 25.0), mods, 4 + step);
+                pump(&mut e, &fx);
+            }
+        }
+        {
+            let fx = e.pointer_up(Point::new(60.0, 25.0), mods, 20);
+            pump(&mut e, &fx);
+        }
         assert_eq!(e.doc.ordered_live()[0].bounds().x, 10.0);
 
         let mods_cmd = Modifiers {
@@ -4341,9 +4752,18 @@ mod tests {
         e.clear_selection();
 
         let mods = Modifiers::default();
-        e.pointer_down(Point::new(-20.0, -20.0), 0, mods, 4);
-        e.pointer_move(Point::new(300.0, 100.0), mods, 5);
-        e.pointer_up(Point::new(300.0, 100.0), mods, 6);
+        {
+            let fx = e.pointer_down(Point::new(-20.0, -20.0), 0, mods, 4);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(300.0, 100.0), mods, 5);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(300.0, 100.0), mods, 6);
+            pump(&mut e, &fx);
+        }
         assert_eq!(e.selection.len(), 2);
     }
 
@@ -4363,9 +4783,18 @@ mod tests {
 
         let mods = Modifiers::default();
         // Empty space between the two shapes, inside their common bounds.
-        e.pointer_down(Point::new(150.0, 25.0), 0, mods, 8);
-        e.pointer_move(Point::new(160.0, 45.0), mods, 9);
-        e.pointer_up(Point::new(160.0, 45.0), mods, 10);
+        {
+            let fx = e.pointer_down(Point::new(150.0, 25.0), 0, mods, 8);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(160.0, 45.0), mods, 9);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(160.0, 45.0), mods, 10);
+            pump(&mut e, &fx);
+        }
 
         assert_eq!(
             e.doc.ordered_live()[0].bounds(),
@@ -4404,8 +4833,14 @@ mod tests {
         e.select(ids);
 
         let mods = Modifiers::default();
-        e.pointer_down(Point::new(150.0, 25.0), 0, mods, 8);
-        e.pointer_up(Point::new(150.0, 25.0), mods, 9);
+        {
+            let fx = e.pointer_down(Point::new(150.0, 25.0), 0, mods, 8);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(150.0, 25.0), mods, 9);
+            pump(&mut e, &fx);
+        }
         assert!(e.selection.is_empty(), "a click inside the box deselects");
         assert_eq!(
             e.doc.ordered_live()[0].bounds(),
@@ -4429,9 +4864,18 @@ mod tests {
         e.select(ids);
 
         let mods = Modifiers::default();
-        e.pointer_down(Point::new(50.0, 25.0), 0, mods, 8);
-        e.pointer_move(Point::new(70.0, 35.0), mods, 9);
-        e.pointer_up(Point::new(70.0, 35.0), mods, 10);
+        {
+            let fx = e.pointer_down(Point::new(50.0, 25.0), 0, mods, 8);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(70.0, 35.0), mods, 9);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(70.0, 35.0), mods, 10);
+            pump(&mut e, &fx);
+        }
 
         assert_eq!(
             e.doc.ordered_live()[0].bounds(),
@@ -4470,19 +4914,37 @@ mod tests {
         press(&mut e, "v", Modifiers::default(), 3);
 
         let mods = Modifiers::default();
-        e.pointer_down(Point::new(25.0, 25.0), 0, mods, 4);
-        e.pointer_up(Point::new(25.0, 25.0), mods, 5);
+        {
+            let fx = e.pointer_down(Point::new(25.0, 25.0), 0, mods, 4);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(25.0, 25.0), mods, 5);
+            pump(&mut e, &fx);
+        }
 
         let shift = Modifiers {
             shift: true,
             ..Modifiers::default()
         };
-        e.pointer_down(Point::new(125.0, 25.0), 0, shift, 6);
-        e.pointer_up(Point::new(125.0, 25.0), shift, 7);
+        {
+            let fx = e.pointer_down(Point::new(125.0, 25.0), 0, shift, 6);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(125.0, 25.0), shift, 7);
+            pump(&mut e, &fx);
+        }
         assert_eq!(e.selection.len(), 2);
 
-        e.pointer_down(Point::new(125.0, 25.0), 0, shift, 8);
-        e.pointer_up(Point::new(125.0, 25.0), shift, 9);
+        {
+            let fx = e.pointer_down(Point::new(125.0, 25.0), 0, shift, 8);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(125.0, 25.0), shift, 9);
+            pump(&mut e, &fx);
+        }
         assert_eq!(e.selection.len(), 1);
     }
 
@@ -4491,8 +4953,14 @@ mod tests {
         let mut e = editor();
         let mods = Modifiers::default();
         press(&mut e, "r", mods, 1);
-        e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
-        e.pointer_move(Point::new(100.0, 100.0), mods, 3);
+        {
+            let fx = e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(100.0, 100.0), mods, 3);
+            pump(&mut e, &fx);
+        }
         e.key_down("Escape", mods, 4);
         assert!(e.doc.is_empty());
         assert_eq!(e.interaction, Interaction::Idle);
@@ -4521,9 +4989,18 @@ mod tests {
         assert_eq!(handle.0, Handle::Se);
         assert_eq!(handle.1, Point::new(100.0, 50.0));
 
-        e.pointer_down(Point::new(100.0, 50.0), 0, mods, 3);
-        e.pointer_move(Point::new(150.0, 100.0), mods, 4);
-        e.pointer_up(Point::new(150.0, 100.0), mods, 5);
+        {
+            let fx = e.pointer_down(Point::new(100.0, 50.0), 0, mods, 3);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(150.0, 100.0), mods, 4);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(150.0, 100.0), mods, 5);
+            pump(&mut e, &fx);
+        }
         assert_eq!(
             e.doc.ordered_live()[0].bounds(),
             Rect::new(0.0, 0.0, 150.0, 100.0)
@@ -4553,9 +5030,18 @@ mod tests {
         let mods = Modifiers::default();
 
         // NE handle sits at (400, 200); drag it past the SW corner (200, 300).
-        e.pointer_down(Point::new(400.0, 200.0), 0, mods, 3);
-        e.pointer_move(Point::new(150.0, 350.0), mods, 4);
-        e.pointer_up(Point::new(150.0, 350.0), mods, 5);
+        {
+            let fx = e.pointer_down(Point::new(400.0, 200.0), 0, mods, 3);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(150.0, 350.0), mods, 4);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(150.0, 350.0), mods, 5);
+            pump(&mut e, &fx);
+        }
 
         let flipped = e.doc.ordered_live()[0].bounds();
         assert_eq!(
@@ -4583,9 +5069,18 @@ mod tests {
         let mods = Modifiers::default();
 
         // Drag the SE handle almost onto the NW anchor.
-        e.pointer_down(Point::new(100.0, 50.0), 0, mods, 3);
-        e.pointer_move(Point::new(1.0, 1.0), mods, 4);
-        e.pointer_up(Point::new(1.0, 1.0), mods, 5);
+        {
+            let fx = e.pointer_down(Point::new(100.0, 50.0), 0, mods, 3);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(1.0, 1.0), mods, 4);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(1.0, 1.0), mods, 5);
+            pump(&mut e, &fx);
+        }
         let bounds = e.doc.ordered_live()[0].bounds();
         assert_eq!(bounds.x, 0.0);
         assert_eq!(bounds.y, 0.0);
@@ -4605,9 +5100,18 @@ mod tests {
             ..Modifiers::default()
         };
 
-        e.pointer_down(Point::new(100.0, 50.0), 0, shift, 3);
-        e.pointer_move(Point::new(140.0, 50.0), shift, 4);
-        e.pointer_up(Point::new(140.0, 50.0), shift, 5);
+        {
+            let fx = e.pointer_down(Point::new(100.0, 50.0), 0, shift, 3);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(140.0, 50.0), shift, 4);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(140.0, 50.0), shift, 5);
+            pump(&mut e, &fx);
+        }
         assert_eq!(
             e.doc.ordered_live()[0].bounds(),
             Rect::new(0.0, 0.0, 140.0, 70.0)
@@ -4719,9 +5223,18 @@ mod tests {
         press(&mut e, "e", Modifiers::default(), 3);
 
         let mods = Modifiers::default();
-        e.pointer_down(Point::new(25.0, 25.0), 0, mods, 4);
-        e.pointer_move(Point::new(125.0, 25.0), mods, 5);
-        e.pointer_up(Point::new(125.0, 25.0), mods, 6);
+        {
+            let fx = e.pointer_down(Point::new(25.0, 25.0), 0, mods, 4);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(125.0, 25.0), mods, 5);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(125.0, 25.0), mods, 6);
+            pump(&mut e, &fx);
+        }
         assert!(e.doc.ordered_live().is_empty());
 
         let cmd = Modifiers {
@@ -4738,7 +5251,10 @@ mod tests {
         press(&mut e, "p", Modifiers::default(), 1);
         let mods = Modifiers::default();
         e.set_pressure(0.7);
-        e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
+        {
+            let fx = e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
+            pump(&mut e, &fx);
+        }
         for i in 1..=20 {
             e.pointer_move(
                 Point::new(i as f64 * 3.0, (i as f64 * 0.7).sin() * 4.0),
@@ -4746,7 +5262,10 @@ mod tests {
                 2 + i,
             );
         }
-        e.pointer_up(Point::new(60.0, 0.0), mods, 30);
+        {
+            let fx = e.pointer_up(Point::new(60.0, 0.0), mods, 30);
+            pump(&mut e, &fx);
+        }
 
         assert_eq!(e.doc.ordered_live().len(), 1);
         let points = match &e.doc.ordered_live()[0].kind {
@@ -4768,8 +5287,14 @@ mod tests {
         let mut e = editor();
         press(&mut e, "p", Modifiers::default(), 1);
         let mods = Modifiers::default();
-        e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
-        e.pointer_move(Point::new(50.0, 10.0), mods, 3);
+        {
+            let fx = e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(50.0, 10.0), mods, 3);
+            pump(&mut e, &fx);
+        }
         e.key_down("Escape", mods, 4);
         assert!(e.doc.is_empty());
     }
@@ -4780,7 +5305,10 @@ mod tests {
         let mods = Modifiers::default();
         press(&mut e, "p", mods, 1);
         assert!(e.tool_locked, "the brush arms locked");
-        e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
+        {
+            let fx = e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
+            pump(&mut e, &fx);
+        }
         for i in 1..=20 {
             e.pointer_move(
                 Point::new(i as f64 * 3.0, (i as f64 * 0.7).sin() * 4.0),
@@ -4788,22 +5316,40 @@ mod tests {
                 2 + i,
             );
         }
-        e.pointer_up(Point::new(57.0, 2.6), mods, 30);
+        {
+            let fx = e.pointer_up(Point::new(57.0, 2.6), mods, 30);
+            pump(&mut e, &fx);
+        }
 
         assert_eq!(e.tool, Tool::Freehand, "the pencil stays armed");
         assert_eq!(e.doc.ordered_live().len(), 1);
 
         // A second stroke needs no re-arming.
-        e.pointer_down(Point::new(100.0, 100.0), 0, mods, 31);
-        e.pointer_move(Point::new(140.0, 120.0), mods, 32);
-        e.pointer_up(Point::new(140.0, 120.0), mods, 33);
+        {
+            let fx = e.pointer_down(Point::new(100.0, 100.0), 0, mods, 31);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(140.0, 120.0), mods, 32);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(140.0, 120.0), mods, 33);
+            pump(&mut e, &fx);
+        }
         assert_eq!(e.doc.ordered_live().len(), 2, "the brush keeps drawing");
 
         let id = e.doc.ordered_live()[0].id.clone();
         e.clear_selection();
         press(&mut e, "v", mods, 34);
-        e.pointer_down(Point::new(0.0, 0.0), 0, mods, 35);
-        e.pointer_up(Point::new(0.0, 0.0), mods, 36);
+        {
+            let fx = e.pointer_down(Point::new(0.0, 0.0), 0, mods, 35);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(0.0, 0.0), mods, 36);
+            pump(&mut e, &fx);
+        }
         assert_eq!(
             e.selection.iter().next(),
             Some(&id),
@@ -4820,9 +5366,18 @@ mod tests {
         press(&mut e, "p", mods, 2);
         assert!(!e.tool_locked, "second press makes the brush single-shot");
 
-        e.pointer_down(Point::new(0.0, 0.0), 0, mods, 3);
-        e.pointer_move(Point::new(60.0, 20.0), mods, 4);
-        e.pointer_up(Point::new(60.0, 20.0), mods, 5);
+        {
+            let fx = e.pointer_down(Point::new(0.0, 0.0), 0, mods, 3);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(60.0, 20.0), mods, 4);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(60.0, 20.0), mods, 5);
+            pump(&mut e, &fx);
+        }
         assert_eq!(
             e.tool,
             Tool::Select,
@@ -4835,9 +5390,18 @@ mod tests {
         let mut e = editor();
         press(&mut e, "l", Modifiers::default(), 1);
         let mods = Modifiers::default();
-        e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
-        e.pointer_move(Point::new(100.0, 50.0), mods, 3);
-        e.pointer_up(Point::new(100.0, 50.0), mods, 4);
+        {
+            let fx = e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(100.0, 50.0), mods, 3);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(100.0, 50.0), mods, 4);
+            pump(&mut e, &fx);
+        }
 
         let element = e.doc.ordered_live()[0];
         match &element.kind {
@@ -4855,9 +5419,18 @@ mod tests {
         }
 
         press(&mut e, "a", Modifiers::default(), 5);
-        e.pointer_down(Point::new(200.0, 0.0), 0, mods, 6);
-        e.pointer_move(Point::new(300.0, 0.0), mods, 7);
-        e.pointer_up(Point::new(300.0, 0.0), mods, 8);
+        {
+            let fx = e.pointer_down(Point::new(200.0, 0.0), 0, mods, 6);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(300.0, 0.0), mods, 7);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(300.0, 0.0), mods, 8);
+            pump(&mut e, &fx);
+        }
         let arrow = e.doc.ordered_live()[1];
         match &arrow.kind {
             ElementKind::Arrow { end_arrowhead, .. } => assert!(end_arrowhead),
@@ -4873,9 +5446,18 @@ mod tests {
             shift: true,
             ..Modifiers::default()
         };
-        e.pointer_down(Point::new(0.0, 0.0), 0, shift, 2);
-        e.pointer_move(Point::new(100.0, 10.0), shift, 3);
-        e.pointer_up(Point::new(100.0, 10.0), shift, 4);
+        {
+            let fx = e.pointer_down(Point::new(0.0, 0.0), 0, shift, 2);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(100.0, 10.0), shift, 3);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(100.0, 10.0), shift, 4);
+            pump(&mut e, &fx);
+        }
         let element = e.doc.ordered_live()[0];
         if let ElementKind::Arrow { end, .. } = &element.kind {
             assert!(end.y.abs() < 1e-6, "snapped to horizontal: {end:?}");
@@ -4890,9 +5472,15 @@ mod tests {
         let mut e = editor();
         let mods = Modifiers::default();
         press(&mut e, "t", mods, 1);
-        e.pointer_down(Point::new(50.0, 50.0), 0, mods, 2);
+        {
+            let fx = e.pointer_down(Point::new(50.0, 50.0), 0, mods, 2);
+            pump(&mut e, &fx);
+        }
         let id = e.doc.ordered_live()[0].id.clone();
-        e.commit_text(&id, "Hello world", 3);
+        {
+            let fx = e.commit_text(&id, "Hello world", 3);
+            pump(&mut e, &fx);
+        }
 
         match &e.doc.element(&id).unwrap().kind {
             ElementKind::Text { text, rect, .. } => {
@@ -4909,9 +5497,15 @@ mod tests {
         let mut e = editor();
         let mods = Modifiers::default();
         press(&mut e, "t", mods, 1);
-        e.pointer_down(Point::new(50.0, 50.0), 0, mods, 2);
+        {
+            let fx = e.pointer_down(Point::new(50.0, 50.0), 0, mods, 2);
+            pump(&mut e, &fx);
+        }
         let id = e.doc.ordered_live()[0].id.clone();
-        e.commit_text(&id, "   ", 3);
+        {
+            let fx = e.commit_text(&id, "   ", 3);
+            pump(&mut e, &fx);
+        }
         assert!(e.doc.is_empty());
         assert!(!e.history.can_undo());
     }
@@ -4923,7 +5517,10 @@ mod tests {
         let shape_id = e.doc.ordered_live()[0].id.clone();
         press(&mut e, "v", Modifiers::default(), 2);
 
-        e.double_click(Point::new(100.0, 50.0), 3);
+        {
+            let fx = e.double_click(Point::new(100.0, 50.0), 3);
+            pump(&mut e, &fx);
+        }
         let text_id = e
             .doc
             .ordered_live()
@@ -4932,7 +5529,10 @@ mod tests {
             .expect("bound text created")
             .id
             .clone();
-        e.commit_text(&text_id, "node", 4);
+        {
+            let fx = e.commit_text(&text_id, "node", 4);
+            pump(&mut e, &fx);
+        }
 
         match e.doc.element(&shape_id).unwrap().kind.clone() {
             ElementKind::Shape { bound_text_id, .. } => {
@@ -4943,9 +5543,18 @@ mod tests {
         let before = e.doc.element(&text_id).unwrap().bounds();
 
         let mods = Modifiers::default();
-        e.pointer_down(Point::new(100.0, 50.0), 0, mods, 5);
-        e.pointer_move(Point::new(150.0, 70.0), mods, 6);
-        e.pointer_up(Point::new(150.0, 70.0), mods, 7);
+        {
+            let fx = e.pointer_down(Point::new(100.0, 50.0), 0, mods, 5);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(150.0, 70.0), mods, 6);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(150.0, 70.0), mods, 7);
+            pump(&mut e, &fx);
+        }
         let after = e.doc.element(&text_id).unwrap().bounds();
         assert!(
             (after.x - before.x - 50.0).abs() < 0.01,
@@ -4959,7 +5568,10 @@ mod tests {
         drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(200.0, 100.0), 1);
         let shape_id = e.doc.ordered_live()[0].id.clone();
         press(&mut e, "v", Modifiers::default(), 2);
-        e.double_click(Point::new(100.0, 50.0), 3);
+        {
+            let fx = e.double_click(Point::new(100.0, 50.0), 3);
+            pump(&mut e, &fx);
+        }
         let text_id = e
             .doc
             .ordered_live()
@@ -4977,14 +5589,29 @@ mod tests {
         let height_before = e.doc.element(&text_id).unwrap().bounds().h;
         let mods = Modifiers::default();
         // Select the shape (clicking its edge; the text is selected after commit).
-        e.pointer_down(Point::new(5.0, 5.0), 0, mods, 5);
-        e.pointer_up(Point::new(5.0, 5.0), mods, 5);
+        {
+            let fx = e.pointer_down(Point::new(5.0, 5.0), 0, mods, 5);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(5.0, 5.0), mods, 5);
+            pump(&mut e, &fx);
+        }
         assert!(e.selection.contains(&shape_id));
 
         // Shrink the shape by dragging its SE handle.
-        e.pointer_down(Point::new(200.0, 100.0), 0, mods, 6);
-        e.pointer_move(Point::new(70.0, 100.0), mods, 7);
-        e.pointer_up(Point::new(70.0, 100.0), mods, 8);
+        {
+            let fx = e.pointer_down(Point::new(200.0, 100.0), 0, mods, 6);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(70.0, 100.0), mods, 7);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(70.0, 100.0), mods, 8);
+            pump(&mut e, &fx);
+        }
         let height_after = e.doc.element(&text_id).unwrap().bounds().h;
         assert!(
             height_after > height_before,
@@ -4997,8 +5624,14 @@ mod tests {
         let mut e = editor();
         let mods = Modifiers::default();
         press(&mut e, "t", mods, 1);
-        e.pointer_down(Point::new(50.0, 50.0), 0, mods, 2);
-        e.cancel_text();
+        {
+            let fx = e.pointer_down(Point::new(50.0, 50.0), 0, mods, 2);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.cancel_text();
+            pump(&mut e, &fx);
+        }
         assert!(e.doc.is_empty());
     }
 
@@ -5015,7 +5648,10 @@ mod tests {
             fill_color: Some("#ffc9c9".into()),
             ..StylePatch::default()
         };
-        e.update_style(&patch, 2);
+        {
+            let fx = e.update_style(&patch, 2);
+            pump(&mut e, &fx);
+        }
 
         match &e.doc.element(&id).unwrap().kind {
             ElementKind::Shape { style, .. } => {
@@ -5045,7 +5681,10 @@ mod tests {
             stroke_width: Some(4.0),
             ..StylePatch::default()
         };
-        e.update_style(&patch, 1);
+        {
+            let fx = e.update_style(&patch, 1);
+            pump(&mut e, &fx);
+        }
         assert_eq!(e.style.stroke_width, 4.0);
 
         drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(50.0, 50.0), 2);
@@ -5088,11 +5727,23 @@ mod tests {
 
         let mods = Modifiers::default();
         press(&mut e, "a", mods, 3);
-        e.pointer_down(Point::new(50.0, 50.0), 0, mods, 4);
-        e.pointer_move(Point::new(200.0, 50.0), mods, 5);
-        e.pointer_move(Point::new(350.0, 50.0), mods, 6);
+        {
+            let fx = e.pointer_down(Point::new(50.0, 50.0), 0, mods, 4);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(200.0, 50.0), mods, 5);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(350.0, 50.0), mods, 6);
+            pump(&mut e, &fx);
+        }
         assert_eq!(e.hover_anchor_points().len(), 4);
-        e.pointer_up(Point::new(350.0, 50.0), mods, 7);
+        {
+            let fx = e.pointer_up(Point::new(350.0, 50.0), mods, 7);
+            pump(&mut e, &fx);
+        }
 
         assert!(e.hover_anchor_points().is_empty());
         assert_eq!(e.doc.ordered_live().len(), 3);
@@ -5124,9 +5775,18 @@ mod tests {
         drag_shape(e, Point::new(300.0, 0.0), Point::new(400.0, 100.0), 2);
         let mods = Modifiers::default();
         press(e, "a", mods, 3);
-        e.pointer_down(Point::new(50.0, 50.0), 0, mods, 4);
-        e.pointer_move(Point::new(350.0, 50.0), mods, 5);
-        e.pointer_up(Point::new(350.0, 50.0), mods, 6);
+        {
+            let fx = e.pointer_down(Point::new(50.0, 50.0), 0, mods, 4);
+            pump(&mut *e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(350.0, 50.0), mods, 5);
+            pump(&mut *e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(350.0, 50.0), mods, 6);
+            pump(&mut *e, &fx);
+        }
     }
 
     fn arrow_waypoints(e: &Editor) -> Vec<Point> {
@@ -5152,9 +5812,18 @@ mod tests {
         );
 
         let mods = Modifiers::default();
-        e.pointer_down(Point::new(200.0, 50.0), 0, mods, 7);
-        e.pointer_move(Point::new(200.0, 150.0), mods, 8);
-        e.pointer_up(Point::new(200.0, 150.0), mods, 9);
+        {
+            let fx = e.pointer_down(Point::new(200.0, 50.0), 0, mods, 7);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(200.0, 150.0), mods, 8);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(200.0, 150.0), mods, 9);
+            pump(&mut e, &fx);
+        }
 
         // The segment bows down: two waypoints, one at each end of the bow.
         assert_eq!(
@@ -5193,8 +5862,14 @@ mod tests {
         bound_arrow_board(&mut e);
         let mods = Modifiers::default();
         // Down and up on the insert handle: no movement, no waypoints.
-        e.pointer_down(Point::new(200.0, 50.0), 0, mods, 7);
-        e.pointer_up(Point::new(200.0, 50.0), mods, 8);
+        {
+            let fx = e.pointer_down(Point::new(200.0, 50.0), 0, mods, 7);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(200.0, 50.0), mods, 8);
+            pump(&mut e, &fx);
+        }
         assert!(arrow_waypoints(&e).is_empty());
     }
 
@@ -5203,11 +5878,26 @@ mod tests {
         let mut e = editor();
         bound_arrow_board(&mut e);
         let mods = Modifiers::default();
-        e.pointer_down(Point::new(200.0, 50.0), 0, mods, 7);
-        e.pointer_up(Point::new(200.0, 50.0), mods, 8);
-        e.pointer_down(Point::new(200.0, 50.0), 0, mods, 9);
-        e.pointer_up(Point::new(200.0, 50.0), mods, 10);
-        e.double_click(Point::new(200.0, 50.0), 11);
+        {
+            let fx = e.pointer_down(Point::new(200.0, 50.0), 0, mods, 7);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(200.0, 50.0), mods, 8);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_down(Point::new(200.0, 50.0), 0, mods, 9);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(200.0, 50.0), mods, 10);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.double_click(Point::new(200.0, 50.0), 11);
+            pump(&mut e, &fx);
+        }
         assert!(arrow_waypoints(&e).is_empty());
     }
 
@@ -5216,13 +5906,31 @@ mod tests {
         let mut e = editor();
         bound_arrow_board(&mut e);
         let mods = Modifiers::default();
-        e.pointer_down(Point::new(200.0, 50.0), 0, mods, 7);
-        e.pointer_move(Point::new(200.0, 150.0), mods, 8);
-        e.pointer_up(Point::new(200.0, 150.0), mods, 9);
+        {
+            let fx = e.pointer_down(Point::new(200.0, 50.0), 0, mods, 7);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(200.0, 150.0), mods, 8);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(200.0, 150.0), mods, 9);
+            pump(&mut e, &fx);
+        }
 
-        e.pointer_down(Point::new(132.0, 150.0), 0, mods, 10);
-        e.pointer_move(Point::new(190.0, 180.0), mods, 11);
-        e.pointer_up(Point::new(190.0, 180.0), mods, 12);
+        {
+            let fx = e.pointer_down(Point::new(132.0, 150.0), 0, mods, 10);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(190.0, 180.0), mods, 11);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(190.0, 180.0), mods, 12);
+            pump(&mut e, &fx);
+        }
         assert_eq!(
             arrow_waypoints(&e),
             vec![Point::new(190.0, 180.0), Point::new(268.0, 150.0)]
@@ -5234,12 +5942,24 @@ mod tests {
         let mut e = editor();
         bound_arrow_board(&mut e);
         let mods = Modifiers::default();
-        e.pointer_down(Point::new(200.0, 50.0), 0, mods, 7);
-        e.pointer_move(Point::new(200.0, 150.0), mods, 8);
-        e.pointer_up(Point::new(200.0, 150.0), mods, 9);
+        {
+            let fx = e.pointer_down(Point::new(200.0, 50.0), 0, mods, 7);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(200.0, 150.0), mods, 8);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(200.0, 150.0), mods, 9);
+            pump(&mut e, &fx);
+        }
         assert_eq!(arrow_waypoints(&e).len(), 2);
 
-        e.double_click(Point::new(132.0, 150.0), 10);
+        {
+            let fx = e.double_click(Point::new(132.0, 150.0), 10);
+            pump(&mut e, &fx);
+        }
         assert_eq!(arrow_waypoints(&e), vec![Point::new(268.0, 150.0)]);
     }
 
@@ -5252,9 +5972,18 @@ mod tests {
 
         let mods = Modifiers::default();
         press(&mut e, "a", mods, 3);
-        e.pointer_down(Point::new(50.0, 50.0), 0, mods, 4);
-        e.pointer_move(Point::new(350.0, 50.0), mods, 5);
-        e.pointer_up(Point::new(350.0, 50.0), mods, 6);
+        {
+            let fx = e.pointer_down(Point::new(50.0, 50.0), 0, mods, 4);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(350.0, 50.0), mods, 5);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(350.0, 50.0), mods, 6);
+            pump(&mut e, &fx);
+        }
 
         let arrow_id = e
             .doc
@@ -5268,9 +5997,18 @@ mod tests {
 
         press(&mut e, "v", mods, 7);
         e.select([b.clone()]);
-        e.pointer_down(Point::new(350.0, 50.0), 0, mods, 8);
-        e.pointer_move(Point::new(450.0, 150.0), mods, 9);
-        e.pointer_up(Point::new(450.0, 150.0), mods, 10);
+        {
+            let fx = e.pointer_down(Point::new(350.0, 50.0), 0, mods, 8);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(450.0, 150.0), mods, 9);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(450.0, 150.0), mods, 10);
+            pump(&mut e, &fx);
+        }
 
         let after = e.doc.element(&arrow_id).unwrap().bounds();
         assert!(
@@ -5289,9 +6027,18 @@ mod tests {
 
         let mods = Modifiers::default();
         press(&mut e, "a", mods, 3);
-        e.pointer_down(Point::new(50.0, 50.0), 0, mods, 4);
-        e.pointer_move(Point::new(350.0, 50.0), mods, 5);
-        e.pointer_up(Point::new(350.0, 50.0), mods, 6);
+        {
+            let fx = e.pointer_down(Point::new(50.0, 50.0), 0, mods, 4);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(350.0, 50.0), mods, 5);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(350.0, 50.0), mods, 6);
+            pump(&mut e, &fx);
+        }
         let arrow_id = e
             .doc
             .ordered_live()
@@ -5311,9 +6058,18 @@ mod tests {
         let connected = (Some(a.clone()), Some(b.clone()));
 
         // Dragging the shaft must not silently detach the connector.
-        e.pointer_down(Point::new(200.0, 50.0), 0, mods, 7);
-        e.pointer_move(Point::new(260.0, 110.0), mods, 8);
-        e.pointer_up(Point::new(260.0, 110.0), mods, 9);
+        {
+            let fx = e.pointer_down(Point::new(200.0, 50.0), 0, mods, 7);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(260.0, 110.0), mods, 8);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(260.0, 110.0), mods, 9);
+            pump(&mut e, &fx);
+        }
         assert_eq!(
             bindings(e.doc.element(&arrow_id).unwrap()),
             connected,
@@ -5331,9 +6087,18 @@ mod tests {
 
         // The link is still live: moving the target drags the endpoint along.
         e.select([b.clone()]);
-        e.pointer_down(Point::new(350.0, 50.0), 0, mods, 11);
-        e.pointer_move(Point::new(350.0, 150.0), mods, 12);
-        e.pointer_up(Point::new(350.0, 150.0), mods, 13);
+        {
+            let fx = e.pointer_down(Point::new(350.0, 50.0), 0, mods, 11);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(350.0, 150.0), mods, 12);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(350.0, 150.0), mods, 13);
+            pump(&mut e, &fx);
+        }
 
         let arrow = e.doc.element(&arrow_id).unwrap();
         let ElementKind::Arrow { end, .. } = &arrow.kind else {
@@ -5351,12 +6116,24 @@ mod tests {
         drag_shape(&mut e, Point::new(300.0, 0.0), Point::new(400.0, 100.0), 2);
         let mods = Modifiers::default();
         press(&mut e, "a", mods, 3);
-        e.pointer_down(Point::new(50.0, 50.0), 0, mods, 4);
-        e.pointer_move(Point::new(350.0, 50.0), mods, 5);
-        e.pointer_up(Point::new(350.0, 50.0), mods, 6);
+        {
+            let fx = e.pointer_down(Point::new(50.0, 50.0), 0, mods, 4);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(350.0, 50.0), mods, 5);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(350.0, 50.0), mods, 6);
+            pump(&mut e, &fx);
+        }
 
         press(&mut e, "v", mods, 7);
-        e.double_click(Point::new(200.0, 50.0), 8);
+        {
+            let fx = e.double_click(Point::new(200.0, 50.0), 8);
+            pump(&mut e, &fx);
+        }
         let text_id = e
             .doc
             .ordered_live()
@@ -5365,7 +6142,10 @@ mod tests {
             .expect("label text created")
             .id
             .clone();
-        e.commit_text(&text_id, "https", 9);
+        {
+            let fx = e.commit_text(&text_id, "https", 9);
+            pump(&mut e, &fx);
+        }
 
         let label = e.doc.element(&text_id).unwrap();
         assert!(label.bounds().w > 50.0);
@@ -5381,9 +6161,18 @@ mod tests {
         let mut e = editor();
         let mods = Modifiers::default();
         press(&mut e, "f", mods, 1);
-        e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
-        e.pointer_move(Point::new(400.0, 300.0), mods, 3);
-        e.pointer_up(Point::new(400.0, 300.0), mods, 4);
+        {
+            let fx = e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(400.0, 300.0), mods, 3);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(400.0, 300.0), mods, 4);
+            pump(&mut e, &fx);
+        }
         assert_eq!(e.doc.ordered_live().len(), 1);
         match &e.doc.ordered_live()[0].kind {
             ElementKind::Frame { rect, name } => {
@@ -5399,9 +6188,18 @@ mod tests {
         let mut e = editor();
         let mods = Modifiers::default();
         press(&mut e, "f", mods, 1);
-        e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
-        e.pointer_move(Point::new(400.0, 300.0), mods, 3);
-        e.pointer_up(Point::new(400.0, 300.0), mods, 4);
+        {
+            let fx = e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(400.0, 300.0), mods, 3);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(400.0, 300.0), mods, 4);
+            pump(&mut e, &fx);
+        }
         let frame_id = e.doc.ordered_live()[0].id.clone();
 
         drag_shape(&mut e, Point::new(50.0, 50.0), Point::new(150.0, 150.0), 5);
@@ -5414,9 +6212,18 @@ mod tests {
 
         press(&mut e, "v", mods, 6);
         e.select([shape_id.clone()]);
-        e.pointer_down(Point::new(100.0, 100.0), 0, mods, 7);
-        e.pointer_move(Point::new(600.0, 100.0), mods, 8);
-        e.pointer_up(Point::new(600.0, 100.0), mods, 9);
+        {
+            let fx = e.pointer_down(Point::new(100.0, 100.0), 0, mods, 7);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(600.0, 100.0), mods, 8);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(600.0, 100.0), mods, 9);
+            pump(&mut e, &fx);
+        }
         assert_eq!(
             e.doc.element(&shape_id).unwrap().frame_id,
             None,
@@ -5429,9 +6236,18 @@ mod tests {
         let mut e = editor();
         let mods = Modifiers::default();
         press(&mut e, "f", mods, 1);
-        e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
-        e.pointer_move(Point::new(400.0, 300.0), mods, 3);
-        e.pointer_up(Point::new(400.0, 300.0), mods, 4);
+        {
+            let fx = e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(400.0, 300.0), mods, 3);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(400.0, 300.0), mods, 4);
+            pump(&mut e, &fx);
+        }
         let frame_id = e.doc.ordered_live()[0].id.clone();
 
         drag_shape(&mut e, Point::new(50.0, 50.0), Point::new(150.0, 150.0), 5);
@@ -5441,9 +6257,18 @@ mod tests {
         press(&mut e, "v", mods, 6);
         e.select([frame_id.clone()]);
         // Grab the frame by its border, away from the resize handles.
-        e.pointer_down(Point::new(300.0, 300.0), 0, mods, 7);
-        e.pointer_move(Point::new(340.0, 330.0), mods, 8);
-        e.pointer_up(Point::new(340.0, 330.0), mods, 9);
+        {
+            let fx = e.pointer_down(Point::new(300.0, 300.0), 0, mods, 7);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(340.0, 330.0), mods, 8);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(340.0, 330.0), mods, 9);
+            pump(&mut e, &fx);
+        }
 
         let after = e.doc.element(&shape_id).unwrap().bounds();
         assert!((after.x - before.x - 40.0).abs() < 0.01);
@@ -5455,22 +6280,49 @@ mod tests {
         let mut e = editor();
         let mods = Modifiers::default();
         press(&mut e, "f", mods, 1);
-        e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
-        e.pointer_move(Point::new(200.0, 150.0), mods, 3);
-        e.pointer_up(Point::new(200.0, 150.0), mods, 4);
+        {
+            let fx = e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(200.0, 150.0), mods, 3);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(200.0, 150.0), mods, 4);
+            pump(&mut e, &fx);
+        }
         let frame_a = e.doc.ordered_live()[0].id.clone();
 
         press(&mut e, "f", mods, 5);
-        e.pointer_down(Point::new(400.0, 0.0), 0, mods, 6);
-        e.pointer_move(Point::new(600.0, 150.0), mods, 7);
-        e.pointer_up(Point::new(600.0, 150.0), mods, 8);
+        {
+            let fx = e.pointer_down(Point::new(400.0, 0.0), 0, mods, 6);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(600.0, 150.0), mods, 7);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(600.0, 150.0), mods, 8);
+            pump(&mut e, &fx);
+        }
         let frame_b = e.doc.ordered_live()[1].id.clone();
 
         // Connect frame A's east border to frame B's west border.
         press(&mut e, "a", mods, 9);
-        e.pointer_down(Point::new(200.0, 75.0), 0, mods, 10);
-        e.pointer_move(Point::new(400.0, 75.0), mods, 11);
-        e.pointer_up(Point::new(400.0, 75.0), mods, 12);
+        {
+            let fx = e.pointer_down(Point::new(200.0, 75.0), 0, mods, 10);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(400.0, 75.0), mods, 11);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(400.0, 75.0), mods, 12);
+            pump(&mut e, &fx);
+        }
 
         let arrow_id = e
             .doc
@@ -5496,9 +6348,18 @@ mod tests {
         // Moving a frame drags the bound endpoint along.
         press(&mut e, "v", mods, 13);
         e.select([frame_a.clone()]);
-        e.pointer_down(Point::new(50.0, 150.0), 0, mods, 14);
-        e.pointer_move(Point::new(50.0, 200.0), mods, 15);
-        e.pointer_up(Point::new(50.0, 200.0), mods, 16);
+        {
+            let fx = e.pointer_down(Point::new(50.0, 150.0), 0, mods, 14);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(50.0, 200.0), mods, 15);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(50.0, 200.0), mods, 16);
+            pump(&mut e, &fx);
+        }
         let (start_y, end_y) = match &e.doc.element(&arrow_id).unwrap().kind {
             ElementKind::Arrow { start, end, .. } => (start.y, end.y),
             _ => unreachable!(),
@@ -5515,9 +6376,18 @@ mod tests {
         let mut e = editor();
         let mods = Modifiers::default();
         press(&mut e, "f", mods, 1);
-        e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
-        e.pointer_move(Point::new(400.0, 300.0), mods, 3);
-        e.pointer_up(Point::new(400.0, 300.0), mods, 4);
+        {
+            let fx = e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(400.0, 300.0), mods, 3);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(400.0, 300.0), mods, 4);
+            pump(&mut e, &fx);
+        }
         let frame_id = e.doc.ordered_live()[0].id.clone();
         drag_shape(&mut e, Point::new(50.0, 50.0), Point::new(150.0, 150.0), 5);
         assert_eq!(e.doc.ordered_live().len(), 2);
@@ -5540,8 +6410,14 @@ mod tests {
         let mut e = editor();
         let mods = Modifiers::default();
         press(&mut e, "n", mods, 1);
-        e.pointer_down(Point::new(200.0, 200.0), 0, mods, 2);
-        e.pointer_up(Point::new(200.0, 200.0), mods, 3);
+        {
+            let fx = e.pointer_down(Point::new(200.0, 200.0), 0, mods, 2);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(200.0, 200.0), mods, 3);
+            pump(&mut e, &fx);
+        }
 
         assert_eq!(e.doc.ordered_live().len(), 1);
         let note = e.doc.ordered_live()[0].clone();
@@ -5558,12 +6434,18 @@ mod tests {
         assert_eq!(e.tool, Tool::Select, "the sticky tool is single-shot");
 
         // Double-click creates the note's bound text, inked in the note colour.
-        e.double_click(Point::new(200.0, 200.0), 4);
+        {
+            let fx = e.double_click(Point::new(200.0, 200.0), 4);
+            pump(&mut e, &fx);
+        }
         let text_id = match &e.interaction {
             Interaction::TextEditing { id, .. } => id.clone(),
             other => panic!("expected the text editor, got {other:?}"),
         };
-        e.commit_text(&text_id, "hello", 5);
+        {
+            let fx = e.commit_text(&text_id, "hello", 5);
+            pump(&mut e, &fx);
+        }
         assert_eq!(e.doc.ordered_live().len(), 2);
         let text = e.doc.element(&text_id).unwrap();
         match &text.kind {
@@ -5586,8 +6468,14 @@ mod tests {
         let mut e = editor();
         let mods = Modifiers::default();
         press(&mut e, "k", mods, 1);
-        e.pointer_down(Point::new(300.0, 300.0), 0, mods, 2);
-        e.pointer_up(Point::new(300.0, 300.0), mods, 3);
+        {
+            let fx = e.pointer_down(Point::new(300.0, 300.0), 0, mods, 2);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(300.0, 300.0), mods, 3);
+            pump(&mut e, &fx);
+        }
         let stack = e.doc.ordered_live()[0].clone();
         assert!(stack.is_sticky_stack());
         assert_eq!(e.tool, Tool::Select, "placing a stack is single-shot");
@@ -5595,9 +6483,18 @@ mod tests {
 
         // N-drag from the pile pulls a note out; the pile stays.
         press(&mut e, "n", mods, 4);
-        e.pointer_down(Point::new(300.0, 300.0), 0, mods, 5);
-        e.pointer_move(Point::new(500.0, 320.0), mods, 6);
-        e.pointer_up(Point::new(500.0, 320.0), mods, 7);
+        {
+            let fx = e.pointer_down(Point::new(300.0, 300.0), 0, mods, 5);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(500.0, 320.0), mods, 6);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(500.0, 320.0), mods, 7);
+            pump(&mut e, &fx);
+        }
         assert_eq!(e.doc.ordered_live().len(), 2);
         let note = e
             .doc
@@ -5616,8 +6513,14 @@ mod tests {
 
         // A click on the pile pulls nothing.
         press(&mut e, "n", mods, 8);
-        e.pointer_down(Point::new(300.0, 300.0), 0, mods, 9);
-        e.pointer_up(Point::new(300.0, 300.0), mods, 10);
+        {
+            let fx = e.pointer_down(Point::new(300.0, 300.0), 0, mods, 9);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(300.0, 300.0), mods, 10);
+            pump(&mut e, &fx);
+        }
         assert_eq!(
             e.doc.ordered_live().len(),
             2,
@@ -5627,9 +6530,18 @@ mod tests {
         // Select-drag from the middle pulls a note too (Miro-style), the
         // pile staying put.
         press(&mut e, "v", mods, 11);
-        e.pointer_down(Point::new(300.0, 300.0), 0, mods, 12);
-        e.pointer_move(Point::new(560.0, 300.0), mods, 13);
-        e.pointer_up(Point::new(560.0, 300.0), mods, 14);
+        {
+            let fx = e.pointer_down(Point::new(300.0, 300.0), 0, mods, 12);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(560.0, 300.0), mods, 13);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(560.0, 300.0), mods, 14);
+            pump(&mut e, &fx);
+        }
         assert_eq!(e.doc.ordered_live().len(), 3, "select pulled a note");
         assert_eq!(
             e.doc.element(&stack.id).unwrap().bounds(),
@@ -5647,9 +6559,18 @@ mod tests {
         assert_eq!(second.bounds().center(), Point::new(560.0, 300.0));
 
         // Dragging the border ring moves the pile, not a note.
-        e.pointer_down(Point::new(235.0, 300.0), 0, mods, 15);
-        e.pointer_move(Point::new(265.0, 360.0), mods, 16);
-        e.pointer_up(Point::new(265.0, 360.0), mods, 17);
+        {
+            let fx = e.pointer_down(Point::new(235.0, 300.0), 0, mods, 15);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(265.0, 360.0), mods, 16);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(265.0, 360.0), mods, 17);
+            pump(&mut e, &fx);
+        }
         assert_eq!(
             e.doc.element(&stack.id).unwrap().bounds(),
             Rect::new(260.0, 290.0, 140.0, 140.0)
@@ -5671,12 +6592,18 @@ mod tests {
 
         // Click well off-centre: the label still lands in the middle.
         press(&mut e, "t", mods, 2);
-        e.pointer_down(Point::new(60.0, 40.0), 0, mods, 3);
+        {
+            let fx = e.pointer_down(Point::new(60.0, 40.0), 0, mods, 3);
+            pump(&mut e, &fx);
+        }
         let text_id = match &e.interaction {
             Interaction::TextEditing { id, .. } => id.clone(),
             other => panic!("expected the text editor, got {other:?}"),
         };
-        e.commit_text(&text_id, "label", 4);
+        {
+            let fx = e.commit_text(&text_id, "label", 4);
+            pump(&mut e, &fx);
+        }
 
         let text = e.doc.element(&text_id).unwrap();
         match &text.kind {
@@ -5707,15 +6634,33 @@ mod tests {
             let mut e = editor();
             let mods = Modifiers::default();
             press(&mut e, "f", mods, 1);
-            e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
-            e.pointer_move(Point::new(400.0, 300.0), mods, 3);
-            e.pointer_up(Point::new(400.0, 300.0), mods, 4);
+            {
+                let fx = e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
+                pump(&mut e, &fx);
+            }
+            {
+                let fx = e.pointer_move(Point::new(400.0, 300.0), mods, 3);
+                pump(&mut e, &fx);
+            }
+            {
+                let fx = e.pointer_up(Point::new(400.0, 300.0), mods, 4);
+                pump(&mut e, &fx);
+            }
             let frame_id = e.doc.ordered_live()[0].id.clone();
             press(&mut e, "v", mods, 5);
             e.clear_selection();
-            e.pointer_down(start, 0, mods, 6);
-            e.pointer_move(end, mods, 7);
-            e.pointer_up(end, mods, 8);
+            {
+                let fx = e.pointer_down(start, 0, mods, 6);
+                pump(&mut e, &fx);
+            }
+            {
+                let fx = e.pointer_move(end, mods, 7);
+                pump(&mut e, &fx);
+            }
+            {
+                let fx = e.pointer_up(end, mods, 8);
+                pump(&mut e, &fx);
+            }
             assert!(
                 e.selection.contains(&frame_id),
                 "a selection rectangle enclosing a frame must select it"
@@ -5728,18 +6673,36 @@ mod tests {
         let mut e = editor();
         let mods = Modifiers::default();
         press(&mut e, "f", mods, 1);
-        e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
-        e.pointer_move(Point::new(400.0, 300.0), mods, 3);
-        e.pointer_up(Point::new(400.0, 300.0), mods, 4);
+        {
+            let fx = e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(400.0, 300.0), mods, 3);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(400.0, 300.0), mods, 4);
+            pump(&mut e, &fx);
+        }
         let frame_id = e.doc.ordered_live()[0].id.clone();
         drag_shape(&mut e, Point::new(50.0, 50.0), Point::new(150.0, 150.0), 5);
         let shape_id = e.doc.ordered_live()[1].id.clone();
 
         press(&mut e, "v", mods, 6);
         e.clear_selection();
-        e.pointer_down(Point::new(20.0, 20.0), 0, mods, 7);
-        e.pointer_move(Point::new(300.0, 200.0), mods, 8);
-        e.pointer_up(Point::new(300.0, 200.0), mods, 9);
+        {
+            let fx = e.pointer_down(Point::new(20.0, 20.0), 0, mods, 7);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(300.0, 200.0), mods, 8);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(300.0, 200.0), mods, 9);
+            pump(&mut e, &fx);
+        }
 
         assert_eq!(e.selection.len(), 1);
         assert!(e.selection.contains(&shape_id));
@@ -5754,18 +6717,33 @@ mod tests {
         let mut e = editor();
         let mods = Modifiers::default();
         press(&mut e, "f", mods, 1);
-        e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
-        e.pointer_move(Point::new(400.0, 300.0), mods, 3);
-        e.pointer_up(Point::new(400.0, 300.0), mods, 4);
+        {
+            let fx = e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(400.0, 300.0), mods, 3);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(400.0, 300.0), mods, 4);
+            pump(&mut e, &fx);
+        }
         let frame_id = e.doc.ordered_live()[0].id.clone();
 
         press(&mut e, "t", mods, 5);
-        e.pointer_down(Point::new(200.0, 150.0), 0, mods, 6);
+        {
+            let fx = e.pointer_down(Point::new(200.0, 150.0), 0, mods, 6);
+            pump(&mut e, &fx);
+        }
         let text_id = match &e.interaction {
             Interaction::TextEditing { id, .. } => id.clone(),
             other => panic!("expected the text editor, got {other:?}"),
         };
-        e.commit_text(&text_id, "inside", 7);
+        {
+            let fx = e.commit_text(&text_id, "inside", 7);
+            pump(&mut e, &fx);
+        }
         assert_eq!(
             e.doc.element(&text_id).unwrap().frame_id.as_ref(),
             Some(&frame_id),
@@ -5775,9 +6753,18 @@ mod tests {
         let before = e.doc.element(&text_id).unwrap().bounds();
         press(&mut e, "v", mods, 8);
         e.select([frame_id.clone()]);
-        e.pointer_down(Point::new(100.0, 300.0), 0, mods, 9);
-        e.pointer_move(Point::new(140.0, 340.0), mods, 10);
-        e.pointer_up(Point::new(140.0, 340.0), mods, 11);
+        {
+            let fx = e.pointer_down(Point::new(100.0, 300.0), 0, mods, 9);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(140.0, 340.0), mods, 10);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(140.0, 340.0), mods, 11);
+            pump(&mut e, &fx);
+        }
         let after = e.doc.element(&text_id).unwrap().bounds();
         assert!(
             (after.x - before.x - 40.0).abs() < 0.01,
@@ -5797,16 +6784,28 @@ mod tests {
         e.clear_selection();
 
         // Approaching the east node of A reveals the nodes.
-        e.pointer_move(Point::new(112.0, 25.0), mods, 4);
+        {
+            let fx = e.pointer_move(Point::new(112.0, 25.0), mods, 4);
+            pump(&mut e, &fx);
+        }
         assert!(
             !e.hover_anchor_points().is_empty(),
             "connection nodes appear on approach"
         );
 
         // Dragging from the node starts an arrow bound to that side.
-        e.pointer_down(Point::new(112.0, 25.0), 0, mods, 5);
-        e.pointer_move(Point::new(288.0, 25.0), mods, 6);
-        e.pointer_up(Point::new(288.0, 25.0), mods, 7);
+        {
+            let fx = e.pointer_down(Point::new(112.0, 25.0), 0, mods, 5);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(288.0, 25.0), mods, 6);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(288.0, 25.0), mods, 7);
+            pump(&mut e, &fx);
+        }
 
         let arrow = e
             .doc
@@ -5832,9 +6831,18 @@ mod tests {
 
         // The start followed the source shape when it moved.
         e.select([a.clone()]);
-        e.pointer_down(Point::new(50.0, 25.0), 0, mods, 8);
-        e.pointer_move(Point::new(50.0, 75.0), mods, 9);
-        e.pointer_up(Point::new(50.0, 75.0), mods, 10);
+        {
+            let fx = e.pointer_down(Point::new(50.0, 25.0), 0, mods, 8);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(50.0, 75.0), mods, 9);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(50.0, 75.0), mods, 10);
+            pump(&mut e, &fx);
+        }
         let start_y = match &e.doc.element(&arrow.id).unwrap().kind {
             ElementKind::Arrow { start, .. } => start.y,
             _ => unreachable!(),
@@ -5847,9 +6855,18 @@ mod tests {
         let mut e = editor();
         let mods = Modifiers::default();
         press(&mut e, "f", mods, 1);
-        e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
-        e.pointer_move(Point::new(400.0, 300.0), mods, 3);
-        e.pointer_up(Point::new(400.0, 300.0), mods, 4);
+        {
+            let fx = e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(400.0, 300.0), mods, 3);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(400.0, 300.0), mods, 4);
+            pump(&mut e, &fx);
+        }
         let frame_id = e.doc.ordered_live()[0].id.clone();
         drag_shape(&mut e, Point::new(50.0, 50.0), Point::new(150.0, 150.0), 5);
 
@@ -5883,14 +6900,29 @@ mod tests {
         let mut e = editor();
         let mods = Modifiers::default();
         press(&mut e, "f", mods, 1);
-        e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
-        e.pointer_move(Point::new(400.0, 300.0), mods, 3);
-        e.pointer_up(Point::new(400.0, 300.0), mods, 4);
+        {
+            let fx = e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(400.0, 300.0), mods, 3);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(400.0, 300.0), mods, 4);
+            pump(&mut e, &fx);
+        }
         let frame_id = e.doc.ordered_live()[0].id.clone();
 
         press(&mut e, "v", mods, 5);
-        e.double_click(Point::new(100.0, -8.0), 6);
-        e.commit_text(&frame_id, "us-central1", 7);
+        {
+            let fx = e.double_click(Point::new(100.0, -8.0), 6);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.commit_text(&frame_id, "us-central1", 7);
+            pump(&mut e, &fx);
+        }
         match &e.doc.element(&frame_id).unwrap().kind {
             ElementKind::Frame { name, .. } => assert_eq!(name, "us-central1"),
             other => panic!("expected frame, got {other:?}"),
@@ -5903,9 +6935,18 @@ mod tests {
         let mods = Modifiers::default();
         press(&mut e, "r", mods, 1);
         let id = {
-            e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
-            e.pointer_move(Point::new(100.0, 60.0), mods, 3);
-            e.pointer_up(Point::new(100.0, 60.0), mods, 4);
+            {
+                let fx = e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
+                pump(&mut e, &fx);
+            }
+            {
+                let fx = e.pointer_move(Point::new(100.0, 60.0), mods, 3);
+                pump(&mut e, &fx);
+            }
+            {
+                let fx = e.pointer_up(Point::new(100.0, 60.0), mods, 4);
+                pump(&mut e, &fx);
+            }
             let live = e.doc.ordered_live();
             assert_eq!(live.len(), 1);
             live[0].id.clone()
@@ -5915,8 +6956,14 @@ mod tests {
 
         // The placed shape is selectable after deselecting.
         e.clear_selection();
-        e.pointer_down(Point::new(50.0, 30.0), 0, mods, 5);
-        e.pointer_up(Point::new(50.0, 30.0), mods, 6);
+        {
+            let fx = e.pointer_down(Point::new(50.0, 30.0), 0, mods, 5);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(50.0, 30.0), mods, 6);
+            pump(&mut e, &fx);
+        }
         assert_eq!(e.selection.len(), 1, "clicking the drawn shape selects it");
     }
 
@@ -5931,9 +6978,18 @@ mod tests {
 
         for (i, start) in [0.0_f64, 200.0].iter().enumerate() {
             let now = 10 + i as u64 * 10;
-            e.pointer_down(Point::new(*start, 0.0), 0, mods, now);
-            e.pointer_move(Point::new(start + 80.0, 60.0), mods, now + 1);
-            e.pointer_up(Point::new(start + 80.0, 60.0), mods, now + 2);
+            {
+                let fx = e.pointer_down(Point::new(*start, 0.0), 0, mods, now);
+                pump(&mut e, &fx);
+            }
+            {
+                let fx = e.pointer_move(Point::new(start + 80.0, 60.0), mods, now + 1);
+                pump(&mut e, &fx);
+            }
+            {
+                let fx = e.pointer_up(Point::new(start + 80.0, 60.0), mods, now + 2);
+                pump(&mut e, &fx);
+            }
         }
         assert_eq!(e.doc.ordered_live().len(), 2, "locked tool keeps drawing");
         assert_eq!(e.tool, Tool::Rectangle);
@@ -5954,15 +7010,24 @@ mod tests {
         let mut e = editor();
         let mods = Modifiers::default();
         press(&mut e, "t", mods, 1);
-        e.pointer_down(Point::new(50.0, 50.0), 0, mods, 2);
+        {
+            let fx = e.pointer_down(Point::new(50.0, 50.0), 0, mods, 2);
+            pump(&mut e, &fx);
+        }
         let id = e.doc.ordered_live()[0].id.clone();
-        e.commit_text(&id, "hello", 3);
+        {
+            let fx = e.commit_text(&id, "hello", 3);
+            pump(&mut e, &fx);
+        }
         assert_eq!(e.tool, Tool::Select, "new text is single-shot");
 
         press(&mut e, "t", mods, 4);
         let effects = e.pointer_down(Point::new(55.0, 55.0), 0, mods, 5);
         assert!(!effects.actions.is_empty(), "editing opens the overlay");
-        e.commit_text(&id, "hello again", 6);
+        {
+            let fx = e.commit_text(&id, "hello again", 6);
+            pump(&mut e, &fx);
+        }
         assert_eq!(e.tool, Tool::Text, "editing existing text keeps the tool");
     }
 
@@ -5970,7 +7035,10 @@ mod tests {
     fn clicking_a_caption_selects_and_moves_the_component() {
         let mut e = editor();
         e.set_viewport(800.0, 600.0);
-        e.insert_glyph("cloud_storage", 1);
+        {
+            let fx = e.insert_glyph("cloud_storage", 1);
+            pump(&mut e, &fx);
+        }
         let glyph = e
             .doc
             .ordered_live()
@@ -5989,8 +7057,14 @@ mod tests {
 
         press(&mut e, "v", Modifiers::default(), 2);
         let mods = Modifiers::default();
-        e.pointer_down(caption_centre, 0, mods, 3);
-        e.pointer_up(caption_centre, mods, 4);
+        {
+            let fx = e.pointer_down(caption_centre, 0, mods, 3);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(caption_centre, mods, 4);
+            pump(&mut e, &fx);
+        }
         assert_eq!(
             e.selection.iter().next().map(String::as_str),
             Some(glyph.id.as_str()),
@@ -5998,7 +7072,10 @@ mod tests {
         );
 
         let before = glyph.bounds();
-        e.pointer_down(caption_centre, 0, mods, 5);
+        {
+            let fx = e.pointer_down(caption_centre, 0, mods, 5);
+            pump(&mut e, &fx);
+        }
         e.pointer_move(
             Point::new(caption_centre.x + 40.0, caption_centre.y),
             mods,
@@ -6017,7 +7094,10 @@ mod tests {
     fn erasing_a_caption_removes_the_component() {
         let mut e = editor();
         e.set_viewport(800.0, 600.0);
-        e.insert_glyph("cloud_storage", 1);
+        {
+            let fx = e.insert_glyph("cloud_storage", 1);
+            pump(&mut e, &fx);
+        }
         let caption_centre = e
             .doc
             .ordered_live()
@@ -6029,8 +7109,14 @@ mod tests {
 
         press(&mut e, "e", Modifiers::default(), 2);
         let mods = Modifiers::default();
-        e.pointer_down(caption_centre, 0, mods, 3);
-        e.pointer_up(caption_centre, mods, 4);
+        {
+            let fx = e.pointer_down(caption_centre, 0, mods, 3);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(caption_centre, mods, 4);
+            pump(&mut e, &fx);
+        }
         assert_eq!(e.doc.ordered_live().len(), 0, "glyph and caption both go");
     }
 
@@ -6039,20 +7125,32 @@ mod tests {
         let mut e = editor();
         let mods = Modifiers::default();
         press(&mut e, "t", mods, 1);
-        e.pointer_down(Point::new(50.0, 50.0), 0, mods, 2);
+        {
+            let fx = e.pointer_down(Point::new(50.0, 50.0), 0, mods, 2);
+            pump(&mut e, &fx);
+        }
         let id = e.doc.ordered_live()[0].id.clone();
-        e.commit_text(&id, "hello", 3);
+        {
+            let fx = e.commit_text(&id, "hello", 3);
+            pump(&mut e, &fx);
+        }
         assert_eq!(e.doc.ordered_live().len(), 1);
         assert_eq!(e.tool, Tool::Select, "placing text is single-shot");
 
         press(&mut e, "t", mods, 4);
-        e.pointer_down(Point::new(55.0, 55.0), 0, mods, 5);
+        {
+            let fx = e.pointer_down(Point::new(55.0, 55.0), 0, mods, 5);
+            pump(&mut e, &fx);
+        }
         assert_eq!(
             e.doc.ordered_live().len(),
             1,
             "clicking existing text does not stack a new element"
         );
-        e.commit_text(&id, "hello world", 5);
+        {
+            let fx = e.commit_text(&id, "hello world", 5);
+            pump(&mut e, &fx);
+        }
         assert_eq!(e.doc.ordered_live().len(), 1);
         match &e.doc.element(&id).unwrap().kind {
             ElementKind::Text { text, .. } => assert_eq!(text, "hello world"),
@@ -6115,9 +7213,18 @@ mod tests {
         e.select([glyph.id.clone()]);
         let mods = Modifiers::default();
         let center = glyph.bounds().center();
-        e.pointer_down(center, 0, mods, 2);
-        e.pointer_move(Point::new(center.x + 60.0, center.y), mods, 3);
-        e.pointer_up(Point::new(center.x + 60.0, center.y), mods, 4);
+        {
+            let fx = e.pointer_down(center, 0, mods, 2);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(center.x + 60.0, center.y), mods, 3);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(center.x + 60.0, center.y), mods, 4);
+            pump(&mut e, &fx);
+        }
         let after = e.doc.element(&caption.id).unwrap().bounds();
         assert!((after.x - before.x - 60.0).abs() < 0.01);
     }
@@ -6157,16 +7264,34 @@ mod tests {
         let mut e = editor();
         let mods = Modifiers::default();
         press(&mut e, "r", mods, 1);
-        e.pointer_down(Point::new(10.0, 10.0), 0, mods, 2);
-        e.pointer_move(Point::new(80.0, 60.0), mods, 3);
+        {
+            let fx = e.pointer_down(Point::new(10.0, 10.0), 0, mods, 2);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(80.0, 60.0), mods, 3);
+            pump(&mut e, &fx);
+        }
         press(&mut e, "v", mods, 4);
-        e.pointer_up(Point::new(80.0, 60.0), mods, 5);
+        {
+            let fx = e.pointer_up(Point::new(80.0, 60.0), mods, 5);
+            pump(&mut e, &fx);
+        }
         assert!(e.doc.is_empty(), "tool switch committed a half-drawn shape");
         assert_eq!(e.tool, Tool::Select);
         // The gesture is really over: the next drag uses the new tool.
-        e.pointer_down(Point::new(300.0, 300.0), 0, mods, 6);
-        e.pointer_move(Point::new(320.0, 320.0), mods, 7);
-        e.pointer_up(Point::new(320.0, 320.0), mods, 8);
+        {
+            let fx = e.pointer_down(Point::new(300.0, 300.0), 0, mods, 6);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(320.0, 320.0), mods, 7);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(320.0, 320.0), mods, 8);
+            pump(&mut e, &fx);
+        }
         assert!(e.doc.is_empty());
     }
 
@@ -6175,7 +7300,10 @@ mod tests {
         let mut e = editor();
         drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(100.0, 50.0), 1);
         e.set_tool(Tool::Select);
-        e.double_click(Point::new(50.0, 25.0), 4);
+        {
+            let fx = e.double_click(Point::new(50.0, 25.0), 4);
+            pump(&mut e, &fx);
+        }
         let text_id = e
             .doc
             .ordered_live()
@@ -6183,7 +7311,10 @@ mod tests {
             .find(|element| element.is_text())
             .map(|element| element.id.clone())
             .expect("double-click did not open a bound text");
-        e.commit_text(&text_id, "   ", 5);
+        {
+            let fx = e.commit_text(&text_id, "   ", 5);
+            pump(&mut e, &fx);
+        }
         // The draft is gone entirely and the shape carries no link.
         assert!(e.doc.element(&text_id).is_none());
         assert_eq!(e.doc.ordered_live().len(), 1);
@@ -6195,7 +7326,10 @@ mod tests {
             "empty commit left a dangling bound_text_id"
         );
         // Re-labeling after the abandoned edit works.
-        e.double_click(Point::new(50.0, 25.0), 6);
+        {
+            let fx = e.double_click(Point::new(50.0, 25.0), 6);
+            pump(&mut e, &fx);
+        }
         let fresh = e
             .doc
             .ordered_live()
@@ -6203,7 +7337,10 @@ mod tests {
             .find(|element| element.is_text())
             .map(|element| element.id.clone())
             .expect("second edit did not open a bound text");
-        e.commit_text(&fresh, "real", 7);
+        {
+            let fx = e.commit_text(&fresh, "real", 7);
+            pump(&mut e, &fx);
+        }
         let ElementKind::Shape { bound_text_id, .. } = &e.doc.ordered_live()[0].kind else {
             panic!("expected a shape")
         };
@@ -6229,7 +7366,10 @@ mod tests {
         {
             *bound_text_id = Some("ghost".into());
         }
-        e.double_click(Point::new(50.0, 25.0), 4);
+        {
+            let fx = e.double_click(Point::new(50.0, 25.0), 4);
+            pump(&mut e, &fx);
+        }
         let fresh = e
             .doc
             .ordered_live()
@@ -6237,7 +7377,10 @@ mod tests {
             .find(|element| element.is_text())
             .map(|element| element.id.clone())
             .expect("no fresh bound text opened");
-        e.commit_text(&fresh, "healed", 5);
+        {
+            let fx = e.commit_text(&fresh, "healed", 5);
+            pump(&mut e, &fx);
+        }
         let ElementKind::Shape { bound_text_id, .. } = &e.doc.element(&shape_id).unwrap().kind
         else {
             panic!("expected a shape")
@@ -6250,17 +7393,44 @@ mod tests {
         let mut e = editor();
         let mods = Modifiers::default();
         e.set_tool(Tool::Frame);
-        e.pointer_down(Point::new(0.0, 0.0), 0, mods, 1);
-        e.pointer_move(Point::new(400.0, 300.0), mods, 2);
-        e.pointer_up(Point::new(400.0, 300.0), mods, 3);
+        {
+            let fx = e.pointer_down(Point::new(0.0, 0.0), 0, mods, 1);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(400.0, 300.0), mods, 2);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(400.0, 300.0), mods, 3);
+            pump(&mut e, &fx);
+        }
         e.set_tool(Tool::Frame);
-        e.pointer_down(Point::new(50.0, 50.0), 0, mods, 4);
-        e.pointer_move(Point::new(200.0, 150.0), mods, 5);
-        e.pointer_up(Point::new(200.0, 150.0), mods, 6);
+        {
+            let fx = e.pointer_down(Point::new(50.0, 50.0), 0, mods, 4);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(200.0, 150.0), mods, 5);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(200.0, 150.0), mods, 6);
+            pump(&mut e, &fx);
+        }
         e.set_tool(Tool::Rectangle);
-        e.pointer_down(Point::new(80.0, 80.0), 0, mods, 7);
-        e.pointer_move(Point::new(140.0, 120.0), mods, 8);
-        e.pointer_up(Point::new(140.0, 120.0), mods, 9);
+        {
+            let fx = e.pointer_down(Point::new(80.0, 80.0), 0, mods, 7);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(140.0, 120.0), mods, 8);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(140.0, 120.0), mods, 9);
+            pump(&mut e, &fx);
+        }
 
         let outer = e.doc.ordered_live()[0].id.clone();
         let inner = e.doc.ordered_live()[1].id.clone();
@@ -6270,7 +7440,10 @@ mod tests {
             "inner frame was not adopted by the outer frame"
         );
         e.select([outer.clone()]);
-        e.delete_selection(10);
+        {
+            let fx = e.delete_selection(10);
+            pump(&mut e, &fx);
+        }
         assert_eq!(
             e.doc.live_count(),
             0,
@@ -6289,7 +7462,10 @@ mod tests {
         let mut e = editor();
         drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(160.0, 100.0), 1);
         let shape_id = e.doc.ordered_live()[0].id.clone();
-        e.double_click(Point::new(80.0, 50.0), 2);
+        {
+            let fx = e.double_click(Point::new(80.0, 50.0), 2);
+            pump(&mut e, &fx);
+        }
         let text_id = e
             .doc
             .ordered_live()
@@ -6298,14 +7474,26 @@ mod tests {
             .expect("bound text created")
             .id
             .clone();
-        e.commit_text(&text_id, "hub", 3);
+        {
+            let fx = e.commit_text(&text_id, "hub", 3);
+            pump(&mut e, &fx);
+        }
 
         drag_shape(&mut e, Point::new(300.0, 0.0), Point::new(400.0, 100.0), 4);
         let mods = Modifiers::default();
         press(&mut e, "a", mods, 5);
-        e.pointer_down(Point::new(350.0, 50.0), 0, mods, 6);
-        e.pointer_move(Point::new(80.0, 50.0), mods, 7);
-        e.pointer_up(Point::new(80.0, 50.0), mods, 8);
+        {
+            let fx = e.pointer_down(Point::new(350.0, 50.0), 0, mods, 6);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(80.0, 50.0), mods, 7);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(80.0, 50.0), mods, 8);
+            pump(&mut e, &fx);
+        }
 
         let arrow = e
             .doc
@@ -6334,9 +7522,18 @@ mod tests {
         drag_shape(&mut e, Point::new(30.0, 0.0), Point::new(130.0, 80.0), 2);
         let mods = Modifiers::default();
         press(&mut e, "a", mods, 3);
-        e.pointer_down(Point::new(80.0, 250.0), 0, mods, 4);
-        e.pointer_move(Point::new(80.0, 40.0), mods, 5);
-        e.pointer_up(Point::new(80.0, 40.0), mods, 6);
+        {
+            let fx = e.pointer_down(Point::new(80.0, 250.0), 0, mods, 4);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(80.0, 40.0), mods, 5);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(80.0, 40.0), mods, 6);
+            pump(&mut e, &fx);
+        }
 
         let arrow = e
             .doc
@@ -6384,10 +7581,22 @@ mod tests {
         let b = e.doc.ordered_live()[1].id.clone();
         let mods = Modifiers::default();
         press(&mut e, "a", mods, 3);
-        e.pointer_down(Point::new(50.0, 50.0), 0, mods, 4);
-        e.pointer_move(Point::new(350.0, 50.0), mods, 5);
-        e.pointer_up(Point::new(350.0, 50.0), mods, 6);
-        e.double_click(Point::new(200.0, 50.0), 7);
+        {
+            let fx = e.pointer_down(Point::new(50.0, 50.0), 0, mods, 4);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(350.0, 50.0), mods, 5);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(350.0, 50.0), mods, 6);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.double_click(Point::new(200.0, 50.0), 7);
+            pump(&mut e, &fx);
+        }
         let text_id = e
             .doc
             .ordered_live()
@@ -6396,14 +7605,26 @@ mod tests {
             .expect("label created")
             .id
             .clone();
-        e.commit_text(&text_id, "sync", 8);
+        {
+            let fx = e.commit_text(&text_id, "sync", 8);
+            pump(&mut e, &fx);
+        }
         let before = e.doc.element(&text_id).unwrap().bounds();
 
         press(&mut e, "v", mods, 9);
         e.select([b.clone()]);
-        e.pointer_down(Point::new(350.0, 50.0), 0, mods, 10);
-        e.pointer_move(Point::new(350.0, 250.0), mods, 11);
-        e.pointer_up(Point::new(350.0, 250.0), mods, 12);
+        {
+            let fx = e.pointer_down(Point::new(350.0, 50.0), 0, mods, 10);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(350.0, 250.0), mods, 11);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(350.0, 250.0), mods, 12);
+            pump(&mut e, &fx);
+        }
 
         let after = e.doc.element(&text_id).unwrap().bounds();
         assert!(
@@ -6417,7 +7638,10 @@ mod tests {
         let mut e = editor();
         drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(100.0, 100.0), 1);
         let shape_id = e.doc.ordered_live()[0].id.clone();
-        e.double_click(Point::new(50.0, 50.0), 2);
+        {
+            let fx = e.double_click(Point::new(50.0, 50.0), 2);
+            pump(&mut e, &fx);
+        }
         let text_id = e
             .doc
             .ordered_live()
@@ -6426,7 +7650,10 @@ mod tests {
             .expect("bound text created")
             .id
             .clone();
-        e.commit_text(&text_id, "node", 3);
+        {
+            let fx = e.commit_text(&text_id, "node", 3);
+            pump(&mut e, &fx);
+        }
         let label_before = e.doc.element(&text_id).unwrap().bounds();
 
         let mods = Modifiers::default();
@@ -6444,14 +7671,29 @@ mod tests {
         let mut e = editor();
         let mods = Modifiers::default();
         press(&mut e, "f", mods, 1);
-        e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
-        e.pointer_move(Point::new(400.0, 400.0), mods, 3);
-        e.pointer_up(Point::new(400.0, 400.0), mods, 4);
+        {
+            let fx = e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_move(Point::new(400.0, 400.0), mods, 3);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(400.0, 400.0), mods, 4);
+            pump(&mut e, &fx);
+        }
         let frame_id = e.doc.ordered_live()[0].id.clone();
 
         press(&mut e, "k", mods, 5);
-        e.pointer_down(Point::new(100.0, 100.0), 0, mods, 6);
-        e.pointer_up(Point::new(100.0, 100.0), mods, 7);
+        {
+            let fx = e.pointer_down(Point::new(100.0, 100.0), 0, mods, 6);
+            pump(&mut e, &fx);
+        }
+        {
+            let fx = e.pointer_up(Point::new(100.0, 100.0), mods, 7);
+            pump(&mut e, &fx);
+        }
         let stack = e
             .doc
             .ordered_live()

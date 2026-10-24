@@ -58,7 +58,7 @@ pub fn hit_test_raw(doc: &Document, point: Point, tolerance: f64) -> Option<Elem
 
 /// Fully transparent elements never intercept input — there is no paint
 /// under the cursor for the user to aim at.
-fn invisible(element: &Element) -> bool {
+pub(crate) fn invisible(element: &Element) -> bool {
     crate::editor::element_style(element)
         .map(|style| style.opacity <= 0.0)
         .unwrap_or(false)
@@ -75,6 +75,85 @@ pub fn elements_in_rect(doc: &Document, rect: Rect) -> Vec<ElementId> {
         })
         .map(|e| e.id.clone())
         .collect()
+}
+
+/// Indexed hit testing for pointer-hot paths (hover, click, marquee): the
+/// same results as the full scan, from grid candidates only. `tolerance` is
+/// in world units, as in [`hit_test_raw`].
+pub fn hit_test_raw_indexed(
+    doc: &Document,
+    index: &crate::spatial::HitIndex,
+    point: Point,
+    tolerance: f64,
+) -> Option<ElementId> {
+    // Same reject the exact test uses (model bounds + max stroke slack), so
+    // the candidate set is a superset of the scan's and results are identical.
+    let pad = tolerance + crate::spatial::hit_pad();
+    let area = Rect::new(point.x - pad, point.y - pad, pad * 2.0, pad * 2.0);
+    let mut best: Option<(String, String)> = None; // (index key, id)
+    for row in index.query(area) {
+        let Some((id, key, _)) = index.row(row) else {
+            continue;
+        };
+        let Some(element) = doc.element(id).filter(|e| !e.is_deleted) else {
+            continue;
+        };
+        if !hits(doc, element, point, tolerance) {
+            continue;
+        }
+        let topmost = best
+            .as_ref()
+            .is_none_or(|(best_key, best_id)| (key, id) > (best_key.as_str(), best_id.as_str()));
+        if topmost {
+            best = Some((key.to_string(), id.to_string()));
+        }
+    }
+    best.map(|(_, id)| id)
+}
+
+/// Indexed [`hit_test`] with the bound-text-to-container mapping.
+pub fn hit_test_indexed(
+    doc: &Document,
+    index: &crate::spatial::HitIndex,
+    point: Point,
+    tolerance: f64,
+) -> Option<ElementId> {
+    hit_test_raw_indexed(doc, index, point, tolerance).map(|id| resolve_container(doc, &id))
+}
+
+/// Indexed [`elements_in_rect`]: identical results from grid candidates.
+pub fn elements_in_rect_indexed(
+    doc: &Document,
+    index: &crate::spatial::HitIndex,
+    rect: Rect,
+) -> Vec<ElementId> {
+    let pad = crate::spatial::hit_pad() + 4.0;
+    let area = rect.expand(pad);
+    let mut ids: Vec<ElementId> = Vec::new();
+    for row in index.query(area) {
+        let Some((id, _, _)) = index.row(row) else {
+            continue;
+        };
+        let Some(element) = doc.element(id).filter(|e| !e.is_deleted) else {
+            continue;
+        };
+        if invisible(element) {
+            continue;
+        }
+        let bounds = element.bounds();
+        if bounds.intersects(&rect) || bounds.expand(4.0).intersects(&rect) {
+            ids.push(element.id.clone());
+        }
+    }
+    // Restore z-order: candidates arrive in row (insertion) order.
+    ids.sort_by(|a, b| {
+        let (ka, kb) = (
+            doc.element(a).map(|e| e.index.as_str()).unwrap_or(""),
+            doc.element(b).map(|e| e.index.as_str()).unwrap_or(""),
+        );
+        ka.cmp(kb).then_with(|| a.cmp(b))
+    });
+    ids
 }
 
 pub fn hits(doc: &Document, element: &Element, p: Point, tolerance: f64) -> bool {
