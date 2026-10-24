@@ -1452,8 +1452,12 @@ impl CanvasServer {
                         Err(message) => return failure(message),
                     };
                     let id = canvas_core::id::new_element_id();
-                    let frame = canvas_core::model::Element::new(frame_kind, index, now)
-                        .with_id(id.clone());
+                    let frame = canvas_core::model::Element::new_with_id(
+                        frame_kind,
+                        index,
+                        now,
+                        id.clone(),
+                    );
                     for shape_id in stats.shape_ids.clone() {
                         if let Some(element) = doc.element_mut(&shape_id) {
                             element.frame_id = Some(id.clone());

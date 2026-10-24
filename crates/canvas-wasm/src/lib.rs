@@ -399,6 +399,9 @@ impl Editor {
         grid_canvas: HtmlCanvasElement,
     ) -> Result<Editor, JsValue> {
         console_error_panic_hook::set_once();
+        // The only platform-entropy crossing: seed ids and nonces at boot so
+        // fixture loads and first edits never enter JS for randomness.
+        canvas_core::id::seed_process_rng();
         let ctx = scene_canvas
             .get_context("2d")?
             .ok_or_else(|| JsValue::from_str("scene canvas has no 2d context"))?

@@ -4,31 +4,55 @@
 
 use crate::connector;
 use crate::geometry::{Point, Rect};
-use crate::model::{Binding, Document, ElementKind, Endpoint, Routing, Style, TextAlign};
+use crate::model::{Binding, Document, Element, ElementKind, Endpoint, Routing, Style, TextAlign};
+
+/// Add an element under a caller-supplied id, above the current stack.
+fn add(doc: &mut Document, kind: ElementKind, id: &str) -> String {
+    let index = match doc.top_index() {
+        Some(top) => crate::index::key_between(Some(&top), None).expect("index space"),
+        None => crate::index::key_between(None, None).expect("first index"),
+    };
+    doc.insert(Element::new_with_id(kind, index, 0, id));
+    id.to_string()
+}
 
 /// Build the demo architecture deterministically.
+///
+/// Every element has an explicit id: the demo is reproducible, and loading it
+/// never draws from the element-id RNG.
 pub fn demo_document() -> Document {
     let mut doc = Document::new();
-    let frame_id = doc.add(
+    let frame_id = add(
+        &mut doc,
         ElementKind::Frame {
             rect: Rect::new(520.0, 120.0, 780.0, 600.0),
             name: "VPC prod".into(),
         },
-        0,
+        "demo-frame",
     );
 
-    let user = glyph(&mut doc, "user", 100.0, 360.0, "User", None);
+    let user = glyph(&mut doc, "demo-user", "user", 100.0, 360.0, "User", None);
     let load_balancer = glyph(
         &mut doc,
+        "demo-load-balancing",
         "load_balancing",
         320.0,
         360.0,
         "Load Balancing",
         None,
     );
-    let gke = glyph(&mut doc, "gke", 640.0, 220.0, "GKE", Some(&frame_id));
+    let gke = glyph(
+        &mut doc,
+        "demo-gke",
+        "gke",
+        640.0,
+        220.0,
+        "GKE",
+        Some(&frame_id),
+    );
     let sql = glyph(
         &mut doc,
+        "demo-cloud-sql",
         "cloud_sql",
         640.0,
         480.0,
@@ -37,6 +61,7 @@ pub fn demo_document() -> Document {
     );
     let storage = glyph(
         &mut doc,
+        "demo-cloud-storage",
         "cloud_storage",
         1060.0,
         220.0,
@@ -45,6 +70,7 @@ pub fn demo_document() -> Document {
     );
     let pubsub = glyph(
         &mut doc,
+        "demo-pubsub",
         "pubsub",
         1060.0,
         480.0,
@@ -52,11 +78,17 @@ pub fn demo_document() -> Document {
         Some(&frame_id),
     );
 
-    connect(&mut doc, &user, &load_balancer, None);
-    connect(&mut doc, &load_balancer, &gke, Some("https"));
-    connect(&mut doc, &gke, &sql, Some("jdbc"));
-    connect(&mut doc, &gke, &storage, Some("objects"));
-    connect(&mut doc, &gke, &pubsub, Some("events"));
+    connect(&mut doc, "demo-connect-0", &user, &load_balancer, None);
+    connect(
+        &mut doc,
+        "demo-connect-1",
+        &load_balancer,
+        &gke,
+        Some("https"),
+    );
+    connect(&mut doc, "demo-connect-2", &gke, &sql, Some("jdbc"));
+    connect(&mut doc, "demo-connect-3", &gke, &storage, Some("objects"));
+    connect(&mut doc, "demo-connect-4", &gke, &pubsub, Some("events"));
 
     doc
 }
@@ -64,27 +96,31 @@ pub fn demo_document() -> Document {
 #[allow(clippy::too_many_arguments)]
 fn glyph(
     doc: &mut Document,
+    id: &str,
     glyph_id: &str,
     x: f64,
     y: f64,
     name: &str,
     frame: Option<&str>,
 ) -> String {
-    let id = doc.add(
+    let id = add(
+        doc,
         ElementKind::Glyph {
             glyph: glyph_id.into(),
             rect: Rect::new(x, y, 96.0, 96.0),
             style: Style::default(),
             caption_id: None,
         },
-        0,
+        id,
     );
     if let Some(frame) = frame {
         if let Some(element) = doc.element_mut(&id) {
             element.frame_id = Some(frame.to_string());
         }
     }
-    let caption = doc.add(
+    let caption_id = format!("{id}-caption");
+    let caption = add(
+        doc,
         ElementKind::Text {
             rect: Rect::new(x - 48.0, y + 100.0, 192.0, 26.0),
             text: name.into(),
@@ -93,7 +129,7 @@ fn glyph(
             container_id: Some(id.clone()),
             style: Style::default(),
         },
-        0,
+        &caption_id,
     );
     if let Some(element) = doc.element_mut(&id) {
         if let ElementKind::Glyph { caption_id, .. } = &mut element.kind {
@@ -103,10 +139,11 @@ fn glyph(
     id
 }
 
-fn connect(doc: &mut Document, from: &str, to: &str, label: Option<&str>) -> String {
+fn connect(doc: &mut Document, id: &str, from: &str, to: &str, label: Option<&str>) -> String {
     let from_rect = doc.element(from).map(|e| e.bounds()).unwrap_or(Rect::ZERO);
     let to_rect = doc.element(to).map(|e| e.bounds()).unwrap_or(Rect::ZERO);
-    let arrow = doc.add(
+    let arrow = add(
+        doc,
         ElementKind::Arrow {
             start: Endpoint {
                 x: from_rect.center().x,
@@ -131,7 +168,7 @@ fn connect(doc: &mut Document, from: &str, to: &str, label: Option<&str>) -> Str
             waypoints: Vec::new(),
             label_id: None,
         },
-        0,
+        id,
     );
     if let Some(text) = label {
         let midpoint = doc
@@ -148,7 +185,9 @@ fn connect(doc: &mut Document, from: &str, to: &str, label: Option<&str>) -> Str
             })
             .map(|route| connector::point_at(&route, 0.5))
             .unwrap_or(Point::ZERO);
-        let label_id = doc.add(
+        let label_id = format!("{arrow}-label");
+        let label_id = add(
+            doc,
             ElementKind::Text {
                 rect: Rect::new(midpoint.x - 60.0, midpoint.y - 34.0, 120.0, 26.0),
                 text: text.into(),
@@ -157,7 +196,7 @@ fn connect(doc: &mut Document, from: &str, to: &str, label: Option<&str>) -> Str
                 container_id: Some(arrow.clone()),
                 style: Style::default(),
             },
-            0,
+            &label_id,
         );
         if let Some(element) = doc.element_mut(&arrow) {
             if let ElementKind::Arrow { label_id: slot, .. } = &mut element.kind {
@@ -172,6 +211,20 @@ fn connect(doc: &mut Document, from: &str, to: &str, label: Option<&str>) -> Str
 mod tests {
     use super::*;
     use crate::text::ApproxMeasurer;
+
+    #[test]
+    fn demo_supplies_its_own_ids() {
+        let before = crate::id::element_id_generations();
+        let doc = demo_document();
+        assert_eq!(
+            crate::id::element_id_generations(),
+            before,
+            "the demo must not draw element ids"
+        );
+        assert!(doc.elements.contains_key("demo-frame"));
+        assert!(doc.elements.contains_key("demo-user-caption"));
+        assert!(doc.elements.contains_key("demo-connect-1-label"));
+    }
 
     #[test]
     fn demo_is_a_connected_architecture() {

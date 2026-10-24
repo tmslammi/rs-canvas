@@ -254,11 +254,26 @@ pub struct Element {
 }
 
 impl Element {
-    /// Build a fresh element. `id`, `index` and `now_ms` are supplied by the
-    /// caller so core stays clock-free and tests stay deterministic.
+    /// Build a fresh element with a generated ID. `index` and `now_ms` are
+    /// supplied by the caller so core stays clock-free and tests stay
+    /// deterministic.
     pub fn new(kind: ElementKind, index: String, now_ms: u64) -> Self {
+        Self::new_with_id(kind, index, now_ms, new_element_id())
+    }
+
+    /// Build a fresh element with a caller-supplied ID.
+    ///
+    /// Unlike [`Element::new`], this never generates (or overrides) an ID:
+    /// fixtures, demos and imports that already know the identity should use
+    /// it. Merge metadata is stamped exactly as `new` does.
+    pub fn new_with_id(
+        kind: ElementKind,
+        index: String,
+        now_ms: u64,
+        id: impl Into<String>,
+    ) -> Self {
         Self {
-            id: new_element_id(),
+            id: id.into(),
             version: 1,
             version_nonce: new_version_nonce(),
             index,
@@ -269,6 +284,7 @@ impl Element {
         }
     }
 
+    /// Override a generated ID. Kept for callers that build through `new`.
     pub fn with_id(mut self, id: impl Into<String>) -> Self {
         self.id = id.into();
         self
@@ -524,6 +540,34 @@ mod tests {
         assert_eq!(element.version, 1);
         assert!(!element.is_deleted);
         assert_eq!(element.updated, 7);
+    }
+
+    #[test]
+    fn caller_supplied_id_is_kept_and_never_generated() {
+        let before = crate::id::element_id_generations();
+        let element = Element::new_with_id(shape(0.0, 0.0), "a0".into(), 7, "explicit-id");
+        assert_eq!(
+            crate::id::element_id_generations(),
+            before,
+            "new_with_id must not draw an ID it is about to discard"
+        );
+        assert_eq!(element.id, "explicit-id");
+        assert_eq!(element.version, 1);
+        assert_eq!(element.updated, 7);
+        assert!(!element.is_deleted);
+        assert!(element.frame_id.is_none());
+    }
+
+    #[test]
+    fn with_id_still_overrides_a_generated_id() {
+        let before = crate::id::element_id_generations();
+        let element = Element::new(shape(0.0, 0.0), "a0".into(), 7).with_id("overridden");
+        assert_eq!(
+            crate::id::element_id_generations(),
+            before + 1,
+            "plain new still generates an ID"
+        );
+        assert_eq!(element.id, "overridden");
     }
 
     #[test]
