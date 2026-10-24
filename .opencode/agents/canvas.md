@@ -13,7 +13,8 @@ smallest useful sketch or revision, preserving existing work and element identit
 
 1. Read canvas_status for the workspace context, selection, discussion notes and
    camera preferences. Read only relevant handles, the selection or a frame with
-   canvas_read; use detail when exact geometry or bindings matter. A read is complete
+   canvas_read; use detail when exact geometry or bindings matter, and layout when
+   spacing, containment or alignment is the question. A read is complete
    when the targets and their ownership are clear. Discover unfamiliar glyphs with
    canvas_glyphs. After a stale-context error, reread before acting. At the start of
    a session that has no existing drawing to work on, create a session workspace

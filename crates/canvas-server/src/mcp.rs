@@ -364,6 +364,11 @@ struct ReadArgs {
     /// combined with ids, frame, query, selected or since.
     #[serde(default)]
     attention: bool,
+    /// Add computed layout facts after the element lines: overlaps, near
+    /// misses, out-of-frame elements, orphans, dangling connectors, alignment
+    /// and text overflow. Capped at 50; off by default.
+    #[serde(default)]
+    layout: bool,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -1097,6 +1102,9 @@ impl CanvasServer {
                        query searches labels/names. Defaults to 100 elements, capped at 500; \
                        offset pagination needs the first read's context and unchanged revision. \
                        detail adds exact element JSON, including full stroke points. \
+                       layout adds computed facts after the lines: overlaps, near misses, \
+                       out-of-frame elements, orphaned labels, dangling connectors, \
+                       alignment and text overflow. \
                        summary returns whole-document counts by kind, bounds and top fills \
                        in a few hundred tokens at any scale: start there on large boards. \
                        attention reads what the user is looking at: the view rect and zoom, \
@@ -1199,8 +1207,12 @@ impl CanvasServer {
                 return failure("resync_required: change history no longer covers that cursor; start a full or scoped read");
             }
             let records = workspace.changes_since(since).await;
-            let (text, changes, changed, removed) =
+            let (mut text, changes, changed, removed) =
                 describe_changes(&doc, &records, since, revision, &mut *aliases);
+            if args.layout {
+                let report = canvas_core::layout::analyze(&doc);
+                text.push_str(&canvas_core::layout::render(&report, &mut *aliases));
+            }
             let structured = serde_json::json!({
                 "workspace": workspace.name,
                 "context": workspace.context(),
@@ -1332,6 +1344,16 @@ impl CanvasServer {
                     "next offset={} revision={revision}\n",
                     offset.saturating_add(limit)
                 ));
+            }
+            if args.layout {
+                let report = if has_scope || query.is_some() {
+                    let matched: std::collections::BTreeSet<String> =
+                        matches.iter().map(|element| element.id.clone()).collect();
+                    canvas_core::layout::analyze_scoped(&doc, &matched)
+                } else {
+                    canvas_core::layout::analyze(&doc)
+                };
+                text.push_str(&canvas_core::layout::render(&report, &mut *aliases));
             }
             let structured = serde_json::json!({
                 "workspace": workspace.name,
@@ -2744,6 +2766,221 @@ mod tests {
             "{scoped}"
         );
         assert!(!scoped.contains(&format!("stack {sth}")), "{scoped}");
+    }
+
+    #[tokio::test]
+    async fn canvas_read_layout_reports_computed_facts_without_owned_noise() {
+        use canvas_core::geometry::Rect;
+        use canvas_core::model::{
+            Binding, ElementKind, Endpoint, Routing, ShapeKind, Style, TextAlign,
+        };
+
+        let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
+        let workspace = state.workspace(crate::state::DEFAULT_WORKSPACE).await;
+        let server = CanvasServer::new(state);
+
+        let shape = |doc: &mut canvas_core::model::Document, rect: Rect| {
+            doc.add(
+                ElementKind::Shape {
+                    shape: ShapeKind::Rectangle,
+                    rect,
+                    style: Style::default(),
+                    bound_text_id: None,
+                },
+                1,
+            )
+        };
+
+        let (
+            frame,
+            overlap_a,
+            overlap_b,
+            label_id,
+            near_a,
+            near_b,
+            outside,
+            orphan,
+            gone,
+            arrow,
+            dangling_target,
+            stack,
+            sticky,
+        ) = {
+            let mut doc = workspace.doc.lock().await;
+            let frame = doc.add(
+                ElementKind::Frame {
+                    rect: Rect::new(0.0, 0.0, 400.0, 300.0),
+                    name: "VPC".into(),
+                },
+                1,
+            );
+            let overlap_a = shape(&mut doc, Rect::new(10.0, 10.0, 100.0, 60.0));
+            let overlap_b = shape(&mut doc, Rect::new(80.0, 30.0, 100.0, 60.0));
+            doc.element_mut(&overlap_a).unwrap().frame_id = Some(frame.clone());
+            doc.element_mut(&overlap_b).unwrap().frame_id = Some(frame.clone());
+            let label_id = doc.add(
+                ElementKind::Text {
+                    rect: Rect::new(20.0, 20.0, 40.0, 20.0),
+                    text: "API".into(),
+                    align: TextAlign::Center,
+                    fixed_width: false,
+                    container_id: Some(overlap_a.clone()),
+                    style: Style::default(),
+                },
+                1,
+            );
+            if let ElementKind::Shape { bound_text_id, .. } =
+                &mut doc.element_mut(&overlap_a).unwrap().kind
+            {
+                *bound_text_id = Some(label_id.clone());
+            }
+
+            let near_a = shape(&mut doc, Rect::new(300.0, 400.0, 100.0, 60.0));
+            let near_b = shape(&mut doc, Rect::new(408.0, 400.0, 100.0, 60.0));
+            let outside = shape(&mut doc, Rect::new(360.0, 100.0, 58.0, 50.0));
+            doc.element_mut(&outside).unwrap().frame_id = Some(frame.clone());
+
+            let gone = shape(&mut doc, Rect::new(600.0, 400.0, 100.0, 60.0));
+            let orphan = doc.add(
+                ElementKind::Text {
+                    rect: Rect::new(600.0, 400.0, 40.0, 20.0),
+                    text: "orphan".into(),
+                    align: TextAlign::Left,
+                    fixed_width: false,
+                    container_id: Some(gone.clone()),
+                    style: Style::default(),
+                },
+                1,
+            );
+            doc.element_mut(&gone).unwrap().is_deleted = true;
+
+            let dangling_target = shape(&mut doc, Rect::new(700.0, 400.0, 100.0, 60.0));
+            doc.element_mut(&dangling_target).unwrap().is_deleted = true;
+            let arrow = doc.add(
+                ElementKind::Arrow {
+                    start: Endpoint::free(700.0, 100.0),
+                    end: Endpoint {
+                        x: 700.0,
+                        y: 400.0,
+                        binding: Some(Binding {
+                            element_id: dangling_target.clone(),
+                            focus: None,
+                        }),
+                    },
+                    routing: Routing::Straight,
+                    start_arrowhead: false,
+                    end_arrowhead: true,
+                    style: Style::default(),
+                    waypoints: Vec::new(),
+                    label_id: None,
+                },
+                1,
+            );
+
+            let stack = doc.add(
+                ElementKind::StickyStack {
+                    rect: Rect::new(0.0, 500.0, 140.0, 140.0),
+                    style: Style::default(),
+                },
+                1,
+            );
+            let sticky = doc.add(
+                ElementKind::Shape {
+                    shape: ShapeKind::Sticky,
+                    rect: Rect::new(10.0, 510.0, 120.0, 120.0),
+                    style: Style::default(),
+                    bound_text_id: None,
+                },
+                1,
+            );
+            (
+                frame,
+                overlap_a,
+                overlap_b,
+                label_id,
+                near_a,
+                near_b,
+                outside,
+                orphan,
+                gone,
+                arrow,
+                dangling_target,
+                stack,
+                sticky,
+            )
+        };
+
+        let plain = error_text(
+            &server
+                .canvas_read(Parameters(ReadArgs::default()))
+                .await
+                .unwrap(),
+        );
+        assert!(!plain.contains("layout:"), "layout is opt-in: {plain}");
+
+        let text = error_text(
+            &server
+                .canvas_read(Parameters(ReadArgs {
+                    layout: true,
+                    ..Default::default()
+                }))
+                .await
+                .unwrap(),
+        );
+
+        let mut aliases = workspace.aliases.lock().await;
+        let h_frame = aliases.handle(&frame);
+        let h_a = aliases.handle(&overlap_a);
+        let h_b = aliases.handle(&overlap_b);
+        let h_label = aliases.handle(&label_id);
+        let h_near_a = aliases.handle(&near_a);
+        let h_near_b = aliases.handle(&near_b);
+        let h_outside = aliases.handle(&outside);
+        let h_orphan = aliases.handle(&orphan);
+        let h_gone = aliases.handle(&gone);
+        let h_arrow = aliases.handle(&arrow);
+        let h_target = aliases.handle(&dangling_target);
+        let h_stack = aliases.handle(&stack);
+        let h_sticky = aliases.handle(&sticky);
+        drop(aliases);
+
+        assert!(text.contains("layout:"), "{text}");
+        assert!(
+            text.contains(&format!("overlap {h_a} {h_b} 30x40")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("near {h_near_a} {h_near_b} gap=8")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("outside {h_outside} in={h_frame} right=18")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("orphan {h_orphan} owner={h_gone} (deleted)")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("dangling {h_arrow} end->{h_target} (deleted)")),
+            "{text}"
+        );
+
+        // Frame children, text containers, bound labels and the sticky pile
+        // are ownership, not accidental overlap.
+        for (left, right) in [
+            (&h_frame, &h_a),
+            (&h_frame, &h_b),
+            (&h_frame, &h_label),
+            (&h_a, &h_label),
+            (&h_stack, &h_sticky),
+        ] {
+            assert!(
+                !text.contains(&format!("overlap {left} {right} "))
+                    && !text.contains(&format!("overlap {right} {left} ")),
+                "{left}/{right} must not report an overlap: {text}"
+            );
+        }
     }
 
     #[tokio::test]

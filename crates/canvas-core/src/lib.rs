@@ -21,6 +21,7 @@ pub mod history;
 pub mod hit;
 pub mod id;
 pub mod index;
+pub mod layout;
 pub mod merge;
 pub mod model;
 pub mod nav;
