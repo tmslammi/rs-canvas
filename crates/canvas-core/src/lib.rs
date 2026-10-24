@@ -32,6 +32,7 @@ pub mod spatial;
 pub mod svg;
 pub mod text;
 pub mod tool;
+pub mod wire;
 
 pub use benchmark::benchmark_fixture;
 pub use bulk::{BulkStats, BulkStyle, GridSpec, KeyChain, LinkMode, ShapeCode, ShapeSpec};

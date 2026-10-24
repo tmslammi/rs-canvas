@@ -48,6 +48,19 @@ pub(crate) fn decode(payload: &[u8]) -> Result<Document, postcard::Error> {
     Ok(owned.into())
 }
 
+/// Encode a wire patch: a bare sequence of full elements in the same frozen v1
+/// element layout. Unlike the document payload there is no map key, because a
+/// patch carries only the elements that changed.
+pub(crate) fn encode_elements(elements: &[Element]) -> Result<Vec<u8>, postcard::Error> {
+    postcard::to_allocvec(&ElementSliceBorrowed(elements))
+}
+
+/// Decode a wire patch payload into full elements.
+pub(crate) fn decode_elements(payload: &[u8]) -> Result<Vec<Element>, postcard::Error> {
+    let owned: Vec<ElementOwned> = postcard::from_bytes(payload)?;
+    Ok(owned.into_iter().map(Element::from).collect())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 struct PointV1 {
     x: f64,
@@ -183,6 +196,20 @@ impl Serialize for PointSliceBorrowed<'_> {
         let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
         for point in self.0 {
             sequence.serialize_element(&PointV1::from(*point))?;
+        }
+        sequence.end()
+    }
+}
+
+/// A borrowed element list for wire patches: the same v1 element layout as a
+/// document, as a bare sequence instead of an id-keyed map.
+struct ElementSliceBorrowed<'a>(&'a [Element]);
+
+impl Serialize for ElementSliceBorrowed<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for element in self.0 {
+            sequence.serialize_element(&ElementBorrowed::from(element))?;
         }
         sequence.end()
     }
@@ -755,6 +782,21 @@ mod tests {
     fn empty_payload_round_trips() {
         let doc = Document::new();
         assert_eq!(decode(&encode(&doc).unwrap()).unwrap(), doc);
+    }
+
+    #[test]
+    fn element_list_round_trips_every_kind() {
+        let doc = all_kinds_document();
+        let elements: Vec<Element> = doc.elements.into_values().collect();
+        let payload = encode_elements(&elements).unwrap();
+        assert_eq!(decode_elements(&payload).unwrap(), elements);
+        assert_eq!(payload, encode_elements(&elements).unwrap());
+    }
+
+    #[test]
+    fn empty_element_list_round_trips() {
+        let payload = encode_elements(&[]).unwrap();
+        assert!(decode_elements(&payload).unwrap().is_empty());
     }
 
     /// Every element kind, every enum variant, every style field and every
