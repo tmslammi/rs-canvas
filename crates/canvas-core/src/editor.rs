@@ -208,7 +208,8 @@ impl Editor {
         self.session.document()
     }
 
-    /// The current camera (view state only, copied for the shell's reads).
+    /// The current camera (view state only). This returns a copy: mutate the
+    /// editor's camera through [`Editor::camera_mut`] or [`Editor::set_camera`].
     pub fn camera(&self) -> Camera {
         self.view.camera
     }
