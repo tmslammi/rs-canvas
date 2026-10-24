@@ -35,7 +35,8 @@ Camera and presentation tools move the user's view; they never change the drawin
 The user may keep several workspaces (named, isolated canvases); every tool acts on \
 the one the user is currently viewing — canvas_status names it and lists the rest. \
 canvas_workspace_create starts a new workspace and brings the user's page to it, so \
-later calls act there. \
+later calls act there. Give a new discussion its own session workspace unless the \
+user is pointing at an existing drawing or workspace. \
 Think together: sketch the smallest useful idea, explore one concrete tradeoff or \
 failure case, and revise existing elements with canvas_script update beats. \
 Read selected elements, ids or a frame rather than unrelated content. Reads return \
@@ -747,7 +748,9 @@ impl CanvasServer {
     #[tool(
         description = "Create a named workspace and open it for the user: the page \
                        showing the current workspace saves its drawing and switches to \
-                       the new one, so later calls act there. Names are 1–40 lowercase \
+                       the new one, so later calls act there. Use it once at the start \
+                       of a session that has no existing drawing to work on, then reuse \
+                       that workspace for the session. Names are 1–40 lowercase \
                        letters, digits or dashes, starting with a letter or digit; the \
                        name must not exist. With no page connected the workspace is \
                        created but the agent stays on the current workspace until the \

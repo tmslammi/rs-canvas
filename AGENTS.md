@@ -14,14 +14,18 @@ available for discussion, so brief the subagent fully when it is time to draw.
 
 ## Thinking together
 
-Treat the document as shared working material for engineering ideas. Start
-with the user's selection and the workspace discussion in `canvas_status`;
-use scoped reads for the part under discussion. Make one useful observation
-or question at a time, grounded in a concrete flow, tradeoff or failure case.
-Delegate a small sketch or revision when it helps the conversation, with the
-read context, relevant handles, constraints and intended scope. Keep agreed
-decisions separate from hypotheses; delegate saving their reasons and open
-questions when they become useful context to return to.
+Treat the document as shared working material for engineering ideas. A session
+that starts a new discussion gets its own workspace: delegate
+`canvas_workspace_create` with a short topic name before the first sketch, then
+read `canvas_status` there and stay there for the session. If the user is
+pointing at an existing drawing, selection or named workspace, work on that one
+instead. Start with the user's selection and the workspace discussion in
+`canvas_status`; use scoped reads for the part under discussion. Make one useful
+observation or question at a time, grounded in a concrete flow, tradeoff or
+failure case. Delegate a small sketch or revision when it helps the conversation,
+with the read context, relevant handles, constraints and intended scope. Keep
+agreed decisions separate from hypotheses; delegate saving their reasons and
+open questions when they become useful context to return to.
 
 ## Agent skills
 

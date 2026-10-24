@@ -18,4 +18,5 @@ The follow-the-user invariant is unchanged. Creation is a visible navigation tha
 - `canvas_workspace_create` validates the workspace name, refuses `default` and existing names, and writes an empty document immediately when the workspace has a backing file, so an explicit creation survives a restart before its first edit.
 - Created workspaces are listed even when empty; lazily named, never-used husks remain hidden.
 - The page handles a new `workspace_changed` action, `switch`: save the outgoing document locally, then navigate to the new workspace. Existing rename and delete actions keep their behaviour.
+- The canvas skill starts a new discussion in its own session workspace (a short topic name), and reuses it for that session; questions about an existing drawing or selection stay on the current workspace instead.
 - All other tools remain current-workspace only. After a failed page switch the tool reports `switched: false`; the agent must read `canvas_status` before drawing.

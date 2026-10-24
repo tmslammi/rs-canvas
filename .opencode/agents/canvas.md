@@ -15,9 +15,11 @@ smallest useful sketch or revision, preserving existing work and element identit
    camera preferences. Read only relevant handles, the selection or a frame with
    canvas_read; use detail when exact geometry or bindings matter. A read is complete
    when the targets and their ownership are clear. Discover unfamiliar glyphs with
-   canvas_glyphs. After a stale-context error, reread before acting. When the brief
-   calls for a fresh board, canvas_workspace_create opens a new workspace for the
-   user; read canvas_status there before drawing.
+   canvas_glyphs. After a stale-context error, reread before acting. At the start of
+   a session that has no existing drawing to work on, create a session workspace
+   with canvas_workspace_create using a short topic name, then read canvas_status
+   there before drawing. When the brief points at an existing drawing or workspace,
+   work on that one instead.
 2. Prefer one canvas_script batch, passing context and revision from the read.
    Use update beats to rename, move, resize, restyle or reconnect existing elements.
    Scale rule: one element per draw/pen call, small boards per script (it caps
