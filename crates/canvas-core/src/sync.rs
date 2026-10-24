@@ -49,14 +49,14 @@ impl PageFrame {
         }
     }
 
-    /// Decode a JSON document frame. Legacy pages omit `rev`; they are treated
-    /// as base zero and every merge still follows LWW. Control frames return
-    /// `None` so the caller can keep handling them separately.
+    /// Decode a JSON document frame. A snapshot must carry the server revision
+    /// it was based on; a frame without `rev` is malformed. Control frames
+    /// return `None` so the caller can keep handling them separately.
     pub fn from_json(frame: &Value) -> Option<Self> {
         match frame.get("type").and_then(Value::as_str) {
             Some("snapshot") => {
                 let doc = serialization::from_value(frame.get("doc")?.clone()).ok()?;
-                let base_revision = frame.get("rev").and_then(Value::as_u64).unwrap_or(0);
+                let base_revision = frame.get("rev").and_then(Value::as_u64)?;
                 Some(PageFrame::Snapshot { base_revision, doc })
             }
             Some("patch") => {
@@ -190,20 +190,14 @@ mod tests {
     }
 
     #[test]
-    fn legacy_json_snapshots_default_to_base_zero() {
+    fn json_snapshots_without_a_base_revision_are_rejected() {
         let mut doc = Document::new();
         doc.insert(element("one", 1));
         let json = serde_json::json!({
             "type": "snapshot",
             "doc": serde_json::to_value(&doc).unwrap(),
         });
-        assert_eq!(
-            PageFrame::from_json(&json).unwrap(),
-            PageFrame::Snapshot {
-                base_revision: 0,
-                doc
-            }
-        );
+        assert!(PageFrame::from_json(&json).is_none());
     }
 
     #[test]

@@ -8,7 +8,7 @@ This keeps ADR-0005's page-authoritative mirror and ADR-0002's single Delta/merg
 
 - Applies to the page↔server document path. MCP tools, view/presentation control frames, gesture previews and drag performance are unchanged.
 - A page snapshot's revision is a base/catch-up hint. Element-level last-writer-wins still decides every merge, and a revision never authorizes deleting an absent element.
-- The JSON fallback stays. A legacy snapshot without `rev` is treated as base zero; a page without a purge ledger simply cannot express a purge, so the element is merged back rather than deleted.
+- A page snapshot must carry its base revision. A frame without `rev` is malformed; absence is never interpreted as a deletion.
 - `PageSync`'s per-connection tombstone synthesis and the `mirror_leads` download heuristic are removed.
 
 ## Consequences
