@@ -1,0 +1,18 @@
+# run 1
+n	elements	delete+scene	undo+scene
+2500	2500	   91.52ms	    9.25ms
+5000	5000	  324.30ms	   18.24ms
+10000	10000	 1293.42ms	   37.20ms
+20000	20000	 6294.14ms	  106.92ms
+# run 2
+n	elements	delete+scene	undo+scene
+2500	2500	  106.67ms	   12.18ms
+5000	5000	  388.95ms	   20.14ms
+10000	10000	 1379.14ms	   38.26ms
+20000	20000	 5556.83ms	   79.76ms
+# run 3
+n	elements	delete+scene	undo+scene
+2500	2500	   87.20ms	    9.15ms
+5000	5000	  321.18ms	   18.40ms
+10000	10000	 1342.27ms	   43.08ms
+20000	20000	 8316.44ms	   86.93ms

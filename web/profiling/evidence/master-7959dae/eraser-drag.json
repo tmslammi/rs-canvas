@@ -1,0 +1,30 @@
+{
+  "name": "eraser-drag",
+  "actionError": null,
+  "durationMs": 848.5,
+  "metrics": {
+    "LayoutCount": 0,
+    "RecalcStyleCount": 2,
+    "LayoutDuration": 0,
+    "RecalcStyleDuration": 0.000076,
+    "ScriptDuration": 0.015495,
+    "TaskDuration": 0.045016,
+    "JSHeapUsedSize": 1856692,
+    "JSHeapTotalSize": 6619136,
+    "Nodes": 262,
+    "Documents": 1,
+    "Frames": 1,
+    "JSEventListeners": 267
+  },
+  "wasm": {
+    "bytes": 84672512,
+    "memories": 1,
+    "grows": 0,
+    "growBytes": 84672512
+  },
+  "longTasks": {
+    "count": 0,
+    "totalMs": 0,
+    "maxMs": 0
+  }
+}

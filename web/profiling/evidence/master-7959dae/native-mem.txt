@@ -1,0 +1,24 @@
+size_of Element      = 360 B
+size_of ElementKind  = 264 B
+size_of DrawOp       = 112 B
+size_of SceneLayer   = 128 B
+
+== connected_fixture(10000) — 19900 elements ==
+  elements (struct + BTree node)   ~8.0MB
+  document strings (id/index)       0.5MB
+  arrow/freehand payloads           0.0MB
+  scene layers (metadata + strings) 5.5MB
+  63494 draw ops + points       31.8MB
+  obstacles                         10000 entries
+  overview (unbuilt ops: 0)        13.6MB (tracked)
+  full detail                       45.9MB (tracked)
+
+== connected_fixture(100000) — 199684 elements ==
+  elements (struct + BTree node)   ~80.7MB
+  document strings (id/index)       4.8MB
+  arrow/freehand payloads           0.0MB
+  scene layers (metadata + strings) 47.3MB
+  637426 draw ops + points       318.6MB
+  obstacles                         100000 entries
+  overview (unbuilt ops: 0)        128.5MB (tracked)
+  full detail                       451.4MB (tracked)

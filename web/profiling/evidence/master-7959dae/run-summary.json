@@ -1,0 +1,393 @@
+[
+  {
+    "name": "boot",
+    "actionError": null,
+    "result": {
+      "bootMs": 50
+    },
+    "durationMs": 8.9,
+    "metrics": {
+      "LayoutCount": 7,
+      "RecalcStyleCount": 8,
+      "LayoutDuration": 0.01543,
+      "RecalcStyleDuration": 0.001029,
+      "ScriptDuration": 0.003827,
+      "TaskDuration": 0.042972,
+      "JSHeapUsedSize": 2306760,
+      "JSHeapTotalSize": 3997696,
+      "Nodes": 281,
+      "Documents": 4,
+      "Frames": 4,
+      "JSEventListeners": 122
+    },
+    "wasm": {
+      "bytes": 1179648,
+      "memories": 1,
+      "grows": 0,
+      "growBytes": 1179648
+    },
+    "longTasks": {
+      "count": 0,
+      "totalMs": 0,
+      "maxMs": 0
+    },
+    "bootMs": 50
+  },
+  {
+    "name": "load-10k",
+    "actionError": null,
+    "result": {
+      "loadMs": 25.7,
+      "count": 10000
+    },
+    "durationMs": 41.9,
+    "metrics": {
+      "LayoutCount": 0,
+      "RecalcStyleCount": 1,
+      "LayoutDuration": 0,
+      "RecalcStyleDuration": 0.000038,
+      "ScriptDuration": 0.000123,
+      "TaskDuration": 0.042677,
+      "JSHeapUsedSize": 1717268,
+      "JSHeapTotalSize": 4259840,
+      "Nodes": 262,
+      "Documents": 1,
+      "Frames": 1,
+      "JSEventListeners": 117
+    },
+    "wasm": {
+      "bytes": 12910592,
+      "memories": 1,
+      "grows": 0,
+      "growBytes": 12910592
+    },
+    "longTasks": {
+      "count": 0,
+      "totalMs": 0,
+      "maxMs": 0
+    }
+  },
+  {
+    "name": "save-json-10k",
+    "actionError": null,
+    "result": {
+      "saveMs": 20.6,
+      "bytes": 6452079
+    },
+    "durationMs": 25.2,
+    "metrics": {
+      "LayoutCount": 0,
+      "RecalcStyleCount": 0,
+      "LayoutDuration": 0,
+      "RecalcStyleDuration": 0,
+      "ScriptDuration": 0,
+      "TaskDuration": 0.025285,
+      "JSHeapUsedSize": 1741612,
+      "JSHeapTotalSize": 4259840,
+      "Nodes": 262,
+      "Documents": 1,
+      "Frames": 1,
+      "JSEventListeners": 117
+    },
+    "wasm": {
+      "bytes": 29949952,
+      "memories": 1,
+      "grows": 0,
+      "growBytes": 29949952
+    },
+    "longTasks": {
+      "count": 0,
+      "totalMs": 0,
+      "maxMs": 0
+    }
+  },
+  {
+    "name": "reload-json-10k",
+    "actionError": null,
+    "result": {
+      "loadMs": 83.8,
+      "count": 10000
+    },
+    "durationMs": 109.1,
+    "metrics": {
+      "LayoutCount": 0,
+      "RecalcStyleCount": 0,
+      "LayoutDuration": 0,
+      "RecalcStyleDuration": 0,
+      "ScriptDuration": 0.002059,
+      "TaskDuration": 0.109367,
+      "JSHeapUsedSize": 1798296,
+      "JSHeapTotalSize": 4259840,
+      "Nodes": 262,
+      "Documents": 1,
+      "Frames": 1,
+      "JSEventListeners": 117
+    },
+    "wasm": {
+      "bytes": 43581440,
+      "memories": 1,
+      "grows": 0,
+      "growBytes": 43581440
+    },
+    "longTasks": {
+      "count": 1,
+      "totalMs": 102,
+      "maxMs": 102
+    }
+  },
+  {
+    "name": "load-100k-connected",
+    "actionError": null,
+    "result": {
+      "loadMs": 431.4,
+      "count": 199684
+    },
+    "durationMs": 454.4,
+    "metrics": {
+      "LayoutCount": 0,
+      "RecalcStyleCount": 1,
+      "LayoutDuration": 0,
+      "RecalcStyleDuration": 0.000042,
+      "ScriptDuration": 0.000262,
+      "TaskDuration": 0.450378,
+      "JSHeapUsedSize": 1720016,
+      "JSHeapTotalSize": 18415616,
+      "Nodes": 262,
+      "Documents": 1,
+      "Frames": 1,
+      "JSEventListeners": 117
+    },
+    "wasm": {
+      "bytes": 215023616,
+      "memories": 1,
+      "grows": 0,
+      "growBytes": 215023616
+    },
+    "longTasks": {
+      "count": 1,
+      "totalMs": 436,
+      "maxMs": 436
+    }
+  },
+  {
+    "name": "drag-node-100k",
+    "actionError": null,
+    "durationMs": 2682,
+    "metrics": {
+      "LayoutCount": 1,
+      "RecalcStyleCount": 4,
+      "LayoutDuration": 0.000065,
+      "RecalcStyleDuration": 0.000198,
+      "ScriptDuration": 0.173074,
+      "TaskDuration": 0.328402,
+      "JSHeapUsedSize": 1822868,
+      "JSHeapTotalSize": 18939904,
+      "Nodes": 262,
+      "Documents": 1,
+      "Frames": 1,
+      "JSEventListeners": 597
+    },
+    "wasm": {
+      "bytes": 215023616,
+      "memories": 1,
+      "grows": 0,
+      "growBytes": 215023616
+    },
+    "longTasks": {
+      "count": 0,
+      "totalMs": 0,
+      "maxMs": 0
+    }
+  },
+  {
+    "name": "pan-100k",
+    "actionError": null,
+    "durationMs": 1344.3,
+    "metrics": {
+      "LayoutCount": 0,
+      "RecalcStyleCount": 0,
+      "LayoutDuration": 0,
+      "RecalcStyleDuration": 0,
+      "ScriptDuration": 0.049747,
+      "TaskDuration": 0.136628,
+      "JSHeapUsedSize": 1830480,
+      "JSHeapTotalSize": 18677760,
+      "Nodes": 262,
+      "Documents": 1,
+      "Frames": 1,
+      "JSEventListeners": 117
+    },
+    "wasm": {
+      "bytes": 215089152,
+      "memories": 1,
+      "grows": 0,
+      "growBytes": 215089152
+    },
+    "longTasks": {
+      "count": 0,
+      "totalMs": 0,
+      "maxMs": 0
+    }
+  },
+  {
+    "name": "zoom-100k",
+    "actionError": null,
+    "durationMs": 1023.8,
+    "metrics": {
+      "LayoutCount": 0,
+      "RecalcStyleCount": 0,
+      "LayoutDuration": 0,
+      "RecalcStyleDuration": 0,
+      "ScriptDuration": 0.033057,
+      "TaskDuration": 0.084707,
+      "JSHeapUsedSize": 1842664,
+      "JSHeapTotalSize": 18677760,
+      "Nodes": 262,
+      "Documents": 1,
+      "Frames": 1,
+      "JSEventListeners": 117
+    },
+    "wasm": {
+      "bytes": 215089152,
+      "memories": 1,
+      "grows": 0,
+      "growBytes": 215089152
+    },
+    "longTasks": {
+      "count": 0,
+      "totalMs": 0,
+      "maxMs": 0
+    }
+  },
+  {
+    "name": "select-all-delete-undo",
+    "actionError": null,
+    "result": {
+      "selectMs": 2.799999952316284,
+      "deleteMs": 1805.9000000953674,
+      "undoMs": 79.20000004768372,
+      "afterSelect": 10000,
+      "afterDelete": 0,
+      "count": 10000
+    },
+    "durationMs": 1905.9,
+    "metrics": {
+      "LayoutCount": 1,
+      "RecalcStyleCount": 2,
+      "LayoutDuration": 0.000105,
+      "RecalcStyleDuration": 0.000081,
+      "ScriptDuration": 0.00021,
+      "TaskDuration": 1.90848,
+      "JSHeapUsedSize": 1771708,
+      "JSHeapTotalSize": 5046272,
+      "Nodes": 262,
+      "Documents": 1,
+      "Frames": 1,
+      "JSEventListeners": 117
+    },
+    "wasm": {
+      "bytes": 63176704,
+      "memories": 1,
+      "grows": 0,
+      "growBytes": 63176704
+    },
+    "longTasks": {
+      "count": 1,
+      "totalMs": 1889,
+      "maxMs": 1889
+    }
+  },
+  {
+    "name": "freehand-300-points",
+    "actionError": null,
+    "result": {
+      "count": 10001
+    },
+    "durationMs": 5037,
+    "metrics": {
+      "LayoutCount": 1,
+      "RecalcStyleCount": 3,
+      "LayoutDuration": 0.000092,
+      "RecalcStyleDuration": 0.000158,
+      "ScriptDuration": 0.082694,
+      "TaskDuration": 0.546877,
+      "JSHeapUsedSize": 1845108,
+      "JSHeapTotalSize": 6619136,
+      "Nodes": 262,
+      "Documents": 1,
+      "Frames": 1,
+      "JSEventListeners": 117
+    },
+    "wasm": {
+      "bytes": 84672512,
+      "memories": 1,
+      "grows": 0,
+      "growBytes": 84672512
+    },
+    "longTasks": {
+      "count": 0,
+      "totalMs": 0,
+      "maxMs": 0
+    }
+  },
+  {
+    "name": "connector-drag",
+    "actionError": null,
+    "durationMs": 1036.6,
+    "metrics": {
+      "LayoutCount": 0,
+      "RecalcStyleCount": 2,
+      "LayoutDuration": 0,
+      "RecalcStyleDuration": 0.00009,
+      "ScriptDuration": 0.040312,
+      "TaskDuration": 0.130208,
+      "JSHeapUsedSize": 1858260,
+      "JSHeapTotalSize": 6619136,
+      "Nodes": 262,
+      "Documents": 1,
+      "Frames": 1,
+      "JSEventListeners": 297
+    },
+    "wasm": {
+      "bytes": 84672512,
+      "memories": 1,
+      "grows": 0,
+      "growBytes": 84672512
+    },
+    "longTasks": {
+      "count": 0,
+      "totalMs": 0,
+      "maxMs": 0
+    }
+  },
+  {
+    "name": "eraser-drag",
+    "actionError": null,
+    "durationMs": 848.5,
+    "metrics": {
+      "LayoutCount": 0,
+      "RecalcStyleCount": 2,
+      "LayoutDuration": 0,
+      "RecalcStyleDuration": 0.000076,
+      "ScriptDuration": 0.015495,
+      "TaskDuration": 0.045016,
+      "JSHeapUsedSize": 1856692,
+      "JSHeapTotalSize": 6619136,
+      "Nodes": 262,
+      "Documents": 1,
+      "Frames": 1,
+      "JSEventListeners": 267
+    },
+    "wasm": {
+      "bytes": 84672512,
+      "memories": 1,
+      "grows": 0,
+      "growBytes": 84672512
+    },
+    "longTasks": {
+      "count": 0,
+      "totalMs": 0,
+      "maxMs": 0
+    }
+  }
+]

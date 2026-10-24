@@ -14,7 +14,8 @@
     "build": "npm run build:wasm && npm run stage",
     "dev": "npm run build:wasm && bash scripts/dev.sh",
     "typecheck": "tsc --noEmit",
-    "test:e2e": "npm run build:wasm && playwright test"
+    "test:e2e": "npm run build:wasm && playwright test",
+    "profile": "npm run build:wasm && playwright test --config profiling/playwright.profiling.config.ts"
   },
   "devDependencies": {
     "@playwright/test": "^1.63.0",

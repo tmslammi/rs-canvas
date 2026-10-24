@@ -1,0 +1,33 @@
+{
+  "name": "freehand-300-points",
+  "actionError": null,
+  "result": {
+    "count": 10001
+  },
+  "durationMs": 5037,
+  "metrics": {
+    "LayoutCount": 1,
+    "RecalcStyleCount": 3,
+    "LayoutDuration": 0.000092,
+    "RecalcStyleDuration": 0.000158,
+    "ScriptDuration": 0.082694,
+    "TaskDuration": 0.546877,
+    "JSHeapUsedSize": 1845108,
+    "JSHeapTotalSize": 6619136,
+    "Nodes": 262,
+    "Documents": 1,
+    "Frames": 1,
+    "JSEventListeners": 117
+  },
+  "wasm": {
+    "bytes": 84672512,
+    "memories": 1,
+    "grows": 0,
+    "growBytes": 84672512
+  },
+  "longTasks": {
+    "count": 0,
+    "totalMs": 0,
+    "maxMs": 0
+  }
+}

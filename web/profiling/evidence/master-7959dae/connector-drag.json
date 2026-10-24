@@ -1,0 +1,30 @@
+{
+  "name": "connector-drag",
+  "actionError": null,
+  "durationMs": 1036.6,
+  "metrics": {
+    "LayoutCount": 0,
+    "RecalcStyleCount": 2,
+    "LayoutDuration": 0,
+    "RecalcStyleDuration": 0.00009,
+    "ScriptDuration": 0.040312,
+    "TaskDuration": 0.130208,
+    "JSHeapUsedSize": 1858260,
+    "JSHeapTotalSize": 6619136,
+    "Nodes": 262,
+    "Documents": 1,
+    "Frames": 1,
+    "JSEventListeners": 297
+  },
+  "wasm": {
+    "bytes": 84672512,
+    "memories": 1,
+    "grows": 0,
+    "growBytes": 84672512
+  },
+  "longTasks": {
+    "count": 0,
+    "totalMs": 0,
+    "maxMs": 0
+  }
+}
