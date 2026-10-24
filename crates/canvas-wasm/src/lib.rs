@@ -576,6 +576,12 @@ impl Editor {
         serde_json::json!({ "type": "patch", "put": patch.put }).to_string()
     }
 
+    /// Drop pending deltas without projecting them; the reconnect snapshot
+    /// carries the document instead.
+    pub fn discard_outbound(&mut self) {
+        self.core.history.discard_outbox();
+    }
+
     /// Merge a server patch — a JSON array of full elements, tombstones
     /// included — into the document with the merge rules. Returns whether
     /// anything changed. Mid-gesture patches are deferred to pointer-up.
