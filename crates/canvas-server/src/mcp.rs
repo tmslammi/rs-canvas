@@ -4153,8 +4153,7 @@ mod tests {
         let page_state = state.clone();
         let page = tokio::spawn(async move {
             let message = from_server.recv().await.unwrap();
-            let frame: serde_json::Value =
-                serde_json::from_str(&message.json.unwrap()).unwrap();
+            let frame: serde_json::Value = serde_json::from_str(&message.json.unwrap()).unwrap();
             assert_eq!(frame["type"], "workspace_changed");
             assert_eq!(frame["action"], "switch");
             let target = page_state
