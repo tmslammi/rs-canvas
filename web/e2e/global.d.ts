@@ -26,6 +26,11 @@ declare global {
       save_json(): string;
       save_bytes(): Uint8Array;
       snapshot_json(): string;
+      snapshot_frame_bytes(): Uint8Array;
+      take_outbound_frame_bytes(): Uint8Array;
+      reconcile_bytes(bytes: Uint8Array): boolean;
+      merge_patch_bytes(bytes: Uint8Array): boolean;
+      wire_frame_kind(bytes: Uint8Array): number;
       load_json(json: string): void;
       load_bytes(bytes: Uint8Array): void;
       flush_save(): void;

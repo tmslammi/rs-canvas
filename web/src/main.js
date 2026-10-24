@@ -812,6 +812,8 @@ async function boot() {
   // server hands over its mirror, and the two reconcile.
   bridge = connectAgentBridge(editor, {
     workspace,
+    // `?wire=json` exercises the legacy path against a current server.
+    wire: new URLSearchParams(location.search).get("wire"),
     onRemoteChange: () => {
       if (!autosavePaused) editor.flush_save();
       refreshToolbar();

@@ -9,7 +9,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap};
 
 use canvas_core::{
-    Affine, ArrowHandle, Camera, CameraTween, Dash, Document, DrawOp, Editor as CoreEditor,
+    wire, Affine, ArrowHandle, Camera, CameraTween, Dash, Document, DrawOp, Editor as CoreEditor,
     Effects, FillStyle, Modifiers, Point, Rect, Renderer, ShellAction, StrokeStyle, StylePatch,
     TextAlign, TextMeasurer, TextOp, Tool,
 };
@@ -340,6 +340,13 @@ struct PresentOutcome {
     cancelled: bool,
 }
 
+/// A deferred server frame, kept in the form it arrived in so the legacy JSON
+/// path and the binary path share the same mid-gesture deferral.
+enum PendingRemote {
+    Json(String),
+    Binary(Vec<u8>),
+}
+
 /// The editor handle the shell talks to.
 #[wasm_bindgen]
 pub struct Editor {
@@ -364,9 +371,12 @@ pub struct Editor {
     /// Agent highlight pulse in flight, if any (view state only).
     pulse: Option<Pulse>,
     /// A server snapshot that arrived mid-gesture, applied on pointer-up.
-    pending_remote: Option<String>,
+    pending_remote: Option<PendingRemote>,
     /// Server patches that arrived mid-gesture, applied on pointer-up.
-    pending_patches: Vec<String>,
+    pending_patches: Vec<PendingRemote>,
+    /// The last server revision seen on the binary wire. Outbound frames echo
+    /// it; merging never depends on it.
+    wire_revision: u64,
     /// Agent explanation playback in flight, if any (view state only).
     presentation: Option<Presentation>,
     /// Finished/cancelled playbacks the shell must acknowledge.
@@ -433,6 +443,7 @@ impl Editor {
             pulse: None,
             pending_remote: None,
             pending_patches: Vec::new(),
+            wire_revision: 0,
             presentation: None,
             present_outcomes: Vec::new(),
         };
@@ -538,7 +549,8 @@ impl Editor {
     }
 
     /// The live document wrapped as a `{"type":"snapshot","doc":{...}}` frame,
-    /// so the shell sends it without a parse/stringify round trip.
+    /// so the shell sends it without a parse/stringify round trip. Legacy
+    /// fallback for servers that do not advertise the binary wire.
     pub fn snapshot_frame_json(&self) -> String {
         #[derive(serde::Serialize)]
         struct Snapshot<'a> {
@@ -553,6 +565,12 @@ impl Editor {
         .unwrap_or_default()
     }
 
+    /// The live document as a binary snapshot wire frame: header, revision,
+    /// then the versioned document envelope. No JSON pass and no string.
+    pub fn snapshot_frame_bytes(&self) -> Vec<u8> {
+        wire::encode_snapshot(self.wire_revision, &self.core.doc).unwrap_or_default()
+    }
+
     /// Merge a server snapshot into this page's document using the merge-ready
     /// rules, keeping local edits. Inbound merges never touch history, so the
     /// user's undo stack stays theirs. Returns whether anything changed.
@@ -561,24 +579,47 @@ impl Editor {
     /// the document under an in-flight drag would corrupt the gesture.
     pub fn reconcile_json(&mut self, json: &str) -> Result<bool, JsValue> {
         if self.core.is_interacting() {
-            self.pending_remote = Some(json.to_string());
+            self.pending_remote = Some(PendingRemote::Json(json.to_string()));
             return Ok(false);
         }
-        self.reconcile_now(json)
+        self.reconcile_json_now(json)
     }
 
-    /// Drain the deltas applied since the last call as one wire patch frame
-    /// (`{"type":"patch","put":[...]}`), or an empty string when nothing
-    /// changed. The shell sends it to the bridge; when the bridge is down the
-    /// frame is dropped and the full snapshot sent on reconnect catches the
-    /// server up.
-    pub fn take_outbound_frame(&mut self) -> String {
-        let deltas = self.core.history.drain_outbox();
-        if deltas.is_empty() {
-            return String::new();
+    /// Merge a binary snapshot wire frame. The payload is decoded straight
+    /// into the model; the shell passes the `Uint8Array` through untouched.
+    /// Mid-gesture snapshots are deferred to pointer-up like the JSON path.
+    pub fn reconcile_bytes(&mut self, bytes: &[u8]) -> Result<bool, JsValue> {
+        if self.core.is_interacting() {
+            self.pending_remote = Some(PendingRemote::Binary(bytes.to_vec()));
+            return Ok(false);
         }
-        let patch = canvas_core::Patch::from_deltas(&deltas, now_ms());
+        self.reconcile_bytes_now(bytes)
+    }
+
+    /// The kind of a wire frame (1 snapshot, 2 patch, 0 malformed). The shell
+    /// uses it to route bytes to `reconcile_bytes` or `merge_patch_bytes`
+    /// without parsing the frame itself.
+    pub fn wire_frame_kind(&self, bytes: &[u8]) -> u8 {
+        wire::kind(bytes).map(wire::FrameKind::id).unwrap_or(0)
+    }
+
+    /// Drain the deltas applied since the last call as one legacy JSON wire
+    /// patch frame (`{"type":"patch","put":[...]}`), or an empty string when
+    /// nothing changed.
+    pub fn take_outbound_frame(&mut self) -> String {
+        let Some(patch) = self.take_outbound_patch() else {
+            return String::new();
+        };
         serde_json::json!({ "type": "patch", "put": patch.put }).to_string()
+    }
+
+    /// Drain the same outbox as one binary patch wire frame: header,
+    /// revision, then the frozen v1 element list. No JSON pass and no string.
+    pub fn take_outbound_frame_bytes(&mut self) -> Vec<u8> {
+        let Some(patch) = self.take_outbound_patch() else {
+            return Vec::new();
+        };
+        wire::encode_patch(self.wire_revision, &patch.put).unwrap_or_default()
     }
 
     /// Merge a server patch — a JSON array of full elements, tombstones
@@ -586,10 +627,23 @@ impl Editor {
     /// anything changed. Mid-gesture patches are deferred to pointer-up.
     pub fn merge_patch_json(&mut self, json: &str) -> Result<bool, JsValue> {
         if self.core.is_interacting() {
-            self.pending_patches.push(json.to_string());
+            self.pending_patches
+                .push(PendingRemote::Json(json.to_string()));
             return Ok(false);
         }
-        self.merge_patch_now(json)
+        self.merge_patch_json_now(json)
+    }
+
+    /// Merge a binary patch wire frame. Element merging is the same
+    /// per-element last-writer-wins path as the JSON fallback. Mid-gesture
+    /// patches are deferred to pointer-up.
+    pub fn merge_patch_bytes(&mut self, bytes: &[u8]) -> Result<bool, JsValue> {
+        if self.core.is_interacting() {
+            self.pending_patches
+                .push(PendingRemote::Binary(bytes.to_vec()));
+            return Ok(false);
+        }
+        self.merge_patch_bytes_now(bytes)
     }
 
     /// Serialize the document and hand it to storage (the shell's debounced
@@ -1068,13 +1122,8 @@ impl Editor {
         // End of a pan gesture: replace the shifted approximation with a
         // crisp render.
         self.settle_view();
-        // A remote snapshot deferred during the gesture can land now.
-        if let Some(pending) = self.pending_remote.take() {
-            let _ = self.reconcile_now(&pending);
-        }
-        for patch in std::mem::take(&mut self.pending_patches) {
-            let _ = self.merge_patch_now(&patch);
-        }
+        // Remote frames deferred during the gesture can land now.
+        self.apply_pending_remote();
     }
 
     /// Abort an interrupted pointer gesture instead of committing its last
@@ -1087,12 +1136,7 @@ impl Editor {
         }
         self.settle_view();
         // The cancelled gesture no longer blocks incoming document edits.
-        if let Some(pending) = self.pending_remote.take() {
-            let _ = self.reconcile_now(&pending);
-        }
-        for patch in std::mem::take(&mut self.pending_patches) {
-            let _ = self.merge_patch_now(&patch);
-        }
+        self.apply_pending_remote();
     }
 
     pub fn wheel(&mut self, x: f64, y: f64, dx: f64, dy: f64, ctrl: bool) {
@@ -1627,13 +1671,33 @@ impl Editor {
         }
     }
 
+    /// Drain the outbox as one patch, or `None` when nothing changed.
+    fn take_outbound_patch(&mut self) -> Option<canvas_core::Patch> {
+        let deltas = self.core.history.drain_outbox();
+        if deltas.is_empty() {
+            return None;
+        }
+        Some(canvas_core::Patch::from_deltas(&deltas, now_ms()))
+    }
+
     /// Merge a remote snapshot now: reconcile, rebuild the scene, repaint.
-    fn reconcile_now(&mut self, json: &str) -> Result<bool, JsValue> {
+    fn reconcile_json_now(&mut self, json: &str) -> Result<bool, JsValue> {
         let remote = canvas_core::serialization::from_json(json)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        Ok(self.apply_remote_snapshot(remote))
+    }
+
+    fn reconcile_bytes_now(&mut self, bytes: &[u8]) -> Result<bool, JsValue> {
+        let (revision, remote) =
+            wire::decode_snapshot(bytes).map_err(|error| JsValue::from_str(&error.to_string()))?;
+        self.wire_revision = revision;
+        Ok(self.apply_remote_snapshot(remote))
+    }
+
+    fn apply_remote_snapshot(&mut self, remote: Document) -> bool {
         let merged = canvas_core::reconcile(&self.core.doc, &remote);
         if merged == self.core.doc {
-            return Ok(false);
+            return false;
         }
         self.core.doc = merged;
         self.core
@@ -1642,20 +1706,31 @@ impl Editor {
         self.last_paint = None;
         self.core.refresh_scene();
         self.render();
-        Ok(true)
+        true
     }
 
     /// Merge a remote patch now: per-element LWW, then rebuild only the
     /// changed layers and repaint them. This is the steady-state path — the
     /// cost is proportional to what changed, not to the document.
-    fn merge_patch_now(&mut self, json: &str) -> Result<bool, JsValue> {
+    fn merge_patch_json_now(&mut self, json: &str) -> Result<bool, JsValue> {
         let elements: Vec<canvas_core::Element> =
             serde_json::from_str(json).map_err(|error| JsValue::from_str(&error.to_string()))?;
+        Ok(self.apply_remote_elements(elements))
+    }
+
+    fn merge_patch_bytes_now(&mut self, bytes: &[u8]) -> Result<bool, JsValue> {
+        let (revision, elements) =
+            wire::decode_patch(bytes).map_err(|error| JsValue::from_str(&error.to_string()))?;
+        self.wire_revision = revision;
+        Ok(self.apply_remote_elements(elements))
+    }
+
+    fn apply_remote_elements(&mut self, elements: Vec<canvas_core::Element>) -> bool {
         let patch = canvas_core::Patch { put: elements };
         let changed: BTreeSet<canvas_core::ElementId> =
             patch.apply_to(&mut self.core.doc).into_iter().collect();
         if changed.is_empty() {
-            return Ok(false);
+            return false;
         }
         self.core
             .selection
@@ -1664,7 +1739,24 @@ impl Editor {
         let dirty = self.core.rebuild_changed(&changed);
         self.paint_dirty(&dirty);
         self.draw_overlay();
-        Ok(true)
+        true
+    }
+
+    /// Apply any frame deferred during a gesture. Called at gesture end, after
+    /// the local edit has committed, so remote merges see its final state.
+    fn apply_pending_remote(&mut self) {
+        if let Some(pending) = self.pending_remote.take() {
+            let _ = match pending {
+                PendingRemote::Json(json) => self.reconcile_json_now(&json),
+                PendingRemote::Binary(bytes) => self.reconcile_bytes_now(&bytes),
+            };
+        }
+        for patch in std::mem::take(&mut self.pending_patches) {
+            let _ = match patch {
+                PendingRemote::Json(json) => self.merge_patch_json_now(&json),
+                PendingRemote::Binary(bytes) => self.merge_patch_bytes_now(&bytes),
+            };
+        }
     }
 
     /// Shift the existing scene pixels by a pure pan and repaint only the
