@@ -14,6 +14,8 @@ const TOOLS = [
   { name: "line", label: "Line", glyph: "╱", shortcut: "L" },
   { name: "arrow", label: "Arrow", glyph: "→", shortcut: "A" },
   { name: "text", label: "Text", glyph: "T", shortcut: "T" },
+  { name: "sticky", label: "Sticky note", glyph: "▤", shortcut: "N" },
+  { name: "stickyStack", label: "Sticky stack", glyph: "☰", shortcut: "K" },
   { name: "frame", label: "Frame", glyph: "⬚", shortcut: "F" },
   { name: "eraser", label: "Eraser", glyph: "⌦", shortcut: "E" },
 ];
@@ -186,63 +188,6 @@ async function boot() {
   };
 
   // -- toolbar ------------------------------------------------------------
-
-  // The workspace switcher: switching is just navigating to the workspace's
-  // URL, so every tab stays pinned to exactly one workspace.
-  const NEW_WORKSPACE = "__new__";
-  const workspaceSelect = document.createElement("select");
-  workspaceSelect.id = "workspace-switcher";
-  workspaceSelect.title = "Workspace — each tab shows one";
-  const fillWorkspaces = (names) => {
-    workspaceSelect.replaceChildren();
-    const all = names.includes(workspace) ? names : [workspace, ...names];
-    for (const name of all) {
-      const option = document.createElement("option");
-      option.value = name;
-      option.textContent = name;
-      workspaceSelect.appendChild(option);
-    }
-    const create = document.createElement("option");
-    create.value = NEW_WORKSPACE;
-    create.textContent = "＋ new…";
-    workspaceSelect.appendChild(create);
-    workspaceSelect.value = workspace;
-  };
-  fillWorkspaces([]);
-  workspaceSelect.addEventListener("change", () => {
-    let name = workspaceSelect.value;
-    if (name === NEW_WORKSPACE) {
-      name = (
-        window.prompt("Workspace name (lowercase letters, digits, dashes):") ??
-        ""
-      )
-        .trim()
-        .toLowerCase();
-      if (!/^[a-z0-9][a-z0-9-]{0,39}$/.test(name)) {
-        workspaceSelect.value = workspace;
-        if (name) showToast(`Invalid workspace name "${name}"`, true);
-        return;
-      }
-    }
-    if (name === workspace) {
-      workspaceSelect.value = workspace;
-      return;
-    }
-    location.assign(
-      name === "default" ? "/" : `/?ws=${encodeURIComponent(name)}`,
-    );
-  });
-  toolbar.appendChild(workspaceSelect);
-  // The server lists live and persisted workspaces; without it (static
-  // serving) the switcher just shows the current one.
-  fetch("/api/workspaces")
-    .then((response) => (response.ok ? response.json() : null))
-    .then((body) => {
-      if (body?.workspaces) {
-        fillWorkspaces(body.workspaces.map((info) => info.name));
-      }
-    })
-    .catch(() => {});
 
   const toolButtons = new Map();
   for (const tool of TOOLS) {
@@ -503,7 +448,7 @@ async function boot() {
       commitTextEditor();
     }
     // preventDefault above also suppresses the focus change, so a form
-    // control (opacity slider, library search) would otherwise keep focus
+    // control (the opacity slider) would otherwise keep focus
     // forever and swallow every canvas shortcut. Blur it explicitly.
     const focused = document.activeElement;
     if (focused instanceof HTMLElement && focused !== document.body) {

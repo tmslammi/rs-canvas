@@ -1,7 +1,6 @@
 ---
 description: Draws, edits, and arranges the rs-canvas diagram — use this for every canvas drawing task instead of calling the mutating canvas tools directly
 mode: subagent
-model: opencode-go/deepseek-v4.1-flash#low
 permissions:
   - { action: canvas_*, resource: "*", effect: allow }
   - { action: subagent, resource: "*", effect: deny }

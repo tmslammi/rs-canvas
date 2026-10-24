@@ -106,27 +106,6 @@ body {
   background: var(--chrome-border);
 }
 
-#workspace-switcher {
-  height: 30px;
-  max-width: 150px;
-  border: 1px solid transparent;
-  border-radius: 4px;
-  background: transparent;
-  font-size: 13px;
-  color: var(--chrome-text);
-  cursor: pointer;
-}
-
-#workspace-switcher:hover {
-  background: var(--chrome-raised);
-  border-color: var(--chrome-border);
-}
-
-#workspace-switcher option {
-  background: var(--chrome);
-  color: var(--chrome-text);
-}
-
 /* -- panels ------------------------------------------------------------- */
 
 #style-panel {

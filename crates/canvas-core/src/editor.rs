@@ -897,11 +897,7 @@ impl Editor {
                 }
             }
             Interaction::Moving {
-                start,
-                originals,
-                arrow_ids: _,
-                started_in_selection: _,
-                ..
+                start, originals, ..
             } => {
                 let current = self.camera.screen_to_world(screen);
                 let (dx, dy) = (current.x - start.x, current.y - start.y);
@@ -1443,21 +1439,25 @@ impl Editor {
                     // befores plus afters from the just-written document.
                     // (Preview moves bypass per-move staging.)
                     if previewed {
+                        // The document already holds the touched preview
+                        // truth. Stage exactly that: touching a second copy
+                        // would give the outbox delta a newer version than
+                        // the local document, so a later undo could tie with
+                        // it and lose the merge to its own move.
                         for original in &originals {
                             if let Some(current) = self.doc.element(&original.id).cloned() {
-                                let mut after = current;
-                                after.touch(now);
                                 tx.push(Delta::Update {
                                     before: original.clone(),
-                                    after,
+                                    after: current,
                                 });
                             }
                         }
                         for (id, pre) in attached_pres {
                             if let Some(current) = self.doc.element(&id).cloned() {
-                                let mut after = current;
-                                after.touch(now);
-                                tx.push(Delta::Update { before: pre, after });
+                                tx.push(Delta::Update {
+                                    before: pre,
+                                    after: current,
+                                });
                             }
                         }
                     }
@@ -4847,6 +4847,39 @@ mod tests {
             Rect::new(0.0, 0.0, 100.0, 50.0),
             "nothing moved"
         );
+    }
+
+    #[test]
+    fn a_drag_outbox_delta_carries_the_committed_version() {
+        let mut e = editor();
+        drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(100.0, 50.0), 1);
+        let id = e.doc.ordered_live()[0].id.clone();
+        // The creation patch is irrelevant; inspect only the move.
+        e.history.drain_outbox();
+
+        press(&mut e, "v", Modifiers::default(), 10);
+        e.select([id.clone()]);
+        let mods = Modifiers::default();
+        let fx = e.pointer_down(Point::new(50.0, 25.0), 0, mods, 20);
+        pump(&mut e, &fx);
+        let fx = e.pointer_move(Point::new(80.0, 45.0), mods, 21);
+        pump(&mut e, &fx);
+        let fx = e.pointer_up(Point::new(80.0, 45.0), mods, 22);
+        pump(&mut e, &fx);
+
+        let patch = crate::patch::Patch::from_deltas(&e.history.drain_outbox(), 23);
+        let committed = e.doc.element(&id).unwrap();
+        let wire = patch
+            .put
+            .iter()
+            .find(|element| element.id == id)
+            .expect("the move is on the wire");
+        assert_eq!(
+            (wire.version, wire.version_nonce),
+            (committed.version, committed.version_nonce),
+            "an outbox delta must match the committed document, or an undo can lose the merge"
+        );
+        assert!(wire.content_eq(committed));
     }
 
     #[test]

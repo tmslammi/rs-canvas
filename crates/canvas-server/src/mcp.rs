@@ -1,7 +1,7 @@
 //! The MCP surface: opencode drives the canvas through these tools.
 //!
 //! View tools (camera, highlights) are transient; they never touch the
-//! document, history or storage. Drawing tools arrive with their tickets.
+//! document, history or storage. Drawing tools edit the mirrored document.
 //! The server is created per MCP session but shares `AppState`. Every tool
 //! call acts on the current workspace — the one the user's most recently
 //! active page is viewing (ADR-0007) — never on an agent-owned one.

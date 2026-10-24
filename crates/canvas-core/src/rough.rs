@@ -852,7 +852,6 @@ pub fn build_element_ops(
             }
             ops
         }
-        // Glyph rendering arrives with the shape library ticket.
         ElementKind::Glyph {
             glyph, rect, style, ..
         } => {

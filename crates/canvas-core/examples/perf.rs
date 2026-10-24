@@ -1,4 +1,4 @@
-//! Scratch performance probe for the 10k-element hot paths.
+//! Performance probe for the 10k-element hot paths.
 //! Run with: cargo run --release --example perf -p canvas-core
 
 use std::collections::BTreeSet;

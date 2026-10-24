@@ -442,11 +442,12 @@ test("a server restart preserves the document", async ({ request }) => {
   }
 });
 
-test("undoing a move survives the sync round trip", async ({ page }) => {
+test("undoing a move survives the sync round trip", async ({ page, request }) => {
+  const mcp = mcpClient(request, BASE);
   await openPage(page);
   await drawRectangle(page);
   // Let the creation patch reach the mirror before the move patch follows.
-  await page.waitForTimeout(500);
+  await expect.poll(() => mcp.text("canvas_read", {})).toContain("rect 420,320");
   const before = await snapshot(page);
 
   await page.keyboard.press("v");
@@ -456,10 +457,12 @@ test("undoing a move survives the sync round trip", async ({ page }) => {
   await page.mouse.up();
   const moved = await snapshot(page);
   expect(moved, "drag moved the rectangle").not.toBe(before);
-  // Let the move patch land on the mirror: the undo patch must beat it there.
-  await page.waitForTimeout(500);
+  // Wait for the move patch to reach the mirror: an undo sent before it
+  // would race the correction, which is a different scenario.
+  await expect.poll(() => mcp.text("canvas_read", {})).toContain("rect 480,360");
 
   await page.keyboard.press("ControlOrMeta+z");
+  await expect.poll(() => snapshot(page)).toBe(before);
   // Past the correction round trip: a stale undo would be reverted here.
   await page.waitForTimeout(1_000);
   expect(await snapshot(page), "undo restored the rectangle").toBe(before);
@@ -480,6 +483,9 @@ test("named tabs sync only their own workspace and focus selects the agent works
   await second.goto(`${BASE}/?ws=beta`);
   await second.waitForFunction(() => window.__rsReady && window.__rsAgentConnected);
   expect(await second.evaluate(() => window.__rsEditor!.element_count())).toBe(0);
+  // The agent follows the most recently active tab, so observe beta before
+  // writing; carrying alpha's context would be a stale-context error.
+  await expect.poll(async () => JSON.parse(await mcp.text("canvas_status", {})).workspace).toBe("beta");
   await mcp.call("canvas_draw", { kind: "ellipse" });
   await expect.poll(() => second.evaluate(() => window.__rsEditor!.element_count())).toBe(1);
   expect(await first.evaluate(() => window.__rsEditor!.element_count())).toBe(1);

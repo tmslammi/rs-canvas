@@ -1,143 +1,70 @@
 # rs-canvas
 
-A local-first browser drawing tool for freehand sketching and GCP / cloud architecture diagrams, in a hand-drawn style.
+A local browser drawing tool for freehand sketching and hand-drawn cloud architecture diagrams. The document model, interaction logic and Canvas2D renderer are written in Rust and compiled to WebAssembly; the browser UI is plain JavaScript with no bundler. Everything runs on your machine — the optional agent server binds to localhost only.
 
-Rust core compiled to WebAssembly owns the document model, interaction logic and Canvas2D rendering; a thin vanilla-TypeScript shell provides the browser UI.
+![rs-canvas showing a hand-drawn GCP architecture diagram](docs/screenshot.png)
 
-## Layout
+## Features
 
-- `crates/canvas-core` — pure-Rust document model, geometry, rendering pipeline (no browser dependencies)
-- `crates/canvas-wasm` — wasm-bindgen façade (`Editor`) and the Canvas2D renderer
-- `web/` — the front end: **plain ES modules, no build step** (like DHH's no-build setups)
+- Rectangle, diamond, ellipse, line, arrow, freehand, text, sticky-note and frame tools on an infinite canvas.
+- Bound, obstacle-aware connectors that re-route as elements move.
+- Frames that own their contents, sticky stacks, labels, grid and snapping.
+- Named workspaces with local autosave, undo/redo, and a workspace picker that works offline.
+- An optional local [MCP](https://modelcontextprotocol.io) bridge that lets an AI agent read the canvas, draw and revise diagrams with the built-in GCP and generic glyph library, move the camera, take screenshots and keep discussion notes while you watch.
 
-## Development
+## Getting started
 
-Prerequisites: Rust with the `wasm32-unknown-unknown` target, `wasm-bindgen-cli`, Node 24+ (only for the Playwright test runner).
+Prerequisites: Rust with the `wasm32-unknown-unknown` target, `wasm-bindgen-cli` matching the version in `Cargo.lock` (currently 0.2.129), and Node 24+.
 
 ```sh
 rustup target add wasm32-unknown-unknown
-cargo install wasm-bindgen-cli
+cargo install wasm-bindgen-cli --version 0.2.129
 
 cd web
 npm install
-npm run dev        # build wasm once, watch Rust, serve the app + agent bridge on :5173
-npm run build      # build wasm + stage web/dist for deployment (a file copy, no bundler)
-npm run test:e2e   # build wasm + run Playwright against the source files
+npm run dev
 ```
 
-The dev command runs the Rust server in `crates/canvas-server`: it serves the
-plain files, hosts the WebSocket bridge for the open page, and exposes the
-agent's MCP endpoint at `http://127.0.0.1:5173/mcp`. The project's
-`opencode.jsonc` and `.codex/config.toml` point their agents at that endpoint;
-start the dev command before using the canvas tools. The server binds to
-localhost only.
+Open <http://localhost:5173>. `npm run dev` builds the wasm bundle, watches Rust sources and serves the app and the agent bridge. Reload the page after a Rust rebuild.
 
-## Workspaces
-
-The **Workspace: name** button at the bottom left identifies the document in
-this tab. Open it to create an empty workspace, switch to an existing one,
-or duplicate the current drawing. Workspaces listed there include this
-browser's saved drawings and the server's live and persisted documents.
-Named workspaces use `?ws=name`; the default workspace keeps the original
-URL and autosave. Names use 1–40 lowercase letters, digits or dashes,
-starting with a letter or digit.
-
-Switching commits text edits, cancels unfinished pointer gestures and waits
-for the outgoing drawing to save. Each workspace keeps a separate drawing
-and autosave; multiple tabs on the same workspace share document changes.
-The agent follows the most recently active tab, and falls back to default
-when no page is connected. Agent settings remain shared across workspaces.
-
-The picker also renames and permanently deletes named workspaces. Rename
-preserves the drawing and rejects existing names; delete requires typing the
-workspace name. Both require an available server and ask you to close or
-switch any other tabs viewing that workspace first. Default cannot be
-renamed or deleted. Creating, switching and reopening browser saves remain
-available without the server.
-
-With the development server, named documents persist under
-`.rs-canvas/workspaces/` beside `.rs-canvas/current.json`. When starting the
-server manually, pass `--doc /path/to/current.json` to enable server
-persistence; without it, browser autosaves provide persistence.
-
-## Agent (MCP)
-
-With `npm run dev` running, opencode can draw, explain and look at the canvas:
-`canvas_read` (scene graph with revision cursors), `canvas_draw` and
-`canvas_pen` (shapes, and freehand strokes with per-point pressure and ink
-style — width, colour, roughness, dash, opacity, fill/shading),
-`canvas_script` (ordered beats with handles, automatic placement, captions and
-camera focus — presented beat by beat on the user's canvas),
-`canvas_screenshot`, `canvas_focus`/`canvas_point`/`canvas_zoom`,
-`canvas_annotate`/`canvas_emphasis`/`canvas_tidy`/`canvas_clear`, and
-`canvas_status` (revision plus transient view hints). The page and the server
-share one document through the merge-ready model, and the mirror persists to
-`.rs-canvas/current.json`.
-
-A tab can instead be pinned to a named workspace with `?ws=<name>` (or the
-toolbar's workspace switcher): each workspace is an isolated drawing with its
-own autosave, and agent calls always act on the workspace the user is
-currently viewing. Named workspaces persist to
-`.rs-canvas/workspaces/<name>.json`.
-
-The toolbar's ◎ button opens live agent preferences the server enforces:
-camera moves (off / gentle / full — focus skips targets that are already
-visible and never zooms past 2× on gentle) and presentation pacing, persisted
-to `.rs-canvas/settings.json`. Everything is local-only.
-
-For engineering discussions, `canvas_read` can inspect the selection, specific
-handles, a frame or matching labels instead of the whole document. Reads are
-paginated (100 elements by default) and return workspace context and revision;
-pass those to `canvas_script` when revising a design. Update beats rename,
-move, resize, restyle, reparent and reconnect existing elements while preserving
-their IDs, owned labels and frame children. Drawing a frame `around` elements
-establishes ownership. A script's `edit` receipt lists what changed and provides
-a transaction for `canvas_revert`; revert refuses to overwrite later edits and
-is retained for the last 50 agent edits during this document lifetime.
-
-`canvas_glyphs` discovers valid glyph IDs. `canvas_remember` saves constraints,
-agreed decisions with reasons, and open questions using the discussion revision
-from `canvas_status`. The ◎ panel shows these notes, which persist beside the
-workspace document as `<name>.discussion.json`. Notes are separate from document
-exports; without a server backing file they last only for the server session.
-The primary agent discusses the design; the canvas subagent makes small,
-verified revisions and records useful context.
-
-Codex loads the project MCP connection and the `canvas` drawing agent from
-`.codex/config.toml`. The `canvas-thinking` skill in
-`.agents/skills/canvas-thinking/` is available by default and can be picked up
-from an ordinary engineering discussion; the primary agent has read-only canvas
-tools and delegates document changes to the drawing agent. Trust this project
-in Codex and open a fresh session after changing its MCP configuration. Run
-`npm run dev` in `web/` so the local server is available.
-
-Example script revision (tool arguments):
-
-```json
-{
-  "context": "<context from canvas_read or canvas_status>",
-  "revision": 12,
-  "beats": [
-    {"update": {"id": "e3", "text": "Ack after processing"}},
-    {"update": {"id": "e7", "to": "e3"}}
-  ]
-}
+```sh
+npm run test:e2e   # build wasm and run the Playwright suite
 ```
 
-After changing server code, restart the dev server to load the new tools and
-reload the page. For concurrent test runs, choose a separate port range, e.g.
-`RS_CANVAS_TEST_PORT=4273 npm run test:e2e` from `web/`.
+## Agent bridge
 
-The app is served as-is: `index.html` loads `/src/main.js` as an ES module, the wasm-bindgen `--target web` output is imported directly, and CSS/fonts are plain files. There is no Vite, no TypeScript and no bundler in the app — `npm run dev` also watches Rust sources and rebuilds the wasm for you (reload the page after a rebuild).
+The dev server exposes an MCP endpoint at `http://127.0.0.1:5173/mcp` and a WebSocket bridge to the open page. The checked-in `opencode.jsonc` and `.codex/config.toml` connect opencode and Codex to it. The agent can:
 
-Core tests run natively:
+- read the drawing and the current selection (`canvas_read`, `canvas_status`);
+- draw and revise shapes, freehand ink, scripts and bulk grids (`canvas_draw`, `canvas_pen`, `canvas_script`, `canvas_bulk`);
+- move the view and capture it (`canvas_focus`, `canvas_point`, `canvas_zoom`, `canvas_screenshot`);
+- annotate, arrange and revert its own edits (`canvas_annotate`, `canvas_emphasis`, `canvas_tidy`, `canvas_clear`, `canvas_revert`);
+- save constraints, decisions and open questions for the current workspace (`canvas_remember`).
+
+The page remains the interactive source of truth: the agent edits a mirrored document over the same delta and merge path the browser uses, and camera commands are transient view state. The server binds to localhost only. See [`docs/adr/0005-agent-drives-canvas.md`](docs/adr/0005-agent-drives-canvas.md) for the design.
+
+## How it works
+
+- `crates/canvas-core` — document model, geometry, history, merge logic, shape library and Canvas2D display list. No browser dependencies.
+- `crates/canvas-wasm` — the wasm-bindgen `Editor` façade and the Canvas2D renderer.
+- `crates/canvas-server` — static file server, live sync bridge, MCP tools and workspace persistence.
+- `web/` — ES modules, CSS and fonts. No build step beyond wasm-bindgen.
+
+Design decisions live in [`docs/adr/`](docs/adr/); the domain vocabulary is in [`CONTEXT.md`](CONTEXT.md).
+
+## Testing
 
 ```sh
 cargo test --workspace
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
+
+cd web
+npm run test:e2e
 ```
 
-## Licensing
+Set `RS_CANVAS_TEST_PORT=4273` to run the Playwright suite on a different port range.
 
-MIT (see `LICENSE`). GCP product names are used nominatively; the shape library contains original artwork only.
+## License
+
+MIT — see [`LICENSE`](LICENSE). GCP product names are used nominatively; the shape library contains original artwork only.

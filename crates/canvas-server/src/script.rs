@@ -324,7 +324,7 @@ pub fn execute(
                 step.created.push(label_id);
             }
         } else if let Some(annotate) = &beat.annotate {
-            let target = resolve(&handles, &working, &annotate.target).map_err(&fail)?;
+            let target = resolve(&handles, &working, &annotate.target).map_err(fail)?;
             let ids = crate::verbs::annotate(&mut working, &target, &annotate.mark, now_ms)
                 .map_err(fail)?;
             for id in ids {
@@ -336,21 +336,21 @@ pub fn execute(
                 .iter()
                 .map(|reference| resolve(&handles, &working, reference))
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(&fail)?;
+                .map_err(fail)?;
             crate::verbs::emphasis(&mut working, &targets, &emphasis.mode, now_ms).map_err(fail)?;
         } else if let Some(tidy) = &beat.tidy {
             let targets = tidy
                 .iter()
                 .map(|reference| resolve(&handles, &working, reference))
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(&fail)?;
+                .map_err(fail)?;
             crate::verbs::tidy(&mut working, &targets, now_ms).map_err(fail)?;
         } else if let Some(clear) = &beat.clear {
             let targets = clear
                 .iter()
                 .map(|reference| resolve(&handles, &working, reference))
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(&fail)?;
+                .map_err(fail)?;
             crate::verbs::clear(&mut working, &targets, now_ms).map_err(fail)?;
         } else if let Some(draw) = &beat.draw {
             if let Some(handle) = &draw.handle {
@@ -371,7 +371,7 @@ pub fn execute(
                 .as_deref()
                 .map(|reference| resolve(&handles, &working, reference))
                 .transpose()
-                .map_err(&fail)?;
+                .map_err(fail)?;
             let mut request = DrawRequest {
                 kind: draw.kind.clone(),
                 text: draw.text.clone(),
@@ -385,7 +385,7 @@ pub fn execute(
                 side: draw.side.clone(),
             };
             if let Some(around) = &draw.around {
-                let rect = around_rect(&handles, &working, around).map_err(&fail)?;
+                let rect = around_rect(&handles, &working, around).map_err(fail)?;
                 request.x = Some(rect.x);
                 request.y = Some(rect.y);
                 request.w = Some(rect.w);
@@ -393,7 +393,7 @@ pub fn execute(
             }
             let id = doc_ops::draw(&mut working, &request, now_ms).map_err(fail)?;
             if let Some(frame) = &draw.frame {
-                let frame = resolve(&handles, &working, frame).map_err(&fail)?;
+                let frame = resolve(&handles, &working, frame).map_err(fail)?;
                 canvas_core::edit::update_element(
                     &mut working,
                     &id,
@@ -403,13 +403,13 @@ pub fn execute(
                     },
                     now_ms,
                 )
-                .map_err(&fail)?;
+                .map_err(fail)?;
             }
             // A frame drawn around elements owns them, not just their coordinates.
             if draw.kind == "frame" {
                 if let Some(around) = &draw.around {
                     for child in around {
-                        let child = resolve(&handles, &working, child).map_err(&fail)?;
+                        let child = resolve(&handles, &working, child).map_err(fail)?;
                         canvas_core::edit::update_element(
                             &mut working,
                             &child,
@@ -419,7 +419,7 @@ pub fn execute(
                             },
                             now_ms,
                         )
-                        .map_err(&fail)?;
+                        .map_err(fail)?;
                     }
                 }
             }
@@ -449,13 +449,13 @@ pub fn execute(
             .as_deref()
             .map(|reference| resolve(&handles, &working, reference))
             .transpose()
-            .map_err(&fail)?;
+            .map_err(fail)?;
         step.point = beat
             .point
             .as_deref()
             .map(|reference| resolve(&handles, &working, reference))
             .transpose()
-            .map_err(&fail)?;
+            .map_err(fail)?;
         steps.push(step);
     }
 

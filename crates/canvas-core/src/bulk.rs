@@ -557,7 +557,7 @@ pub fn summarize(doc: &Document) -> serde_json::Value {
         }
     }
     let mut fills: Vec<(String, usize)> = fills.into_iter().collect();
-    fills.sort_by(|a, b| b.1.cmp(&a.1));
+    fills.sort_by_key(|a| std::cmp::Reverse(a.1));
     fills.truncate(8);
     serde_json::json!({
         "live": doc.live_count(),

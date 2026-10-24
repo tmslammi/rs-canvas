@@ -2,7 +2,7 @@
 //!
 //! Element IDs are immutable, globally unique and never reused. Versions
 //! carry a random nonce so equal versions from concurrent editors resolve
-//! deterministically (see the merge ticket).
+//! deterministically.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::OnceLock;
