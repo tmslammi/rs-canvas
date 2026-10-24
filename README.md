@@ -12,6 +12,31 @@ A local browser drawing tool for freehand sketching and hand-drawn cloud archite
 - Named workspaces with local autosave, undo/redo, and a workspace picker that works offline.
 - An optional local [MCP](https://modelcontextprotocol.io) bridge that lets an AI agent read the canvas, draw and revise diagrams with the built-in GCP and generic glyph library, move the camera, take screenshots and keep discussion notes while you watch.
 
+## Install (macOS alpha)
+
+Prebuilt alpha builds are published as GitHub pre-releases. On a Mac:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/tmslammi/rs-canvas/master/install.sh | bash
+rs-canvas
+```
+
+The installer verifies the release checksum and puts `rs-canvas` in
+`~/.local/bin`. The executable carries the front end, so the installing machine
+does not need Rust, Node or a checkout. It serves the app at
+<http://127.0.0.1:5173> and the MCP endpoint at
+<http://127.0.0.1:5173/mcp>; documents live in `~/.rs-canvas`.
+
+To pin or roll back to a specific alpha:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/tmslammi/rs-canvas/master/install.sh \
+  | bash -s -- --version 0.1.0-alpha.1
+```
+
+Apple Silicon and Intel builds are published. Linux and Windows are not yet.
+Maintainer notes live in [`docs/releases.md`](docs/releases.md).
+
 ## Getting started
 
 Prerequisites: Rust with the `wasm32-unknown-unknown` target, `wasm-bindgen-cli` matching the version in `Cargo.lock` (currently 0.2.129), and Node 24+.

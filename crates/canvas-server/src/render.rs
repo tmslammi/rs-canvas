@@ -12,6 +12,10 @@ const MAX_EDGE: f32 = 1_600.0;
 /// The app's canvas background, so the hand-drawn ink reads the same here.
 const BACKGROUND: (u8, u8, u8) = (26, 24, 21);
 
+/// Installed builds serve the front end from the executable, so the font
+/// normally found under `web/fonts` is carried in the binary as well.
+const EMBEDDED_FONT: &[u8] = include_bytes!("../../../web/fonts/ComicShanns-Regular.ttf");
+
 pub fn render_png(doc: &Document, web_dir: &Path) -> Result<Vec<u8>, String> {
     if doc.live_count() == 0 {
         return Err("the canvas is empty; draw something first".into());
@@ -19,11 +23,8 @@ pub fn render_png(doc: &Document, web_dir: &Path) -> Result<Vec<u8>, String> {
     let svg = to_svg(doc, &ApproxMeasurer);
     let mut options = resvg::usvg::Options::default();
     let font = web_dir.join("fonts").join("ComicShanns-Regular.ttf");
-    if font.exists() {
-        let bytes = std::fs::read(&font)
-            .map_err(|error| format!("cannot read the canvas font: {error}"))?;
-        options.fontdb_mut().load_font_data(bytes);
-    }
+    let bytes = std::fs::read(&font).unwrap_or_else(|_| EMBEDDED_FONT.to_vec());
+    options.fontdb_mut().load_font_data(bytes);
     let tree = resvg::usvg::Tree::from_str(&svg, &options)
         .map_err(|error| format!("cannot parse the drawing: {error}"))?;
     let size = tree.size();
