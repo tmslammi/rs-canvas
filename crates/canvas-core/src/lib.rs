@@ -4,6 +4,7 @@
 //! No browser dependencies; everything here is testable natively.
 
 pub mod benchmark;
+mod binary;
 pub mod bulk;
 pub mod camera;
 pub mod connector;
@@ -13,6 +14,7 @@ pub mod describe;
 pub mod display;
 pub mod edit;
 pub mod editor;
+pub mod envelope;
 pub mod geometry;
 pub mod glyphs;
 pub mod history;

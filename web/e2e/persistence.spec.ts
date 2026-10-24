@@ -11,6 +11,72 @@ async function drawRect(page: import("@playwright/test").Page): Promise<void> {
   await page.mouse.up();
 }
 
+const AUTOSAVE_KEY = "current-v2";
+
+type StoredAutosave = {
+  hasBytes: boolean;
+  hasJson: boolean;
+  size: number;
+  magic: string;
+};
+
+async function readAutosave(
+  page: import("@playwright/test").Page,
+  key = AUTOSAVE_KEY,
+): Promise<StoredAutosave> {
+  return page.evaluate(async (id) => {
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open("rs-canvas");
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    try {
+      const value = await new Promise<any>((resolve, reject) => {
+        const request = db.transaction("documents", "readonly").objectStore("documents").get(id);
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+      if (!value) return { hasBytes: false, hasJson: false, size: 0, magic: "" };
+      const bytes = value.bytes;
+      const hasBytes = bytes instanceof Uint8Array;
+      return {
+        hasBytes,
+        hasJson: typeof value.json === "string",
+        size: hasBytes ? bytes.byteLength : 0,
+        magic: hasBytes ? new TextDecoder().decode(bytes.slice(0, 8)) : "",
+      };
+    } finally {
+      db.close();
+    }
+  }, key);
+}
+
+async function writeLegacyAutosave(
+  page: import("@playwright/test").Page,
+  json: string,
+  key = AUTOSAVE_KEY,
+): Promise<void> {
+  await page.evaluate(async ({ id, legacyJson }) => {
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open("rs-canvas");
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const request = db
+          .transaction("documents", "readwrite")
+          .objectStore("documents")
+          .put({ id, json: legacyJson, updated: Date.now() });
+        request.onsuccess = () => resolve();
+        request.onerror = () => reject(request.error);
+      });
+    } finally {
+      db.close();
+    }
+  }, { id: key, legacyJson: json });
+}
+
 test("autosave survives a reload", async ({ page }) => {
   await page.goto("/");
   await page.waitForFunction(() => window.__rsReady === true);
@@ -22,6 +88,39 @@ test("autosave survives a reload", async ({ page }) => {
   await page.reload();
   await page.waitForFunction(() => window.__rsReady === true);
   expect(await count(page)).toBe(1);
+});
+
+test("autosaves use the binary envelope", async ({ page }) => {
+  await page.goto("/");
+  await page.waitForFunction(() => window.__rsReady === true);
+  await page.evaluate(() => window.__rsEditor!.new_document());
+  await drawRect(page);
+
+  await expect.poll(async () => (await readAutosave(page)).hasBytes).toBe(true);
+  const stored = await readAutosave(page);
+  const jsonBytes = await page.evaluate(() => new TextEncoder().encode(window.__rsEditor!.save_json()).length);
+  expect(stored.magic).toBe("RSCDOC\r\n");
+  expect(stored.hasJson, "binary records do not carry a JSON string").toBe(false);
+  expect(stored.size).toBeLessThan(jsonBytes);
+});
+
+test("legacy JSON autosaves load and upgrade to binary", async ({ page }) => {
+  await page.goto("/");
+  await page.waitForFunction(() => window.__rsReady === true);
+  await page.evaluate(() => window.__rsEditor!.new_document());
+  await drawRect(page);
+  const json = await page.evaluate(() => window.__rsEditor!.save_json());
+  await writeLegacyAutosave(page, json);
+
+  await page.reload();
+  await page.waitForFunction(() => window.__rsReady === true);
+  expect(await count(page)).toBe(1);
+
+  await page.evaluate(() => window.__rsEditor!.flush_save());
+  await expect.poll(async () => (await readAutosave(page)).hasBytes).toBe(true);
+  const stored = await readAutosave(page);
+  expect(stored.magic).toBe("RSCDOC\r\n");
+  expect(stored.hasJson).toBe(false);
 });
 
 test("named workspaces have separate autosaves and unload checkpoints", async ({ page }) => {
@@ -44,6 +143,10 @@ test("named workspaces have separate autosaves and unload checkpoints", async ({
   await page.goto("/");
   await page.waitForFunction(() => window.__rsReady === true);
   expect(await count(page), "named checkpoint does not replace the default drawing").toBe(1);
+  const checkpoint = await page.evaluate(
+    () => localStorage.getItem("rs-canvas-unload-checkpoint:workspace:separate"),
+  );
+  expect(checkpoint, "the unload checkpoint is prefixed base64 of binary bytes").toMatch(/^rsc-bin1:/);
   await page.goto("/?ws=separate");
   await page.waitForFunction(() => window.__rsReady === true);
   expect(await count(page), "named workspace restores its own drawing").toBe(2);

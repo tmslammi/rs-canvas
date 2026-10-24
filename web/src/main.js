@@ -1,4 +1,4 @@
-import init, { Editor, load_saved_json, list_saved_workspaces, save_workspace_json, delete_saved_workspace } from "./wasm/canvas_wasm.js";
+import init, { Editor, load_saved_document, list_saved_workspaces, save_workspace_bytes, delete_saved_workspace } from "./wasm/canvas_wasm.js";
 import { createStylePanel } from "./stylePanel.js";
 import { createAgentPanel } from "./agentPanel.js";
 import { connectAgentBridge } from "./agentBridge.js";
@@ -412,12 +412,27 @@ async function boot() {
     ? "rs-canvas-unload-checkpoint"
     : `rs-canvas-unload-checkpoint:workspace:${name}`;
   const UNLOAD_CHECKPOINT = checkpointKey(workspace);
+  // localStorage is string-only, so binary checkpoints carry base64 with a
+  // distinct prefix. A checkpoint without the prefix is the old JSON format.
+  const CHECKPOINT_PREFIX = "rsc-bin1:";
+  const bytesToBase64 = (bytes) => {
+    let binary = "";
+    const chunk = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunk) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+    }
+    return btoa(binary);
+  };
+  const checkpointValue = (bytes) => CHECKPOINT_PREFIX + bytesToBase64(bytes);
+  const checkpointBytes = (value) => value.startsWith(CHECKPOINT_PREFIX)
+    ? Uint8Array.from(atob(value.slice(CHECKPOINT_PREFIX.length)), (c) => c.charCodeAt(0))
+    : new TextEncoder().encode(value);
   const checkpointAutosave = () => {
     if (!autosaveTimer) return; // nothing pending — IndexedDB is already current
     window.clearTimeout(autosaveTimer);
     autosaveTimer = 0;
     try {
-      localStorage.setItem(UNLOAD_CHECKPOINT, editor.save_json());
+      localStorage.setItem(UNLOAD_CHECKPOINT, checkpointValue(editor.save_bytes()));
     } catch {
       // Quota or privacy-mode refusal: the async flush below may still land.
     }
@@ -589,7 +604,7 @@ async function boot() {
     pinching = false;
     pinchDistance = 0;
     bridge?.publishChanges();
-    return editor.save_json();
+    return editor.save_bytes();
   };
   const pauseWorkspaceSave = () => {
     autosavePaused = true;
@@ -599,8 +614,8 @@ async function boot() {
   const catalogue = (remove, add) => {
     try { updateWorkspaceCatalogue(remove, add); } catch { /* IndexedDB still lists saved names. */ }
   };
-  const checkpoint = (name, json) => {
-    try { localStorage.setItem(checkpointKey(name), json); } catch { /* The awaited IndexedDB save is durable. */ }
+  const checkpoint = (name, bytes) => {
+    try { localStorage.setItem(checkpointKey(name), checkpointValue(bytes)); } catch { /* The awaited IndexedDB save is durable. */ }
   };
   const clearCheckpoint = (name) => {
     try { localStorage.removeItem(checkpointKey(name)); } catch { /* Storage can be unavailable. */ }
@@ -622,10 +637,10 @@ async function boot() {
     location.assign(workspaceUrl(name));
   };
   const storeOutgoingWorkspace = async () => {
-    const json = prepareWorkspace();
-    await save_workspace_json(workspace, json);
-    checkpoint(workspace, json);
-    return json;
+    const bytes = prepareWorkspace();
+    await save_workspace_bytes(workspace, bytes);
+    checkpoint(workspace, bytes);
+    return bytes;
   };
   const managementRequest = async (path, options) => {
     const response = await fetch(`/api/workspaces/${encodeURIComponent(workspace)}${path}`, options);
@@ -640,21 +655,22 @@ async function boot() {
     catalogue(workspace, null);
   };
   const manageWorkspace = async (name) => {
-    const json = await storeOutgoingWorkspace();
-    if (name && await load_saved_json(name)) throw new Error("That workspace already has a saved drawing. Choose another name.");
+    const bytes = await storeOutgoingWorkspace();
+    if (name && await load_saved_document(name)) throw new Error("That workspace already has a saved drawing. Choose another name.");
     pauseWorkspaceSave();
     workspaceLeaving = true;
     let serverChanged = false;
     try {
-      if (name) await save_workspace_json(name, json);
+      if (name) await save_workspace_bytes(name, bytes);
       await managementRequest(name ? "/rename" : "", name ? {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name, doc: JSON.parse(json) }),
+        // The server merges the document through its JSON wire path.
+        body: JSON.stringify({ name, doc: JSON.parse(editor.save_json()) }),
       } : { method: "DELETE" });
       serverChanged = true;
       bridge?.close();
       await removeLocalWorkspace();
-      if (name) checkpoint(name, json);
+      if (name) checkpoint(name, bytes);
       navigateWorkspace(name || "default", name ? `Workspace renamed to ${name}` : `Workspace ${workspace} deleted`);
     } catch (error) {
       if (serverChanged) {
@@ -678,10 +694,10 @@ async function boot() {
       navigateWorkspace(name);
     },
     onDuplicate: async (name) => {
-      if (await load_saved_json(name)) throw new Error("That workspace already has a saved drawing. Choose another name.");
-      const json = await storeOutgoingWorkspace();
-      await save_workspace_json(name, json);
-      checkpoint(name, json);
+      if (await load_saved_document(name)) throw new Error("That workspace already has a saved drawing. Choose another name.");
+      const bytes = await storeOutgoingWorkspace();
+      await save_workspace_bytes(name, bytes);
+      checkpoint(name, bytes);
       navigateWorkspace(name, `Duplicated ${workspace} as ${name}`);
     },
     onRename: manageWorkspace,
@@ -768,9 +784,9 @@ async function boot() {
   redraw();
 
   try {
-    const saved = await load_saved_json(workspace);
+    const saved = await load_saved_document(workspace);
     if (saved) {
-      editor.load_json(saved);
+      editor.load_bytes(saved);
       showToast("Restored your last drawing");
     }
   } catch (error) {
@@ -783,7 +799,7 @@ async function boot() {
     const checkpoint = localStorage.getItem(UNLOAD_CHECKPOINT);
     if (checkpoint) {
       localStorage.removeItem(UNLOAD_CHECKPOINT);
-      editor.load_json(checkpoint);
+      editor.load_bytes(checkpointBytes(checkpoint));
       editor.flush_save();
     }
   } catch (error) {
@@ -822,9 +838,9 @@ async function boot() {
       bridge?.close();
       try {
         if (change.action === "rename") {
-          const json = prepareWorkspace();
-          await save_workspace_json(change.workspace, json);
-          checkpoint(change.workspace, json);
+          const bytes = prepareWorkspace();
+          await save_workspace_bytes(change.workspace, bytes);
+          checkpoint(change.workspace, bytes);
         }
         await removeLocalWorkspace();
         navigateWorkspace(change.workspace, "Workspace updated");

@@ -1,13 +1,17 @@
-//! JSON serialization with a versioned schema and a migration seam.
+//! Document serialization: versioned JSON for import/export and the wire, and
+//! the versioned binary envelope for persistence.
 //!
 //! Files and autosaves share one schema. The migration function is the single
 //! place older documents are upgraded; unknown future versions are rejected.
+//! Both read paths funnel into the same identity check and sanitizing pass.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use serde_json::Value;
 
+use crate::binary;
+use crate::envelope::{self, Codec, EnvelopeError};
 use crate::geometry::Rect;
 use crate::model::{Document, Element, ElementId, ElementKind, SCHEMA_VERSION};
 
@@ -18,6 +22,10 @@ pub enum SchemaError {
     UnsupportedVersion(u32),
     /// A document that is structurally unusable.
     Invalid(String),
+    /// The binary envelope is malformed or names an unknown codec.
+    Envelope(EnvelopeError),
+    /// The binary payload could not be decoded.
+    Binary(String),
 }
 
 impl fmt::Display for SchemaError {
@@ -31,6 +39,8 @@ impl fmt::Display for SchemaError {
                 )
             }
             SchemaError::Invalid(msg) => write!(f, "invalid document: {msg}"),
+            SchemaError::Envelope(e) => write!(f, "invalid document envelope: {e}"),
+            SchemaError::Binary(msg) => write!(f, "invalid binary document: {msg}"),
         }
     }
 }
@@ -40,6 +50,12 @@ impl std::error::Error for SchemaError {}
 impl From<serde_json::Error> for SchemaError {
     fn from(value: serde_json::Error) -> Self {
         SchemaError::Json(value)
+    }
+}
+
+impl From<EnvelopeError> for SchemaError {
+    fn from(value: EnvelopeError) -> Self {
+        SchemaError::Envelope(value)
     }
 }
 
@@ -66,7 +82,70 @@ pub fn from_value(value: Value) -> Result<Document, SchemaError> {
         .ok_or_else(|| SchemaError::Invalid("missing schemaVersion".into()))?
         as u32;
     let value = migrate(value, version)?;
-    let mut doc: Document = serde_json::from_value(value)?;
+    let doc: Document = serde_json::from_value(value)?;
+    finish_document(doc)
+}
+
+/// Encode a document in the binary envelope for persistence.
+///
+/// This is the save path: one postcard pass over borrowed fields, no
+/// intermediate `Value` tree and no cloning of the document.
+pub fn to_bytes(doc: &Document) -> Result<Vec<u8>, SchemaError> {
+    if doc.schema_version != SCHEMA_VERSION {
+        return Err(SchemaError::Invalid(format!(
+            "cannot write a document at schema version {} (current is {SCHEMA_VERSION})",
+            doc.schema_version
+        )));
+    }
+    let payload = binary::encode(doc).map_err(|error| SchemaError::Binary(error.to_string()))?;
+    Ok(envelope::encode(SCHEMA_VERSION, Codec::Postcard, &payload)?)
+}
+
+/// Load a persisted document, auto-detecting the binary envelope.
+///
+/// Bytes without the magic are treated as UTF-8 JSON (legacy autosaves,
+/// checkpoints and mirror files), so the transition needs no explicit
+/// migration step: the next save writes binary over the same key or path.
+pub fn from_bytes(input: &[u8]) -> Result<Document, SchemaError> {
+    if !envelope::is_binary(input) {
+        let json = std::str::from_utf8(input).map_err(|error| {
+            SchemaError::Invalid(format!(
+                "document is neither a binary envelope nor UTF-8 JSON: {error}"
+            ))
+        })?;
+        return from_json(json);
+    }
+    let envelope = envelope::decode(input)?;
+    decode_binary(envelope)
+}
+
+/// Dispatch on the envelope's schema version before touching the payload.
+///
+/// Version 1 is the first binary schema and shares the current document model.
+/// A future bump must keep a frozen decoder for version 1 here instead of
+/// reusing `Document`; JSON import remains the escape hatch for any document
+/// this build cannot decode.
+fn decode_binary(envelope: envelope::Envelope<'_>) -> Result<Document, SchemaError> {
+    match envelope.schema_version {
+        1 => {
+            let doc = match envelope.codec {
+                Codec::Postcard => binary::decode(envelope.payload)
+                    .map_err(|error| SchemaError::Binary(error.to_string()))?,
+            };
+            finish_document(doc)
+        }
+        v if v < SCHEMA_VERSION => Err(SchemaError::Invalid(format!(
+            "no binary migration path from schema version {v}"
+        ))),
+        v => Err(SchemaError::UnsupportedVersion(v)),
+    }
+}
+
+/// The checks every loaded document gets, whether it arrived as JSON or as a
+/// binary payload: normalize the schema version, verify identity and order
+/// keys, then repair hostile references and geometry.
+fn finish_document(mut doc: Document) -> Result<Document, SchemaError> {
+    doc.schema_version = SCHEMA_VERSION;
     for (id, element) in &doc.elements {
         if id != &element.id {
             return Err(SchemaError::Invalid(format!(
@@ -322,6 +401,191 @@ mod tests {
         let json = to_json(&doc).unwrap();
         let back = from_json(&json).unwrap();
         assert_eq!(doc, back);
+    }
+
+    #[test]
+    fn binary_and_json_round_trips_agree() {
+        let doc = full_document();
+        let binary = from_bytes(&to_bytes(&doc).unwrap()).unwrap();
+        let json = from_json(&to_json(&doc).unwrap()).unwrap();
+        assert_eq!(binary, json);
+        assert_eq!(binary, doc);
+    }
+
+    #[test]
+    fn binary_round_trip_keeps_tombstones() {
+        let mut doc = full_document();
+        let id = doc.elements.keys().next().unwrap().clone();
+        doc.element_mut(&id).unwrap().is_deleted = true;
+        let back = from_bytes(&to_bytes(&doc).unwrap()).unwrap();
+        assert_eq!(back, doc);
+        assert!(back.element(&id).unwrap().is_deleted);
+    }
+
+    #[test]
+    fn binary_save_is_deterministic() {
+        let doc = full_document();
+        assert_eq!(to_bytes(&doc).unwrap(), to_bytes(&doc).unwrap());
+    }
+
+    #[test]
+    fn legacy_json_bytes_still_load() {
+        let doc = full_document();
+        for json in [to_json(&doc).unwrap(), to_json_pretty(&doc).unwrap()] {
+            let back = from_bytes(json.as_bytes()).unwrap();
+            assert_eq!(back, doc);
+        }
+    }
+
+    #[test]
+    fn binary_rejects_a_future_version_before_decoding_the_payload() {
+        let bytes = binary_with_version(&full_document(), 99);
+        assert!(matches!(
+            from_bytes(&bytes),
+            Err(SchemaError::UnsupportedVersion(99))
+        ));
+    }
+
+    #[test]
+    fn binary_rejects_a_version_with_no_migration_path() {
+        let bytes = binary_with_version(&full_document(), 0);
+        assert!(matches!(from_bytes(&bytes), Err(SchemaError::Invalid(_))));
+    }
+
+    #[test]
+    fn binary_rejects_an_unknown_codec() {
+        let mut bytes = to_bytes(&full_document()).unwrap();
+        bytes[12] = 99;
+        assert!(matches!(
+            from_bytes(&bytes),
+            Err(SchemaError::Envelope(EnvelopeError::UnsupportedCodec(99)))
+        ));
+    }
+
+    #[test]
+    fn binary_rejects_truncated_headers_and_payloads() {
+        let bytes = to_bytes(&full_document()).unwrap();
+        assert!(matches!(
+            from_bytes(&bytes[..envelope::HEADER_LEN - 1]),
+            Err(SchemaError::Envelope(EnvelopeError::TruncatedHeader))
+        ));
+        assert!(matches!(
+            from_bytes(&bytes[..bytes.len() - 1]),
+            Err(SchemaError::Envelope(
+                EnvelopeError::TruncatedPayload { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn binary_rejects_trailing_bytes_and_corrupt_payloads() {
+        let mut bytes = to_bytes(&full_document()).unwrap();
+        bytes.push(0);
+        assert!(matches!(
+            from_bytes(&bytes),
+            Err(SchemaError::Envelope(EnvelopeError::TrailingBytes { .. }))
+        ));
+
+        let corrupt = envelope::encode(1, Codec::Postcard, &[0xff; 8]).unwrap();
+        assert!(matches!(from_bytes(&corrupt), Err(SchemaError::Binary(_))));
+    }
+
+    #[test]
+    fn binary_load_applies_the_same_identity_and_order_checks() {
+        let mut doc = full_document();
+        let id = doc.elements.keys().next().unwrap().clone();
+        let element = doc.elements.remove(&id).unwrap();
+        doc.elements.insert("other-key".into(), element);
+        assert!(matches!(
+            from_bytes(&to_bytes(&doc).unwrap()),
+            Err(SchemaError::Invalid(_))
+        ));
+
+        let mut doc = full_document();
+        doc.elements.values_mut().next().unwrap().index = "a!".into();
+        assert!(matches!(
+            from_bytes(&to_bytes(&doc).unwrap()),
+            Err(SchemaError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn binary_load_preserves_live_references() {
+        let mut doc = Document::new();
+        let shape_id = doc.add(
+            ElementKind::Shape {
+                shape: ShapeKind::Rectangle,
+                rect: Rect::new(0.0, 0.0, 100.0, 50.0),
+                style: Style::default(),
+                bound_text_id: None,
+            },
+            1,
+        );
+        let text_id = doc.add(
+            ElementKind::Text {
+                rect: Rect::new(0.0, 0.0, 10.0, 10.0),
+                text: "label".into(),
+                align: TextAlign::Center,
+                fixed_width: false,
+                container_id: Some(shape_id.clone()),
+                style: Style::default(),
+            },
+            2,
+        );
+        if let ElementKind::Shape { bound_text_id, .. } =
+            &mut doc.element_mut(&shape_id).unwrap().kind
+        {
+            *bound_text_id = Some(text_id.clone());
+        }
+
+        let back = from_bytes(&to_bytes(&doc).unwrap()).unwrap();
+        let ElementKind::Shape { bound_text_id, .. } = &back.element(&shape_id).unwrap().kind
+        else {
+            panic!("shape kind changed")
+        };
+        assert_eq!(bound_text_id.as_deref(), Some(text_id.as_str()));
+        let ElementKind::Text { container_id, .. } = &back.element(&text_id).unwrap().kind else {
+            panic!("text kind changed")
+        };
+        assert_eq!(container_id.as_deref(), Some(shape_id.as_str()));
+    }
+
+    #[test]
+    fn binary_save_rejects_a_document_at_another_schema_version() {
+        let mut doc = Document::new();
+        doc.schema_version = 2;
+        assert!(matches!(to_bytes(&doc), Err(SchemaError::Invalid(_))));
+    }
+
+    #[test]
+    fn binary_load_repairs_dangling_references() {
+        let mut doc = Document::new();
+        let shape_id = doc.add(
+            ElementKind::Shape {
+                shape: ShapeKind::Rectangle,
+                rect: Rect::new(0.0, 0.0, 100.0, 50.0),
+                style: Style::default(),
+                bound_text_id: Some("ghost-text".into()),
+            },
+            1,
+        );
+        doc.element_mut(&shape_id).unwrap().frame_id = Some("ghost-frame".into());
+
+        let back = from_bytes(&to_bytes(&doc).unwrap()).unwrap();
+        let shape = back.element(&shape_id).unwrap();
+        assert!(shape.frame_id.is_none());
+        assert!(matches!(
+            &shape.kind,
+            ElementKind::Shape {
+                bound_text_id: None,
+                ..
+            }
+        ));
+    }
+
+    fn binary_with_version(doc: &Document, version: u32) -> Vec<u8> {
+        let payload = crate::binary::encode(doc).unwrap();
+        envelope::encode(version, Codec::Postcard, &payload).unwrap()
     }
 
     #[test]

@@ -25,8 +25,10 @@ declare global {
       update_style(patch: string): void;
       commit_text(id: string, text: string): void;
       save_json(): string;
+      save_bytes(): Uint8Array;
       snapshot_json(): string;
       load_json(json: string): void;
+      load_bytes(bytes: Uint8Array): void;
       flush_save(): void;
       export_svg(): string;
       export_png(scale: number): string;
