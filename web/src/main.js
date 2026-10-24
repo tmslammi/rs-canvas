@@ -669,8 +669,9 @@ async function boot() {
       if (name) await save_workspace_bytes(name, bytes);
       await managementRequest(name ? "/rename" : "", name ? {
         method: "POST", headers: { "Content-Type": "application/json" },
-        // The workspace-management API merges the embedded document.
-        body: JSON.stringify({ name, doc: JSON.parse(editor.save_json()) }),
+        // The page uploads its document over the binary wire after navigating;
+        // the management route only moves the workspace.
+        body: JSON.stringify({ name }),
       } : { method: "DELETE" });
       serverChanged = true;
       bridge?.close();

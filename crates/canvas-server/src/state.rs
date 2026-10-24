@@ -1169,7 +1169,6 @@ impl AppState {
         &self,
         name: &str,
         renamed: Option<&str>,
-        incoming: Option<Document>,
     ) -> Result<(), WorkspaceManagementError> {
         use WorkspaceManagementError::*;
         if !valid_workspace_name(name) || renamed.is_some_and(|name| !valid_workspace_name(name)) {
@@ -1206,7 +1205,6 @@ impl AppState {
         let stored = self.workspaces.lock().unwrap().contains_key(name);
         let path = self.build_workspace(name).doc_path;
         if !stored
-            && incoming.is_none()
             && !match &path {
                 Some(path) => tokio::fs::try_exists(path).await.map_err(Io)?,
                 None => false,
@@ -1222,10 +1220,9 @@ impl AppState {
         }
         let _write = source.persist_write.lock().await;
         let mut doc = source.doc.lock().await;
-        let merged = incoming
-            .as_ref()
-            .map(|incoming| canvas_core::merge::reconcile(&doc, incoming))
-            .unwrap_or_else(|| doc.clone());
+        // The page uploads its document over the binary wire after navigating.
+        // The management route moves the mirror as it stands.
+        let merged = doc.clone();
         if let Some(new_name) = renamed {
             let destination = Arc::new(self.build_workspace(new_name));
             destination
@@ -1744,10 +1741,7 @@ mod tests {
         let before = old.doc.lock().await.clone();
         let mut messages = old.to_pages.subscribe();
         assert!(state.register_page(&old).await);
-        state
-            .manage_workspace("alpha", Some("beta"), None)
-            .await
-            .unwrap();
+        state.manage_workspace("alpha", Some("beta")).await.unwrap();
         assert!(
             !state.register_page(&old).await,
             "retired connections cannot rejoin"
@@ -1787,13 +1781,13 @@ mod tests {
         let before_alpha = alpha.doc.lock().await.clone();
         let before_beta = beta.doc.lock().await.clone();
         assert!(matches!(
-            state.manage_workspace("alpha", Some("beta"), None).await,
+            state.manage_workspace("alpha", Some("beta")).await,
             Err(WorkspaceManagementError::Conflict(_))
         ));
         alpha.pages.store(2, Ordering::SeqCst);
         for renamed in [None, Some("gamma")] {
             assert!(matches!(
-                state.manage_workspace("alpha", renamed, None).await,
+                state.manage_workspace("alpha", renamed).await,
                 Err(WorkspaceManagementError::Conflict(_))
             ));
         }
@@ -1801,11 +1795,11 @@ mod tests {
         assert_eq!(*beta.doc.lock().await, before_beta);
         assert!(!alpha.retired.load(Ordering::SeqCst));
         assert!(matches!(
-            state.manage_workspace("default", None, None).await,
+            state.manage_workspace("default", None).await,
             Err(WorkspaceManagementError::Invalid(_))
         ));
         assert!(matches!(
-            state.manage_workspace("alpha", Some("../oops"), None).await,
+            state.manage_workspace("alpha", Some("../oops")).await,
             Err(WorkspaceManagementError::Invalid(_))
         ));
     }
@@ -1827,7 +1821,7 @@ mod tests {
             .await
             .iter()
             .any(|info| info.name == "alpha"));
-        state.manage_workspace("alpha", None, None).await.unwrap();
+        state.manage_workspace("alpha", None).await.unwrap();
         assert!(!dir.join("workspaces/alpha.rsc").exists());
         assert!(!state
             .list_workspaces()
@@ -1835,7 +1829,7 @@ mod tests {
             .iter()
             .any(|info| info.name == "alpha"));
         assert!(matches!(
-            state.manage_workspace("alpha", None, None).await,
+            state.manage_workspace("alpha", None).await,
             Err(WorkspaceManagementError::NotFound)
         ));
         let _ = tokio::fs::remove_dir_all(dir).await;
