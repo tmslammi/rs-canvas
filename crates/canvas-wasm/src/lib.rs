@@ -1664,10 +1664,11 @@ impl Editor {
 
     fn apply_remote_snapshot(&mut self, remote: Document) -> bool {
         let merged = canvas_core::reconcile(self.core.document(), &remote);
-        self.last_paint = None;
-        if !self.core.merge_document(merged) {
+        if merged == *self.core.document() {
             return false;
         }
+        self.last_paint = None;
+        self.core.merge_document(merged);
         self.render();
         true
     }
