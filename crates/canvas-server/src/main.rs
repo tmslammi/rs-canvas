@@ -5,15 +5,19 @@
 //! a networked service.
 
 mod aliases;
+mod discussion;
 mod doc_ops;
+mod document;
 #[cfg(feature = "embed-web")]
 mod embedded;
 mod mcp;
+mod page_hub;
 mod render;
 mod script;
 mod state;
 mod verbs;
 mod workspace_api;
+mod workspace_store;
 mod ws;
 
 use std::path::PathBuf;

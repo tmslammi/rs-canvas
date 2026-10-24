@@ -53,11 +53,13 @@ async fn selected_frame_reads_and_updates_preserve_existing_identities() {
     let frame = created["created"]["workers"].as_str().unwrap();
     let workspace = server.current().await;
     let worker_id = workspace.resolve_id(worker).await;
-    *workspace.view_hint.lock().await = Some(crate::state::ViewHint {
-        selection: vec![worker_id.clone()],
-        camera: None,
-        viewport: None,
-    });
+    workspace
+        .set_view_hint(crate::state::ViewHint {
+            selection: vec![worker_id.clone()],
+            camera: None,
+            viewport: None,
+        })
+        .await;
     let selected = read(&server, json!({"selected":true})).await;
     assert!(text(&selected).contains("Worker"));
     assert!(!text(&selected).contains("Queue"));
@@ -85,7 +87,7 @@ async fn failed_revisions_and_partial_verbs_commit_nothing() {
     .await;
     let workspace = server.current().await;
     let before = workspace.document_json().await;
-    let revision = workspace.revision.load(Ordering::SeqCst);
+    let revision = workspace.revision();
     let result = server
         .canvas_script(Parameters(
             serde_json::from_value(json!({"beats":[
@@ -99,7 +101,7 @@ async fn failed_revisions_and_partial_verbs_commit_nothing() {
     assert_eq!(result.is_error, Some(true));
     assert!(text(&result).contains("beat 2"));
     assert_eq!(workspace.document_json().await, before);
-    assert_eq!(workspace.revision.load(Ordering::SeqCst), revision);
+    assert_eq!(workspace.revision(), revision);
     let result = server
         .canvas_emphasis(Parameters(EmphasisArgs {
             ids: vec![
@@ -119,7 +121,7 @@ async fn workspace_switch_rejects_explicit_and_session_context() {
     let server = server();
     let observed = status(&server).await;
     let beta = server.state.workspace("beta").await;
-    beta.pages.store(1, Ordering::SeqCst);
+    beta.set_page_count(1);
     beta.note_page_activity();
     for context in [
         Some(observed["context"].as_str().unwrap().to_string()),
@@ -139,14 +141,14 @@ async fn workspace_switch_rejects_explicit_and_session_context() {
         assert_eq!(result.is_error, Some(true));
         assert!(text(&result).contains("stale_context"));
     }
-    assert_eq!(beta.doc.lock().await.live_count(), 0);
+    assert_eq!(beta.doc().lock().await.live_count(), 0);
     status(&server).await;
     script(
         &server,
         json!([{"draw":{"kind":"sticky","text":"on beta"}}]),
     )
     .await;
-    assert_eq!(beta.doc.lock().await.live_count(), 2);
+    assert_eq!(beta.doc().lock().await.live_count(), 2);
 }
 
 #[tokio::test]
@@ -183,7 +185,7 @@ async fn revert_preserves_unrelated_work_and_conflicts_on_later_edits() {
     let changed = script(&server, json!([{"update":{"id":worker,"text":"Trial"}}])).await;
     let workspace = server.current().await;
     let id = workspace.resolve_id(worker).await;
-    let mut doc = workspace.doc.lock().await;
+    let mut doc = workspace.doc().lock().await;
     let before = doc.clone();
     let label = canvas_core::commands::owned_label(&doc, &id).unwrap();
     let element = doc.element_mut(&label).unwrap();
@@ -343,8 +345,7 @@ async fn discussion_persists_per_workspace_and_rejects_stale_replacement() {
             .state
             .workspace("other")
             .await
-            .discussion
-            .lock()
+            .discussion()
             .await
             .revision,
         0

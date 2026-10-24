@@ -9,58 +9,35 @@
 //! current workspace — the one the user's most recently active page is on.
 //! Creating a workspace is the one routing action: it navigates the user's
 //! page to the new workspace (ADR-0008).
+//!
+//! `Workspace` is the composition root for four collaborators:
+//! `DocumentMirror` (document, revision, change log, aliases, transactions),
+//! `PageHub` (presence, broadcast, view hints, presentation/screenshot state),
+//! `WorkspaceStore` (name, epoch, persistence, lifecycle) and
+//! `DiscussionStore` (discussion notes). Cross-collaborator workflows —
+//! absorbing a page frame, publishing an edit, loading and persisting a
+//! workspace — stay here so the ordering of mirror update, broadcast and
+//! persist remains explicit.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use canvas_core::model::{Document, Element, ElementId, ElementKind, Style};
+use canvas_core::model::{Document, Element};
 use canvas_core::sync::PageFrame;
-use canvas_core::{serialization, Delta};
-use tokio::sync::{broadcast, Mutex, Notify};
+use canvas_core::Delta;
+use tokio::sync::{broadcast, Mutex};
 
 use crate::aliases::Aliases;
-use rmcp::schemars;
-
-/// Small, user-inspectable engineering context, separate from document/view state.
-#[derive(
-    Clone, Debug, Default, serde::Serialize, serde::Deserialize, rmcp::schemars::JsonSchema,
-)]
-#[serde(deny_unknown_fields)]
-pub struct Discussion {
-    #[serde(default)]
-    pub constraints: Vec<String>,
-    /// Agreed decisions, including their reasons. Hypotheses belong in questions.
-    #[serde(default)]
-    pub decisions: Vec<String>,
-    #[serde(default)]
-    pub questions: Vec<String>,
-}
-
-#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
-pub struct DiscussionRecord {
-    pub revision: u64,
-    pub notes: Discussion,
-}
-
-#[derive(Clone)]
-pub struct AgentTransaction {
-    pub id: String,
-    /// The exact committed journal. Revert replays its inverse instead of
-    /// retaining full before/after snapshots of every touched element.
-    pub deltas: Vec<Delta>,
-}
-
-/// How many recent changes `canvas_read(since)` can recall.
-const CHANGE_LOG_LIMIT: usize = 200;
-
-/// How long a burst of edits coalesces before the mirror is written to disk.
-static PAGE_ACTIVITY: AtomicU64 = AtomicU64::new(0);
-
-const PERSIST_DEBOUNCE: Duration = Duration::from_millis(500);
-
+use crate::discussion::DiscussionStore;
+pub use crate::discussion::{Discussion, DiscussionRecord};
+use crate::document::DocumentMirror;
+pub use crate::document::{AgentTransaction, ChangeKind, ChangeRecord, ChangedElement};
+use crate::page_hub::PageHub;
+pub use crate::page_hub::{PageFrameOutcome, PageMessage, ViewHint};
+use crate::workspace_store::{write_atomic, WorkspaceStore};
 /// The unnamed workspace: where `--doc` points and where agent calls land
 /// when no page is connected.
 pub const DEFAULT_WORKSPACE: &str = "default";
@@ -74,307 +51,6 @@ pub fn valid_workspace_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-}
-
-/// One broadcast frame plus the page that must not receive it (the origin of
-/// a patch never gets its own change echoed back).
-///
-/// A control frame is a JSON text frame. A document frame is a binary wire
-/// frame (ADR-0010). There is exactly one encoding per message kind.
-#[derive(Clone, Debug)]
-pub enum PageMessage {
-    Control(String),
-    Document { bytes: Vec<u8>, except: Option<u64> },
-}
-
-impl PageMessage {
-    pub fn control(text: String) -> Self {
-        Self::Control(text)
-    }
-
-    pub fn document(bytes: Vec<u8>, except: Option<u64>) -> Self {
-        Self::Document { bytes, except }
-    }
-
-    pub fn except(&self) -> Option<u64> {
-        match self {
-            PageMessage::Control(_) => None,
-            PageMessage::Document { except, .. } => *except,
-        }
-    }
-}
-
-/// What kind of change one element underwent, as far as a before/after
-/// comparison can tell. One element may carry several kinds (a move that
-/// also resizes and relabels, for example).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum ChangeKind {
-    Added,
-    Removed,
-    Moved,
-    Resized,
-    Relabelled,
-    Restyled,
-    Reparented,
-    Reordered,
-    Other,
-}
-
-impl ChangeKind {
-    /// Reporting order for revision summaries and per-element lists.
-    pub const ALL: [ChangeKind; 9] = [
-        ChangeKind::Added,
-        ChangeKind::Removed,
-        ChangeKind::Moved,
-        ChangeKind::Resized,
-        ChangeKind::Relabelled,
-        ChangeKind::Restyled,
-        ChangeKind::Reparented,
-        ChangeKind::Reordered,
-        ChangeKind::Other,
-    ];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            ChangeKind::Added => "added",
-            ChangeKind::Removed => "removed",
-            ChangeKind::Moved => "moved",
-            ChangeKind::Resized => "resized",
-            ChangeKind::Relabelled => "relabelled",
-            ChangeKind::Restyled => "restyled",
-            ChangeKind::Reparented => "reparented",
-            ChangeKind::Reordered => "reordered",
-            ChangeKind::Other => "other",
-        }
-    }
-}
-
-/// One element in a change record: its id and every kind detected.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ChangedElement {
-    pub id: String,
-    pub kinds: Vec<ChangeKind>,
-}
-
-/// One recorded document change, for `canvas_read(since)`.
-#[derive(Clone, Debug)]
-pub struct ChangeRecord {
-    pub revision: u64,
-    pub source: String,
-    pub changed: Vec<ChangedElement>,
-}
-
-impl ChangeRecord {
-    /// Per-kind element counts for this revision, in reporting order.
-    pub fn kind_counts(&self) -> Vec<(ChangeKind, usize)> {
-        ChangeKind::ALL
-            .iter()
-            .filter_map(|kind| {
-                let count = self
-                    .changed
-                    .iter()
-                    .filter(|change| change.kinds.contains(kind))
-                    .count();
-                (count > 0).then_some((*kind, count))
-            })
-            .collect()
-    }
-}
-
-/// Classify one element from its before/after copies. Every changed id gets
-/// at least one kind, so a change can never be silently dropped.
-fn classify_change(before: Option<&Element>, after: Option<&Element>) -> Vec<ChangeKind> {
-    let Some(after) = after else {
-        return vec![ChangeKind::Removed];
-    };
-    let Some(before) = before else {
-        return if after.is_deleted {
-            vec![ChangeKind::Removed]
-        } else {
-            vec![ChangeKind::Added]
-        };
-    };
-    if after.is_deleted {
-        return if before.is_deleted {
-            vec![ChangeKind::Other]
-        } else {
-            vec![ChangeKind::Removed]
-        };
-    }
-    if before.is_deleted {
-        return vec![ChangeKind::Added];
-    }
-
-    let mut kinds = Vec::new();
-    let before_bounds = before.bounds();
-    let after_bounds = after.bounds();
-    if before_bounds.x != after_bounds.x || before_bounds.y != after_bounds.y {
-        kinds.push(ChangeKind::Moved);
-    }
-    if before_bounds.w != after_bounds.w || before_bounds.h != after_bounds.h {
-        kinds.push(ChangeKind::Resized);
-    }
-    if label_changed(before, after) {
-        kinds.push(ChangeKind::Relabelled);
-    }
-    if style_of(before) != style_of(after) {
-        kinds.push(ChangeKind::Restyled);
-    }
-    if parent_of(before) != parent_of(after) {
-        kinds.push(ChangeKind::Reparented);
-    }
-    if before.index != after.index {
-        kinds.push(ChangeKind::Reordered);
-    }
-    if other_change(before, after) {
-        kinds.push(ChangeKind::Other);
-    }
-    if kinds.is_empty() {
-        // Only merge metadata changed (version, nonce, timestamp).
-        kinds.push(ChangeKind::Other);
-    }
-    kinds
-}
-
-fn label_changed(before: &Element, after: &Element) -> bool {
-    match (&before.kind, &after.kind) {
-        (ElementKind::Text { text: before, .. }, ElementKind::Text { text: after, .. })
-        | (ElementKind::Frame { name: before, .. }, ElementKind::Frame { name: after, .. }) => {
-            before != after
-        }
-        _ => false,
-    }
-}
-
-fn style_of(element: &Element) -> Option<&Style> {
-    match &element.kind {
-        ElementKind::Shape { style, .. }
-        | ElementKind::Freehand { style, .. }
-        | ElementKind::Glyph { style, .. }
-        | ElementKind::Arrow { style, .. }
-        | ElementKind::Text { style, .. }
-        | ElementKind::StickyStack { style, .. } => Some(style),
-        ElementKind::Frame { .. } => None,
-    }
-}
-
-/// Parent/owner membership: a frame, plus the container of a bound label.
-fn parent_of(element: &Element) -> (Option<&str>, Option<&str>) {
-    let container = match &element.kind {
-        ElementKind::Text { container_id, .. } => container_id.as_deref(),
-        _ => None,
-    };
-    (element.frame_id.as_deref(), container)
-}
-
-/// Properties outside bounds, label, style, membership and order. Geometry is
-/// deliberately excluded here (endpoint positions move with an arrow, freehand
-/// samples move with a stroke), so a plain move is not also reported as
-/// `other`.
-fn other_change(before: &Element, after: &Element) -> bool {
-    match (&before.kind, &after.kind) {
-        (
-            ElementKind::Shape {
-                shape: before_shape,
-                bound_text_id: before_label,
-                ..
-            },
-            ElementKind::Shape {
-                shape: after_shape,
-                bound_text_id: after_label,
-                ..
-            },
-        ) => before_shape != after_shape || before_label != after_label,
-        (
-            ElementKind::Freehand {
-                pressures: before, ..
-            },
-            ElementKind::Freehand {
-                pressures: after, ..
-            },
-        ) => before != after,
-        (
-            ElementKind::Glyph {
-                glyph: before_glyph,
-                caption_id: before_caption,
-                ..
-            },
-            ElementKind::Glyph {
-                glyph: after_glyph,
-                caption_id: after_caption,
-                ..
-            },
-        ) => before_glyph != after_glyph || before_caption != after_caption,
-        (
-            ElementKind::Arrow {
-                start: before_start,
-                end: before_end,
-                routing: before_routing,
-                start_arrowhead: before_start_head,
-                end_arrowhead: before_end_head,
-                label_id: before_label,
-                ..
-            },
-            ElementKind::Arrow {
-                start: after_start,
-                end: after_end,
-                routing: after_routing,
-                start_arrowhead: after_start_head,
-                end_arrowhead: after_end_head,
-                label_id: after_label,
-                ..
-            },
-        ) => {
-            before_routing != after_routing
-                || before_start_head != after_start_head
-                || before_end_head != after_end_head
-                || before_label != after_label
-                || before_start.binding != after_start.binding
-                || before_end.binding != after_end.binding
-        }
-        (
-            ElementKind::Text {
-                align: before_align,
-                fixed_width: before_fixed,
-                ..
-            },
-            ElementKind::Text {
-                align: after_align,
-                fixed_width: after_fixed,
-                ..
-            },
-        ) => before_align != after_align || before_fixed != after_fixed,
-        (ElementKind::StickyStack { .. }, ElementKind::StickyStack { .. }) => false,
-        (ElementKind::Frame { .. }, ElementKind::Frame { .. }) => false,
-        _ => true,
-    }
-}
-
-/// The most recent page's transient view state, for `canvas_status`.
-#[derive(Clone, Debug, serde::Deserialize)]
-pub struct ViewHint {
-    #[serde(default)]
-    pub camera: Option<serde_json::Value>,
-    #[serde(default)]
-    pub viewport: Option<serde_json::Value>,
-    #[serde(default)]
-    pub selection: Vec<String>,
-}
-
-/// What applying one page frame did to the mirror.
-#[derive(Clone, Debug, Default)]
-pub struct PageFrameOutcome {
-    /// The mirror changed.
-    pub changed: bool,
-    /// The mirror's revision after the frame.
-    pub revision: u64,
-    /// The page's base revision for snapshots; `None` for patches.
-    pub base_revision: Option<u64>,
-    /// Elements the page must apply to match the merged mirror: live elements
-    /// its snapshot omitted, or winners its stale copies lost to.
-    pub corrections: Vec<Element>,
-    /// Incoming IDs whose copy won the merge.
-    pub accepted: Vec<ElementId>,
 }
 
 #[cfg(test)]
@@ -460,123 +136,87 @@ impl AgentSettings {
 }
 
 /// A named, isolated drawing context: one document mirror and the pages
-/// viewing it. Everything an agent call can touch — the document, its
-/// revision and change log, element handles, view hints, the page broadcast
-/// and pending present/screenshot requests — is scoped to one of these.
+/// viewing it. This is the composition root: every public operation delegates
+/// to one collaborator or sequences several of them in the order the bridge
+/// has always used.
 pub struct Workspace {
-    pub name: String,
-    /// Identity of this in-memory document lifetime; handles never cross it.
-    pub epoch: String,
-    generation: AtomicU64,
-    pub transactions: Mutex<Vec<AgentTransaction>>,
-    pub discussion: Mutex<DiscussionRecord>,
-    /// The document mirror.
-    pub doc: Mutex<Document>,
-    /// Where the mirror is persisted; `None` keeps it in memory only.
-    pub doc_path: Option<PathBuf>,
-    /// Connected pages on this workspace.
-    pub pages: AtomicUsize,
-    /// Server-to-page messages (JSON control frames or binary document frames
-    /// over the WebSocket).
-    pub to_pages: broadcast::Sender<PageMessage>,
-    /// A persist is queued; bursts coalesce into one write.
-    persist_pending: AtomicBool,
-    persist_write: Mutex<()>,
-    pub retired: AtomicBool,
-    /// Created explicitly by an agent (or any future create RPC) rather than
-    /// lazily by a page naming the workspace. Keeps an empty workspace in the
-    /// listing even before its first page or element exists.
-    created: AtomicBool,
-    /// Wakes the persist loop.
-    persist_notify: Notify,
-    /// Page acknowledgements of a finished presentation: (id, cancelled).
-    pub present_acks: broadcast::Sender<(u64, bool)>,
-    /// Presentation ids, so each timeline can be matched to its ack.
-    pub present_counter: AtomicU64,
-    /// True while a presentation is playing on some page.
-    pub present_active: AtomicBool,
-    /// Fired when a presentation finishes or is cancelled.
-    pub present_finished: Notify,
-    /// Page replies to a screenshot request: (id, data URL or None).
-    pub screenshot_replies: broadcast::Sender<(u64, Option<String>)>,
-    /// Screenshot request ids.
-    pub screenshot_counter: AtomicU64,
-    /// Bumped on every document mutation; the agent's change cursor.
-    pub revision: AtomicU64,
-    /// Recent changes, newest last (bounded).
-    change_log: Mutex<Vec<ChangeRecord>>,
-    /// Transient view state from the most recent page report.
-    pub view_hint: Mutex<Option<ViewHint>>,
-    /// Short handles for element ids, as the agent sees them.
-    pub aliases: Mutex<Aliases>,
-    /// Monotonic order of the most recent page activity; drives
-    /// current-workspace resolution without clock ties or clock changes.
-    last_activity: AtomicU64,
+    mirror: Arc<DocumentMirror>,
+    hub: PageHub,
+    store: Arc<WorkspaceStore>,
+    discussion: DiscussionStore,
 }
 
 impl Workspace {
     fn new(name: &str, doc_path: Option<PathBuf>) -> Self {
-        let (to_pages, _) = broadcast::channel(64);
-        let (present_acks, _) = broadcast::channel(16);
-        let (screenshot_replies, _) = broadcast::channel(16);
+        let discussion = DiscussionStore::new(doc_path.as_deref());
         Self {
-            name: name.to_string(),
-            epoch: canvas_core::id::new_element_id(),
-            generation: AtomicU64::new(0),
-            transactions: Mutex::new(Vec::new()),
-            discussion: Mutex::new(DiscussionRecord::default()),
-            doc: Mutex::new(Document::new()),
-            doc_path,
-            pages: AtomicUsize::new(0),
-            to_pages,
-            persist_pending: AtomicBool::new(false),
-            persist_write: Mutex::new(()),
-            retired: AtomicBool::new(false),
-            created: AtomicBool::new(false),
-            persist_notify: Notify::new(),
-            present_acks,
-            present_counter: AtomicU64::new(0),
-            present_active: AtomicBool::new(false),
-            present_finished: Notify::new(),
-            screenshot_replies,
-            screenshot_counter: AtomicU64::new(0),
-            revision: AtomicU64::new(0),
-            change_log: Mutex::new(Vec::new()),
-            view_hint: Mutex::new(None),
-            aliases: Mutex::new(Aliases::default()),
-            last_activity: AtomicU64::new(0),
+            mirror: Arc::new(DocumentMirror::new()),
+            hub: PageHub::new(),
+            store: Arc::new(WorkspaceStore::new(name, doc_path)),
+            discussion,
         }
     }
 
-    /// A page on this workspace did something; it may now be the current one.
-    pub fn note_page_activity(&self) {
-        let activity = PAGE_ACTIVITY.fetch_add(1, Ordering::SeqCst) + 1;
-        self.last_activity.fetch_max(activity, Ordering::SeqCst);
+    // Identity and lifecycle ------------------------------------------------
+
+    pub fn name(&self) -> &str {
+        self.store.name()
     }
 
     pub fn context(&self) -> String {
-        format!("{}:{}", self.epoch, self.generation.load(Ordering::SeqCst))
+        self.store.context()
     }
 
-    /// Load the persisted mirror, if any. Called once when the workspace is
-    /// created.
+    pub fn doc_path(&self) -> Option<&std::path::Path> {
+        self.store.doc_path()
+    }
+
+    pub fn persisted(&self) -> bool {
+        self.store.persisted()
+    }
+
+    pub fn created(&self) -> bool {
+        self.store.created()
+    }
+
+    pub fn mark_created(&self) {
+        self.store.mark_created();
+    }
+
+    pub fn inherit_created(&self, created: bool) {
+        self.store.inherit_created(created);
+    }
+
+    pub fn is_retired(&self) -> bool {
+        self.store.is_retired()
+    }
+
+    /// Retire this workspace. New page admission is refused and the persist
+    /// loop wakes to exit.
+    pub fn retire(&self) {
+        self.store.retire();
+    }
+
+    /// Hold the persist write lock across a management operation.
+    pub async fn persist_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.store.lock_writes().await
+    }
+
+    /// Load the persisted mirror and discussion notes, if any. Called once
+    /// when the workspace is created.
     pub async fn load_document(&self) {
-        let Some(path) = &self.doc_path else {
+        let Some(path) = self.store.doc_path() else {
             return;
         };
-        if let Ok(json) = tokio::fs::read_to_string(path.with_extension("discussion.json")).await {
-            if let Ok(notes) = serde_json::from_str(&json) {
-                *self.discussion.lock().await = notes;
-            }
-        }
+        self.discussion.load().await;
         let Ok(bytes) = tokio::fs::read(path).await else {
             return;
         };
-        match serialization::from_bytes(&bytes) {
+        match canvas_core::serialization::from_bytes(&bytes) {
             Ok(doc) => {
                 let elements = doc.live_count();
-                *self.doc.lock().await = doc;
-                tracing::info!(elements, path = %path.display(), workspace = %self.name, "restored document");
+                self.mirror.replace_document(doc).await;
+                tracing::info!(elements, path = %path.display(), workspace = %self.name(), "restored document");
             }
             Err(error) => {
                 tracing::warn!(%error, path = %path.display(), "ignoring unreadable document");
@@ -584,125 +224,106 @@ impl Workspace {
         }
     }
 
+    /// Write the mirror to disk atomically; a no-op without a path.
+    pub async fn persist_document(&self) {
+        self.store.persist_document(&self.mirror).await;
+    }
+
+    /// Queue a persist; bursts within the debounce window coalesce.
+    pub async fn schedule_persist(&self) {
+        self.store.schedule_persist().await;
+    }
+
+    /// The debounced persist loop, spawned per workspace at creation.
+    pub async fn persist_loop(self: Arc<Self>) {
+        self.store.clone().persist_loop(self.mirror.clone()).await;
+    }
+
+    /// In-memory mirrors live only while a page is watching: without a
+    /// configured document file there is no home for the drawing between
+    /// page sessions — the page's own autosave is the source of truth.
+    pub async fn release_when_idle(&self, remaining_pages: usize) {
+        if remaining_pages == 0 && !self.store.persisted() {
+            let mut doc = self.mirror.doc().lock().await;
+            *doc = Document::new();
+            self.store.bump_generation();
+            self.mirror.clear_transactions().await;
+        }
+    }
+
+    // Document mirror -------------------------------------------------------
+
+    /// The mirror document. Callers hold this guard across a read/write that
+    /// must be atomic with the surrounding merge or transaction.
+    pub fn doc(&self) -> &Mutex<Document> {
+        self.mirror.doc()
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.mirror.revision()
+    }
+
+    #[cfg(test)]
+    pub fn set_revision(&self, revision: u64) {
+        self.mirror.set_revision(revision);
+    }
+
+    /// The element handles the agent sees.
+    pub fn aliases(&self) -> &Mutex<Aliases> {
+        self.mirror.aliases()
+    }
+
     /// The mirror as compact JSON, for tests that compare frames.
     #[cfg(test)]
     pub async fn document_json(&self) -> String {
-        let doc = self.doc.lock().await;
-        serialization::to_json(&doc).unwrap_or_default()
+        self.mirror.document_json().await
     }
 
     /// The element id behind a handle; unknown names pass through.
     pub async fn resolve_id(&self, name: &str) -> String {
-        self.aliases.lock().await.resolve(name)
+        self.mirror.resolve_id(name).await
     }
 
     /// Resolve a batch of handles.
     pub async fn resolve_ids(&self, names: &[String]) -> Vec<String> {
-        let aliases = self.aliases.lock().await;
-        names.iter().map(|name| aliases.resolve(name)).collect()
+        self.mirror.resolve_ids(names).await
     }
 
     /// The mirror as a binary snapshot wire frame. The document payload is the
     /// same binary envelope persistence uses.
     pub async fn snapshot_frame_bytes(&self) -> Result<Vec<u8>, canvas_core::wire::WireError> {
-        let revision = self.revision.load(Ordering::SeqCst);
-        let doc = self.doc.lock().await;
-        canvas_core::wire::encode_snapshot(revision, &doc)
+        self.mirror.snapshot_frame_bytes().await
     }
 
-    /// Broadcast a patch to every page but `except` as one binary frame.
-    async fn broadcast_patch(&self, revision: u64, put: &[Element], except: Option<u64>) {
-        if self.pages.load(Ordering::SeqCst) == 0 {
-            return;
-        }
-        match canvas_core::wire::encode_patch(revision, put) {
-            Ok(bytes) => {
-                let _ = self.to_pages.send(PageMessage::document(bytes, except));
-            }
-            Err(error) => {
-                tracing::warn!(%error, "could not encode binary patch; dropping broadcast");
-            }
-        }
-    }
-
-    /// Merge an already-parsed page snapshot into the mirror. The page's
-    /// `base_revision` is recorded and returned; element-level LWW still
-    /// decides the merge. Absence never deletes: only explicit tombstones in
-    /// the snapshot do. The outcome names every winner the upload lost and
-    /// every live server element it omitted, so the caller can correct the
-    /// page instead of guessing from a previous snapshot.
-    pub async fn absorb_document(
+    /// Record a document change: diff old vs new, bump the revision and
+    /// append to the bounded change log.
+    pub async fn record_change(
         &self,
-        remote: &Document,
-        base_revision: u64,
-        origin: Option<u64>,
-    ) -> PageFrameOutcome {
-        let mut doc = self.doc.lock().await;
-        let result = canvas_core::merge::reconcile_document(&doc, remote);
-        let changed = !result.changed.is_empty();
-        let (revision, winners) = if changed {
-            let (revision, winners) = self.record_change(&doc, &result.document, "page").await;
-            *doc = result.document;
-            (revision, winners)
-        } else {
-            (self.revision.load(Ordering::SeqCst), Vec::new())
-        };
-        let corrections = result.corrections;
-        let accepted = result.accepted;
-        drop(doc);
-        self.broadcast_merge(revision, &winners, &corrections, origin)
-            .await;
-        if changed {
-            self.schedule_persist().await;
-        }
-        PageFrameOutcome {
-            changed,
-            revision,
-            base_revision: Some(base_revision),
-            corrections,
-            accepted,
-        }
+        before: &Document,
+        after: &Document,
+        source: &str,
+    ) -> (u64, Vec<Element>) {
+        self.mirror.record_change(before, after, source).await
     }
 
-    /// Merge a page patch into the mirror. Changed elements broadcast to the
-    /// other pages; elements whose copy lost to a newer mirror version come
-    /// back to the origin as corrections, so a concurrent agent edit cannot
-    /// leave the page stale. Returns the same outcome shape as a snapshot.
-    async fn absorb_patch_outcome(&self, put: Vec<Element>, origin: u64) -> PageFrameOutcome {
-        let canvas_core::merge::MergeOutcome {
-            changed,
-            corrections,
-            accepted,
-        } = {
-            let mut doc = self.doc.lock().await;
-            canvas_core::merge::merge_elements(&mut doc, &put)
-        };
-        let changes: Vec<ChangedElement> = changed
-            .iter()
-            .map(|change| ChangedElement {
-                id: change.after.id.clone(),
-                kinds: classify_change(change.before.as_ref(), Some(&change.after)),
-            })
-            .collect();
-        let winners: Vec<Element> = changed.into_iter().map(|change| change.after).collect();
-        let changed = !changes.is_empty();
-        let revision = if changed {
-            self.record_ids(changes, "page").await
-        } else {
-            self.revision.load(Ordering::SeqCst)
-        };
-        self.broadcast_merge(revision, &winners, &corrections, Some(origin))
-            .await;
-        if changed {
-            self.schedule_persist().await;
-        }
-        PageFrameOutcome {
-            changed,
-            revision,
-            base_revision: None,
-            corrections,
-            accepted,
-        }
+    /// Record a committed delta journal.
+    pub async fn record_deltas(&self, deltas: &[Delta], source: &str) -> u64 {
+        self.mirror.record_deltas(deltas, source).await
+    }
+
+    /// Record an additions-only bulk commit.
+    pub async fn record_bulk(&self, changed: Vec<String>) -> u64 {
+        self.mirror.record_bulk(changed).await
+    }
+
+    /// Change records newer than `since`.
+    pub async fn changes_since(&self, since: u64) -> Vec<ChangeRecord> {
+        self.mirror.changes_since(since).await
+    }
+
+    /// Cursor coverage, checked while the caller holds the document lock.
+    pub async fn cursor_valid(&self, since: u64) -> bool {
+        self.mirror.cursor_valid(since).await
     }
 
     /// Apply one decoded binary page frame. This is the WebSocket-free seam:
@@ -727,285 +348,223 @@ impl Workspace {
         outcome
     }
 
-    /// Broadcast merge winners and/or corrections. The origin is skipped when
-    /// it already holds every winner; corrections always reach it.
-    async fn broadcast_merge(
+    /// Merge an already-parsed page snapshot into the mirror. The page's
+    /// `base_revision` is recorded and returned; element-level LWW still
+    /// decides the merge. Absence never deletes: only explicit tombstones in
+    /// the snapshot do. The outcome names every winner the upload lost and
+    /// every live server element it omitted, so the caller can correct the
+    /// page instead of guessing from a previous snapshot.
+    pub async fn absorb_document(
         &self,
-        revision: u64,
-        winners: &[Element],
-        corrections: &[Element],
+        remote: &Document,
+        base_revision: u64,
         origin: Option<u64>,
-    ) {
-        if winners.is_empty() && corrections.is_empty() {
-            return;
-        }
-        if winners.is_empty() {
-            self.broadcast_patch(revision, corrections, None).await;
-        } else if corrections.is_empty() {
-            self.broadcast_patch(revision, winners, origin).await;
+    ) -> PageFrameOutcome {
+        let mut doc = self.mirror.doc().lock().await;
+        let result = canvas_core::merge::reconcile_document(&doc, remote);
+        let changed = !result.changed.is_empty();
+        let (revision, winners) = if changed {
+            let (revision, winners) = self.record_change(&doc, &result.document, "page").await;
+            *doc = result.document;
+            (revision, winners)
         } else {
-            let mut all = winners.to_vec();
-            for correction in corrections {
-                if !all.iter().any(|element| element.id == correction.id) {
-                    all.push(correction.clone());
-                }
-            }
-            self.broadcast_patch(revision, &all, None).await;
+            (self.mirror.revision(), Vec::new())
+        };
+        let corrections = result.corrections;
+        let accepted = result.accepted;
+        drop(doc);
+        self.hub
+            .broadcast_merge(revision, &winners, &corrections, origin)
+            .await;
+        if changed {
+            self.schedule_persist().await;
+        }
+        PageFrameOutcome {
+            changed,
+            revision,
+            base_revision: Some(base_revision),
+            corrections,
+            accepted,
+        }
+    }
+
+    /// Merge a page patch into the mirror. Changed elements broadcast to the
+    /// other pages; elements whose copy lost to a newer mirror version come
+    /// back to the origin as corrections, so a concurrent agent edit cannot
+    /// leave the page stale. Returns the same outcome shape as a snapshot.
+    async fn absorb_patch_outcome(&self, put: Vec<Element>, origin: u64) -> PageFrameOutcome {
+        let canvas_core::merge::MergeOutcome {
+            changed,
+            corrections,
+            accepted,
+        } = {
+            let mut doc = self.mirror.doc().lock().await;
+            canvas_core::merge::merge_elements(&mut doc, &put)
+        };
+        let changes: Vec<ChangedElement> = changed
+            .iter()
+            .map(|change| ChangedElement {
+                id: change.after.id.clone(),
+                kinds: crate::document::classify_change(
+                    change.before.as_ref(),
+                    Some(&change.after),
+                ),
+            })
+            .collect();
+        let winners: Vec<Element> = changed.into_iter().map(|change| change.after).collect();
+        let changed = !changes.is_empty();
+        let revision = if changed {
+            self.mirror.record_ids(changes, "page").await
+        } else {
+            self.mirror.revision()
+        };
+        self.hub
+            .broadcast_merge(revision, &winners, &corrections, Some(origin))
+            .await;
+        if changed {
+            self.schedule_persist().await;
+        }
+        PageFrameOutcome {
+            changed,
+            revision,
+            base_revision: None,
+            corrections,
+            accepted,
         }
     }
 
     /// Broadcast an agent-side edit as a patch and queue the persist.
     pub async fn publish_patch(&self, revision: u64, put: Vec<Element>) {
-        self.broadcast_patch(revision, &put, None).await;
+        self.hub.broadcast_patch(revision, &put, None).await;
         self.schedule_persist().await;
     }
 
-    /// Record a document change: diff old vs new, bump the revision and
-    /// append to the bounded change log. Returns the new revision and the
-    /// elements as they now stand (tombstones included), ready to broadcast.
-    pub async fn record_change(
-        &self,
-        before: &Document,
-        after: &Document,
-        source: &str,
-    ) -> (u64, Vec<Element>) {
-        let mut changed: Vec<ChangedElement> = Vec::new();
-        for (id, after_element) in &after.elements {
-            match before.elements.get(id) {
-                Some(before_element) if before_element == after_element => {}
-                before_element => changed.push(ChangedElement {
-                    id: id.clone(),
-                    kinds: classify_change(before_element, Some(after_element)),
-                }),
-            }
-        }
-        for (id, before_element) in &before.elements {
-            if !after.elements.contains_key(id) {
-                changed.push(ChangedElement {
-                    id: id.clone(),
-                    kinds: classify_change(Some(before_element), None),
-                });
-            }
-        }
-        let put: Vec<Element> = changed
-            .iter()
-            .filter_map(|change| after.element(&change.id).cloned())
-            .collect();
-        if changed.is_empty() {
-            return (self.revision.load(Ordering::SeqCst), put);
-        }
-        let revision = self.record_ids(changed, source).await;
-        (revision, put)
+    /// Append a committed agent transaction to the revert history.
+    pub async fn push_transaction(&self, transaction: AgentTransaction) {
+        self.mirror.push_transaction(transaction).await;
     }
 
-    /// Record a committed delta journal: bump the revision and change log
-    /// from the elements the commands actually touched. The classification is
-    /// derived from the deltas' before/after copies, so delta-native commits
-    /// keep the same rich `canvas_read(since)` report as page snapshots.
-    pub async fn record_deltas(&self, deltas: &[Delta], source: &str) -> u64 {
-        let mut changed: Vec<ChangedElement> = Vec::new();
-        for delta in deltas {
-            let (id, kinds) = match delta {
-                Delta::Add { element } => {
-                    (element.id.clone(), classify_change(None, Some(element)))
-                }
-                Delta::Purge { element } => {
-                    (element.id.clone(), classify_change(Some(element), None))
-                }
-                Delta::Remove { before, tombstone } => {
-                    let after = tombstone.materialize(before);
-                    (
-                        before.id.clone(),
-                        classify_change(Some(before), Some(&after)),
-                    )
-                }
-                Delta::Update { before, after } => {
-                    (after.id.clone(), classify_change(Some(before), Some(after)))
-                }
-            };
-            if let Some(existing) = changed.iter_mut().find(|entry| entry.id == id) {
-                for kind in kinds {
-                    if !existing.kinds.contains(&kind) {
-                        existing.kinds.push(kind);
-                    }
-                }
-            } else {
-                changed.push(ChangedElement { id, kinds });
-            }
+    /// The most recent committed agent transactions, newest first.
+    pub async fn recent_transactions(&self, limit: usize) -> Vec<AgentTransaction> {
+        self.mirror.recent_transactions(limit).await
+    }
+
+    /// A committed agent transaction by receipt id.
+    pub async fn transaction(&self, id: &str) -> Option<AgentTransaction> {
+        self.mirror.transaction(id).await
+    }
+
+    // Pages and page-directed state ----------------------------------------
+
+    /// A page on this workspace did something; it may now be the current one.
+    pub fn note_page_activity(&self) {
+        self.hub.note_activity();
+    }
+
+    pub fn page_count(&self) -> usize {
+        self.hub.count()
+    }
+
+    /// Monotonic activity stamp used by current-workspace resolution.
+    pub fn activity(&self) -> u64 {
+        self.hub.activity()
+    }
+
+    #[cfg(test)]
+    pub fn set_page_count(&self, pages: usize) {
+        self.hub.set_count(pages);
+    }
+
+    #[cfg(test)]
+    pub fn set_activity(&self, activity: u64) {
+        self.hub.set_activity(activity);
+    }
+
+    /// Admit one page unless the workspace has been retired. Counts and
+    /// activity are recorded under the same rules as before.
+    pub async fn register_page(&self) -> bool {
+        if self.store.is_retired() {
+            return false;
         }
-        self.record_ids(changed, source).await
+        self.hub.connect();
+        self.hub.note_activity();
+        true
     }
 
-    /// Record an additions-only bulk commit: bump the revision and change log
-    /// without per-element receipt work. Bulk boards skip the revert history
-    /// (which would retain every element); wrap them in a frame to remove
-    /// them later with one clear.
-    pub async fn record_bulk(&self, changed: Vec<String>) -> u64 {
-        let changed = changed
-            .into_iter()
-            .map(|id| ChangedElement {
-                id,
-                kinds: vec![ChangeKind::Added],
-            })
-            .collect();
-        self.record_ids(changed, "agent").await
+    pub fn release_page(&self) {
+        self.hub.disconnect();
     }
 
-    /// Record a change by the elements it touched and the kinds detected.
-    async fn record_ids(&self, changed: Vec<ChangedElement>, source: &str) -> u64 {
-        let revision = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
-        let mut log = self.change_log.lock().await;
-        log.push(ChangeRecord {
-            revision,
-            source: source.to_string(),
-            changed,
-        });
-        let overflow = log.len().saturating_sub(CHANGE_LOG_LIMIT);
-        if overflow > 0 {
-            log.drain(0..overflow);
-        }
-        revision
+    pub fn subscribe(&self) -> broadcast::Receiver<PageMessage> {
+        self.hub.subscribe()
     }
 
-    /// Change records newer than `since`.
-    pub async fn changes_since(&self, since: u64) -> Vec<ChangeRecord> {
-        self.change_log
-            .lock()
-            .await
-            .iter()
-            .filter(|record| record.revision > since)
-            .cloned()
-            .collect()
+    pub fn broadcast(&self, message: PageMessage) {
+        self.hub.broadcast(message);
     }
 
-    /// Cursor coverage, checked while the caller holds the document lock.
-    pub async fn cursor_valid(&self, since: u64) -> bool {
-        let revision = self.revision.load(Ordering::SeqCst);
-        let log = self.change_log.lock().await;
-        since <= revision
-            && log.first().map_or(since == revision, |first| {
-                since >= first.revision.saturating_sub(1)
-            })
+    pub async fn view_hint(&self) -> Option<ViewHint> {
+        self.hub.view_hint().await
+    }
+
+    pub async fn set_view_hint(&self, hint: ViewHint) {
+        self.hub.set_view_hint(hint).await;
+    }
+
+    /// Wait out an in-flight presentation so captures show the settled view.
+    pub async fn wait_for_presentation(&self, max: Duration) {
+        self.hub.wait_for_presentation(max).await;
+    }
+
+    pub fn presentation_started(&self) {
+        self.hub.presentation_started();
+    }
+
+    pub fn presentation_finished(&self) {
+        self.hub.presentation_finished();
+    }
+
+    pub fn next_presentation_id(&self) -> u64 {
+        self.hub.next_presentation_id()
+    }
+
+    pub fn subscribe_present_acks(&self) -> broadcast::Receiver<(u64, bool)> {
+        self.hub.subscribe_present_acks()
+    }
+
+    pub fn acknowledge_presentation(&self, id: u64, cancelled: bool) {
+        self.hub.acknowledge_presentation(id, cancelled);
+    }
+
+    pub fn next_screenshot_id(&self) -> u64 {
+        self.hub.next_screenshot_id()
+    }
+
+    pub fn subscribe_screenshot_replies(&self) -> broadcast::Receiver<(u64, Option<String>)> {
+        self.hub.subscribe_screenshot_replies()
+    }
+
+    pub fn reply_screenshot(&self, id: u64, data_url: Option<String>) {
+        self.hub.reply_screenshot(id, data_url);
+    }
+
+    // Discussion ------------------------------------------------------------
+
+    pub async fn discussion(&self) -> DiscussionRecord {
+        self.discussion.record().await
+    }
+
+    pub fn discussion_persisted(&self) -> bool {
+        self.discussion.persisted()
     }
 
     /// Replace context only against the version the caller actually read.
-    /// Persist before updating memory so a failed write never reports success.
     pub async fn remember(
         &self,
         notes: Discussion,
         expected: u64,
     ) -> Result<DiscussionRecord, String> {
-        if notes
-            .constraints
-            .iter()
-            .chain(&notes.decisions)
-            .chain(&notes.questions)
-            .count()
-            > 100
-            || notes
-                .constraints
-                .iter()
-                .chain(&notes.decisions)
-                .chain(&notes.questions)
-                .any(|s| s.len() > 2000)
-        {
-            return Err("discussion supports up to 100 entries of at most 2000 bytes each".into());
-        }
-        let mut current = self.discussion.lock().await;
-        if current.revision != expected {
-            return Err(
-                "discussion changed; read canvas_status and merge the latest notes before retrying"
-                    .into(),
-            );
-        }
-        let updated = DiscussionRecord {
-            revision: expected + 1,
-            notes,
-        };
-        if let Some(path) = &self.doc_path {
-            let json = serde_json::to_string_pretty(&updated).map_err(|e| e.to_string())?;
-            write_atomic(&path.with_extension("discussion.json"), json.as_bytes())
-                .await
-                .map_err(|e| e.to_string())?;
-        }
-        *current = updated.clone();
-        Ok(updated)
-    }
-
-    /// Queue a persist; bursts within `PERSIST_DEBOUNCE` coalesce into one
-    /// write. The loop is spawned when the workspace is created.
-    pub async fn schedule_persist(&self) {
-        self.persist_pending.store(true, Ordering::SeqCst);
-        self.persist_notify.notify_one();
-    }
-
-    /// The debounced persist loop, spawned per workspace at creation.
-    pub async fn persist_loop(self: Arc<Self>) {
-        loop {
-            self.persist_notify.notified().await;
-            if self.retired.load(Ordering::SeqCst) {
-                break;
-            }
-            tokio::time::sleep(PERSIST_DEBOUNCE).await;
-            if self.persist_pending.swap(false, Ordering::SeqCst) {
-                self.persist_document().await;
-            }
-        }
-    }
-
-    /// In-memory mirrors live only while a page is watching: without a
-    /// configured document file there is no home for the drawing between
-    /// page sessions — the page's own autosave is the source of truth.
-    pub async fn release_when_idle(&self, remaining_pages: usize) {
-        if remaining_pages == 0 && self.doc_path.is_none() {
-            let mut doc = self.doc.lock().await;
-            *doc = Document::new();
-            self.generation.fetch_add(1, Ordering::SeqCst);
-            self.transactions.lock().await.clear();
-        }
-    }
-
-    /// Wait out an in-flight presentation so captures show the settled view.
-    pub async fn wait_for_presentation(&self, max: Duration) {
-        if !self.present_active.load(Ordering::SeqCst) {
-            return;
-        }
-        let _ = tokio::time::timeout(max, self.present_finished.notified()).await;
-    }
-
-    /// Mark playback started (screenshots will wait for it).
-    pub fn presentation_started(&self) {
-        self.present_active.store(true, Ordering::SeqCst);
-    }
-
-    /// Mark playback over and wake any waiting screenshot.
-    pub fn presentation_finished(&self) {
-        self.present_active.store(false, Ordering::SeqCst);
-        self.present_finished.notify_one();
-    }
-
-    /// Write the mirror to disk atomically; a no-op without a path.
-    pub async fn persist_document(&self) {
-        let _write = self.persist_write.lock().await;
-        if self.retired.load(Ordering::SeqCst) {
-            return;
-        }
-        let Some(path) = &self.doc_path else {
-            return;
-        };
-        let bytes = {
-            let doc = self.doc.lock().await;
-            match serialization::to_bytes(&doc) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    tracing::warn!(%error, path = %path.display(), "could not serialize document");
-                    return;
-                }
-            }
-        };
-        if let Err(error) = write_atomic(path, &bytes).await {
-            tracing::warn!(%error, path = %path.display(), "could not persist document");
-        }
+        self.discussion.remember(notes, expected).await
     }
 }
 
@@ -1140,7 +699,7 @@ impl AppState {
             ));
         }
         let candidate = self.build_workspace(name);
-        if let Some(path) = &candidate.doc_path {
+        if let Some(path) = candidate.doc_path() {
             if tokio::fs::try_exists(path).await.map_err(Io)? {
                 return Err(Conflict(
                     "That workspace already exists. Choose another name.".into(),
@@ -1148,7 +707,7 @@ impl AppState {
             }
         }
         let workspace = self.workspace_unlocked(name).await;
-        workspace.created.store(true, Ordering::SeqCst);
+        workspace.mark_created();
         workspace.persist_document().await;
         Ok(workspace)
     }
@@ -1157,12 +716,7 @@ impl AppState {
     /// cannot join a document while it is being renamed or deleted.
     pub async fn register_page(&self, workspace: &Workspace) -> bool {
         let _management = self.workspace_management.lock().await;
-        if workspace.retired.load(Ordering::SeqCst) {
-            return false;
-        }
-        workspace.pages.fetch_add(1, Ordering::SeqCst);
-        workspace.note_page_activity();
-        true
+        workspace.register_page().await
     }
 
     pub async fn manage_workspace(
@@ -1192,7 +746,7 @@ impl AppState {
         if let Some(new_name) = renamed {
             let destination = self.build_workspace(new_name);
             if self.workspaces.lock().unwrap().contains_key(new_name)
-                || match &destination.doc_path {
+                || match destination.doc_path() {
                     Some(path) => tokio::fs::try_exists(path).await.map_err(Io)?,
                     None => false,
                 }
@@ -1203,7 +757,10 @@ impl AppState {
             }
         }
         let stored = self.workspaces.lock().unwrap().contains_key(name);
-        let path = self.build_workspace(name).doc_path;
+        let path = self
+            .build_workspace(name)
+            .doc_path()
+            .map(std::path::Path::to_path_buf);
         if !stored
             && !match &path {
                 Some(path) => tokio::fs::try_exists(path).await.map_err(Io)?,
@@ -1213,59 +770,59 @@ impl AppState {
             return Err(NotFound);
         }
         let source = self.workspace_unlocked(name).await;
-        if source.pages.load(Ordering::SeqCst) > 1 {
+        if source.page_count() > 1 {
             return Err(Conflict(
                 "This workspace is open in another tab. Close or switch those tabs first.".into(),
             ));
         }
-        let _write = source.persist_write.lock().await;
-        let mut doc = source.doc.lock().await;
+        let _write = source.persist_guard().await;
+        let mut doc = source.doc().lock().await;
         // The page uploads its document over the binary wire after navigating.
         // The management route moves the mirror as it stands.
         let merged = doc.clone();
         if let Some(new_name) = renamed {
             let destination = Arc::new(self.build_workspace(new_name));
-            destination
-                .created
-                .store(source.created.load(Ordering::SeqCst), Ordering::SeqCst);
-            if let Some(path) = &destination.doc_path {
-                let bytes =
-                    serialization::to_bytes(&merged).map_err(|error| Invalid(error.to_string()))?;
+            destination.inherit_created(source.created());
+            if let Some(path) = destination.doc_path() {
+                let bytes = canvas_core::serialization::to_bytes(&merged)
+                    .map_err(|error| Invalid(error.to_string()))?;
                 write_atomic(path, &bytes).await.map_err(Io)?;
             }
             // Remove the old file only once the new document is durable.
-            if let Some(path) = &source.doc_path {
+            if let Some(path) = source.doc_path() {
                 match tokio::fs::remove_file(path).await {
                     Ok(()) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(error) => {
-                        if let Some(path) = &destination.doc_path {
+                        if let Some(path) = destination.doc_path() {
                             let _ = tokio::fs::remove_file(path).await;
                         }
                         return Err(Io(error));
                     }
                 }
             }
-            *destination.doc.lock().await = merged;
+            *destination.doc().lock().await = merged;
             self.workspaces
                 .lock()
                 .unwrap()
                 .insert(new_name.into(), destination.clone());
             tokio::spawn(destination.persist_loop());
-        } else if let Some(path) = &source.doc_path {
+        } else if let Some(path) = source.doc_path() {
             match tokio::fs::remove_file(path).await {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(Io(error)),
             }
         }
-        source.retired.store(true, Ordering::SeqCst);
+        source.retire();
         *doc = Document::new();
-        source.persist_notify.notify_one();
-        let _ = source.to_pages.send(PageMessage::control(serde_json::json!({
-            "type": "workspace_changed", "action": if renamed.is_some() { "rename" } else { "delete" },
-            "workspace": renamed.unwrap_or(DEFAULT_WORKSPACE),
-        }).to_string()));
+        source.broadcast(PageMessage::control(
+            serde_json::json!({
+                "type": "workspace_changed", "action": if renamed.is_some() { "rename" } else { "delete" },
+                "workspace": renamed.unwrap_or(DEFAULT_WORKSPACE),
+            })
+            .to_string(),
+        ));
         self.workspaces.lock().unwrap().remove(name);
         Ok(())
     }
@@ -1276,8 +833,8 @@ impl AppState {
         let current = {
             let map = self.workspaces.lock().unwrap();
             map.values()
-                .filter(|ws| ws.pages.load(Ordering::SeqCst) > 0)
-                .max_by_key(|ws| ws.last_activity.load(Ordering::SeqCst))
+                .filter(|ws| ws.page_count() > 0)
+                .max_by_key(|ws| ws.activity())
                 .cloned()
         };
         match current {
@@ -1294,21 +851,21 @@ impl AppState {
             self.workspaces.lock().unwrap().values().cloned().collect();
         let mut infos = Vec::new();
         for ws in workspaces {
-            let elements = ws.doc.lock().await.live_count();
-            let pages = ws.pages.load(Ordering::SeqCst);
-            if ws.name != DEFAULT_WORKSPACE
-                && !ws.created.load(Ordering::SeqCst)
-                && ws.doc_path.is_none()
+            let elements = ws.doc().lock().await.live_count();
+            let pages = ws.page_count();
+            if ws.name() != DEFAULT_WORKSPACE
+                && !ws.created()
+                && ws.doc_path().is_none()
                 && pages == 0
                 && elements == 0
             {
                 continue;
             }
             infos.push(WorkspaceInfo {
-                name: ws.name.clone(),
+                name: ws.name().to_string(),
                 pages,
                 elements: Some(elements),
-                persisted: ws.doc_path.is_some(),
+                persisted: ws.persisted(),
             });
         }
         let mut known: HashSet<String> = infos.iter().map(|info| info.name.clone()).collect();
@@ -1343,7 +900,7 @@ impl AppState {
             .lock()
             .unwrap()
             .values()
-            .map(|ws| ws.pages.load(Ordering::SeqCst))
+            .map(|ws| ws.page_count())
             .sum()
     }
 
@@ -1352,9 +909,7 @@ impl AppState {
     pub async fn release_workspace(&self, workspace: &Workspace) {
         // Admission must not race a queued cleanup using an old zero-page count.
         let _management = self.workspace_management.lock().await;
-        workspace
-            .release_when_idle(workspace.pages.load(Ordering::SeqCst))
-            .await;
+        workspace.release_when_idle(workspace.page_count()).await;
         if self.total_pages() == 0 && self.settings_path.is_none() {
             *self.settings.lock().await = AgentSettings::default();
         }
@@ -1403,7 +958,7 @@ impl AppState {
         let workspaces: Vec<Arc<Workspace>> =
             self.workspaces.lock().unwrap().values().cloned().collect();
         for ws in workspaces {
-            let _ = ws.to_pages.send(PageMessage::control(frame.clone()));
+            ws.broadcast(PageMessage::control(frame.clone()));
         }
         Ok(settings)
     }
@@ -1423,18 +978,11 @@ impl AppState {
     }
 }
 
-async fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    let temp = path.with_extension("tmp");
-    tokio::fs::write(&temp, contents).await?;
-    tokio::fs::rename(&temp, path).await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use canvas_core::model::{ElementKind, Style};
+    use canvas_core::serialization;
 
     fn shape_at(x: f64) -> canvas_core::model::ElementKind {
         canvas_core::model::ElementKind::Shape {
@@ -1555,7 +1103,7 @@ mod tests {
         let path = dir.join("document.rsc");
         let state = AppState::new(PathBuf::from("."), Some(path.clone()), true);
         let ws = state.workspace(DEFAULT_WORKSPACE).await;
-        add_shape(&mut *ws.doc.lock().await, 10.0, 1);
+        add_shape(&mut *ws.doc().lock().await, 10.0, 1);
         ws.persist_document().await;
 
         let bytes = tokio::fs::read(&path).await.unwrap();
@@ -1566,7 +1114,7 @@ mod tests {
 
         let restored = AppState::new(PathBuf::from("."), Some(path), true);
         let restored_ws = restored.workspace(DEFAULT_WORKSPACE).await;
-        assert_eq!(restored_ws.doc.lock().await.live_count(), 1);
+        assert_eq!(restored_ws.doc().lock().await.live_count(), 1);
         let _ = tokio::fs::remove_dir_all(dir).await;
     }
 
@@ -1588,7 +1136,7 @@ mod tests {
         let state = AppState::new(PathBuf::from("."), Some(path), true);
         let ws = state.workspace(DEFAULT_WORKSPACE).await;
         assert_eq!(
-            ws.doc.lock().await.live_count(),
+            ws.doc().lock().await.live_count(),
             0,
             "a mirror must be a binary document"
         );
@@ -1610,7 +1158,7 @@ mod tests {
 
         let state = AppState::new(PathBuf::from("."), Some(path), true);
         let ws = state.workspace(DEFAULT_WORKSPACE).await;
-        assert_eq!(ws.doc.lock().await.live_count(), 0);
+        assert_eq!(ws.doc().lock().await.live_count(), 0);
         let _ = tokio::fs::remove_dir_all(dir).await;
     }
 
@@ -1623,7 +1171,7 @@ mod tests {
 
         let state = AppState::new(PathBuf::from("."), Some(path), true);
         let ws = state.workspace(DEFAULT_WORKSPACE).await;
-        assert_eq!(ws.doc.lock().await.live_count(), 0);
+        assert_eq!(ws.doc().lock().await.live_count(), 0);
         let _ = tokio::fs::remove_dir_all(dir).await;
     }
 
@@ -1633,15 +1181,15 @@ mod tests {
         let state = AppState::new(PathBuf::from("."), Some(dir.join("current.rsc")), true);
         let alpha = state.workspace("alpha").await;
         assert_eq!(
-            alpha.doc_path.as_deref(),
+            alpha.doc_path(),
             Some(dir.join("workspaces/alpha.rsc").as_path())
         );
-        add_shape(&mut *alpha.doc.lock().await, 5.0, 1);
+        add_shape(&mut *alpha.doc().lock().await, 5.0, 1);
         alpha.persist_document().await;
 
         let reopened = AppState::new(PathBuf::from("."), Some(dir.join("current.rsc")), true);
         let alpha = reopened.workspace("alpha").await;
-        assert_eq!(alpha.doc.lock().await.live_count(), 1);
+        assert_eq!(alpha.doc().lock().await.live_count(), 1);
         let _ = tokio::fs::remove_dir_all(dir).await;
     }
 
@@ -1663,8 +1211,8 @@ mod tests {
         ));
 
         let created = state.create_workspace("fresh").await.unwrap();
-        assert_eq!(created.doc.lock().await.live_count(), 0);
-        assert!(created.created.load(Ordering::SeqCst));
+        assert_eq!(created.doc().lock().await.live_count(), 0);
+        assert!(created.created());
         assert!(
             dir.join("workspaces/fresh.rsc").exists(),
             "an explicitly created workspace is durable before its first edit"
@@ -1689,7 +1237,7 @@ mod tests {
     async fn created_workspaces_are_listed_without_a_backing_file() {
         let state = AppState::new(PathBuf::from("."), None, true);
         let created = state.create_workspace("fresh").await.unwrap();
-        assert_eq!(created.doc_path, None);
+        assert!(created.doc_path().is_none());
         let names: Vec<String> = state
             .list_workspaces()
             .await
@@ -1707,7 +1255,7 @@ mod tests {
         let state = AppState::new(PathBuf::from("."), None, true);
         let alpha = state.workspace("alpha").await;
         let beta = state.workspace("beta").await;
-        let mut beta_pages = beta.to_pages.subscribe();
+        let mut beta_pages = beta.subscribe();
 
         let element = Element::new(shape_at(0.0), "a0".into(), 1).with_id("one");
         assert!(
@@ -1717,10 +1265,10 @@ mod tests {
                 .changed
         );
 
-        assert_eq!(alpha.doc.lock().await.live_count(), 1);
-        assert_eq!(beta.doc.lock().await.live_count(), 0);
-        assert_eq!(alpha.revision.load(Ordering::SeqCst), 1);
-        assert_eq!(beta.revision.load(Ordering::SeqCst), 0);
+        assert_eq!(alpha.doc().lock().await.live_count(), 1);
+        assert_eq!(beta.doc().lock().await.live_count(), 0);
+        assert_eq!(alpha.revision(), 1);
+        assert_eq!(beta.revision(), 0);
         assert!(
             beta_pages.try_recv().is_err(),
             "alpha's patch must not leak into beta"
@@ -1736,10 +1284,10 @@ mod tests {
         ));
         let state = AppState::new(PathBuf::from("."), Some(dir.join("current.rsc")), true);
         let old = state.workspace("alpha").await;
-        add_shape(&mut *old.doc.lock().await, 42.0, 1);
+        add_shape(&mut *old.doc().lock().await, 42.0, 1);
         old.persist_document().await;
-        let before = old.doc.lock().await.clone();
-        let mut messages = old.to_pages.subscribe();
+        let before = old.doc().lock().await.clone();
+        let mut messages = old.subscribe();
         assert!(state.register_page(&old).await);
         state.manage_workspace("alpha", Some("beta")).await.unwrap();
         assert!(
@@ -1762,7 +1310,10 @@ mod tests {
             "workspace rename writes the same binary format"
         );
         let restarted = AppState::new(PathBuf::from("."), Some(dir.join("current.rsc")), true);
-        assert_eq!(*restarted.workspace("beta").await.doc.lock().await, before);
+        assert_eq!(
+            *restarted.workspace("beta").await.doc().lock().await,
+            before
+        );
         assert!(!restarted
             .list_workspaces()
             .await
@@ -1776,24 +1327,24 @@ mod tests {
         let state = AppState::new(PathBuf::from("."), None, true);
         let alpha = state.workspace("alpha").await;
         let beta = state.workspace("beta").await;
-        add_shape(&mut *alpha.doc.lock().await, 1.0, 1);
-        add_shape(&mut *beta.doc.lock().await, 2.0, 1);
-        let before_alpha = alpha.doc.lock().await.clone();
-        let before_beta = beta.doc.lock().await.clone();
+        add_shape(&mut *alpha.doc().lock().await, 1.0, 1);
+        add_shape(&mut *beta.doc().lock().await, 2.0, 1);
+        let before_alpha = alpha.doc().lock().await.clone();
+        let before_beta = beta.doc().lock().await.clone();
         assert!(matches!(
             state.manage_workspace("alpha", Some("beta")).await,
             Err(WorkspaceManagementError::Conflict(_))
         ));
-        alpha.pages.store(2, Ordering::SeqCst);
+        alpha.set_page_count(2);
         for renamed in [None, Some("gamma")] {
             assert!(matches!(
                 state.manage_workspace("alpha", renamed).await,
                 Err(WorkspaceManagementError::Conflict(_))
             ));
         }
-        assert_eq!(*alpha.doc.lock().await, before_alpha);
-        assert_eq!(*beta.doc.lock().await, before_beta);
-        assert!(!alpha.retired.load(Ordering::SeqCst));
+        assert_eq!(*alpha.doc().lock().await, before_alpha);
+        assert_eq!(*beta.doc().lock().await, before_beta);
+        assert!(!alpha.is_retired());
         assert!(matches!(
             state.manage_workspace("default", None).await,
             Err(WorkspaceManagementError::Invalid(_))
@@ -1813,7 +1364,7 @@ mod tests {
         ));
         let initial = AppState::new(PathBuf::from("."), Some(dir.join("current.rsc")), true);
         let old = initial.workspace("alpha").await;
-        add_shape(&mut *old.doc.lock().await, 4.0, 1);
+        add_shape(&mut *old.doc().lock().await, 4.0, 1);
         old.persist_document().await;
         let state = AppState::new(PathBuf::from("."), Some(dir.join("current.rsc")), true);
         assert!(state
@@ -1840,19 +1391,19 @@ mod tests {
         let state = AppState::new(PathBuf::from("."), None, true);
         let alpha = state.workspace("alpha").await;
         let beta = state.workspace("beta").await;
-        alpha.pages.store(1, Ordering::SeqCst);
-        beta.pages.store(1, Ordering::SeqCst);
+        alpha.set_page_count(1);
+        beta.set_page_count(1);
         for _ in 0..100 {
             alpha.note_page_activity();
-            let first = alpha.last_activity.load(Ordering::SeqCst);
+            let first = alpha.activity();
             beta.note_page_activity();
             assert!(
-                beta.last_activity.load(Ordering::SeqCst) > first,
+                beta.activity() > first,
                 "rapid activity must not tie at millisecond precision"
             );
-            assert_eq!(state.current_workspace().await.name, "beta");
+            assert_eq!(state.current_workspace().await.name(), "beta");
             alpha.note_page_activity();
-            assert_eq!(state.current_workspace().await.name, "alpha");
+            assert_eq!(state.current_workspace().await.name(), "alpha");
         }
     }
 
@@ -1861,21 +1412,21 @@ mod tests {
         let state = AppState::new(PathBuf::from("."), None, true);
         // No pages anywhere: the default workspace, even though it has none.
         let current = state.current_workspace().await;
-        assert_eq!(current.name, DEFAULT_WORKSPACE);
+        assert_eq!(current.name(), DEFAULT_WORKSPACE);
 
         let alpha = state.workspace("alpha").await;
-        alpha.pages.store(1, Ordering::SeqCst);
-        alpha.last_activity.store(100, Ordering::SeqCst);
-        assert_eq!(state.current_workspace().await.name, "alpha");
+        alpha.set_page_count(1);
+        alpha.set_activity(100);
+        assert_eq!(state.current_workspace().await.name(), "alpha");
 
         let beta = state.workspace("beta").await;
-        beta.pages.store(1, Ordering::SeqCst);
-        beta.last_activity.store(200, Ordering::SeqCst);
-        assert_eq!(state.current_workspace().await.name, "beta");
+        beta.set_page_count(1);
+        beta.set_activity(200);
+        assert_eq!(state.current_workspace().await.name(), "beta");
 
         // A workspace nobody is watching is never current.
-        beta.pages.store(0, Ordering::SeqCst);
-        assert_eq!(state.current_workspace().await.name, "alpha");
+        beta.set_page_count(0);
+        assert_eq!(state.current_workspace().await.name(), "alpha");
     }
 
     #[tokio::test]
@@ -1892,7 +1443,7 @@ mod tests {
         assert_eq!(names, vec![DEFAULT_WORKSPACE]);
 
         let alpha = state.workspace("alpha").await;
-        alpha.pages.store(1, Ordering::SeqCst);
+        alpha.set_page_count(1);
         let names: Vec<String> = state
             .list_workspaces()
             .await
@@ -1906,7 +1457,7 @@ mod tests {
     async fn a_new_page_cannot_join_halfway_through_idle_cleanup() {
         let state = Arc::new(AppState::new(PathBuf::from("."), None, true));
         let workspace = state.workspace(DEFAULT_WORKSPACE).await;
-        let mut doc = workspace.doc.lock().await;
+        let mut doc = workspace.doc().lock().await;
         add_shape(&mut doc, 1.0, 1);
         let releasing = state.clone();
         let old = workspace.clone();
@@ -1922,7 +1473,7 @@ mod tests {
         );
         drop(doc);
         cleanup.await.unwrap();
-        assert_eq!(workspace.doc.lock().await.live_count(), 0);
+        assert_eq!(workspace.doc().lock().await.live_count(), 0);
         assert!(state.register_page(&workspace).await);
     }
 
@@ -1930,12 +1481,12 @@ mod tests {
     async fn in_memory_mirrors_clear_when_the_last_page_leaves() {
         let state = AppState::new(PathBuf::from("."), None, true);
         let ws = state.workspace(DEFAULT_WORKSPACE).await;
-        add_shape(&mut *ws.doc.lock().await, 0.0, 1);
+        add_shape(&mut *ws.doc().lock().await, 0.0, 1);
 
         ws.release_when_idle(1).await;
-        assert_eq!(ws.doc.lock().await.live_count(), 1, "a page is watching");
+        assert_eq!(ws.doc().lock().await.live_count(), 1, "a page is watching");
         ws.release_when_idle(0).await;
-        assert_eq!(ws.doc.lock().await.live_count(), 0, "no page, no mirror");
+        assert_eq!(ws.doc().lock().await.live_count(), 0, "no page, no mirror");
     }
 
     #[tokio::test]
@@ -1943,9 +1494,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rs-canvas-idle-{}", std::process::id()));
         let state = AppState::new(PathBuf::from("."), Some(dir.join("document.rsc")), true);
         let ws = state.workspace(DEFAULT_WORKSPACE).await;
-        add_shape(&mut *ws.doc.lock().await, 0.0, 1);
+        add_shape(&mut *ws.doc().lock().await, 0.0, 1);
         ws.release_when_idle(0).await;
-        assert_eq!(ws.doc.lock().await.live_count(), 1);
+        assert_eq!(ws.doc().lock().await.live_count(), 1);
         let _ = tokio::fs::remove_dir_all(dir).await;
     }
 
@@ -1953,8 +1504,8 @@ mod tests {
     async fn patches_merge_and_broadcast_to_everyone_but_the_origin() {
         let state = AppState::new(PathBuf::from("."), None, true);
         let ws = state.workspace(DEFAULT_WORKSPACE).await;
-        ws.pages.store(1, Ordering::SeqCst);
-        let mut from_server = ws.to_pages.subscribe();
+        ws.set_page_count(1);
+        let mut from_server = ws.subscribe();
         let element = Element::new(shape_at(0.0), "a0".into(), 1).with_id("one");
 
         assert!(
@@ -1967,29 +1518,29 @@ mod tests {
         let (revision, put) = document_put(message);
         assert_eq!(revision, 1);
         assert_eq!(put.len(), 1);
-        assert_eq!(ws.revision.load(Ordering::SeqCst), 1);
+        assert_eq!(ws.revision(), 1);
 
         assert!(
             !ws.apply_page_frame(7, patch(vec![element])).await.changed,
             "replaying a patch is a no-op"
         );
-        assert_eq!(ws.revision.load(Ordering::SeqCst), 1);
+        assert_eq!(ws.revision(), 1);
     }
 
     #[tokio::test]
     async fn a_stale_patch_cannot_clobber_a_newer_mirror() {
         let state = AppState::new(PathBuf::from("."), None, true);
         let ws = state.workspace(DEFAULT_WORKSPACE).await;
-        ws.pages.store(1, Ordering::SeqCst);
+        ws.set_page_count(1);
         let mut newer = Element::new(shape_at(5.0), "a0".into(), 1).with_id("one");
         newer.version = 4;
         ws.apply_page_frame(1, patch(vec![newer])).await;
 
-        let mut from_server = ws.to_pages.subscribe();
+        let mut from_server = ws.subscribe();
         let older = Element::new(shape_at(0.0), "a0".into(), 1).with_id("one");
         assert!(!ws.apply_page_frame(1, patch(vec![older])).await.changed);
         assert_eq!(
-            ws.doc.lock().await.element("one").unwrap().kind,
+            ws.doc().lock().await.element("one").unwrap().kind,
             shape_at(5.0)
         );
 
@@ -2003,8 +1554,8 @@ mod tests {
     async fn workspaces_broadcast_patches_as_binary_frames() {
         let state = AppState::new(PathBuf::from("."), None, true);
         let ws = state.workspace(DEFAULT_WORKSPACE).await;
-        ws.pages.store(1, Ordering::SeqCst);
-        let mut from_server = ws.to_pages.subscribe();
+        ws.set_page_count(1);
+        let mut from_server = ws.subscribe();
         let element = Element::new(shape_at(0.0), "a0".into(), 1).with_id("one");
 
         assert!(
@@ -2021,8 +1572,8 @@ mod tests {
     async fn snapshots_carry_the_current_revision_as_a_binary_frame() {
         let state = AppState::new(PathBuf::from("."), None, true);
         let ws = state.workspace(DEFAULT_WORKSPACE).await;
-        add_shape(&mut *ws.doc.lock().await, 3.0, 1);
-        ws.revision.store(5, Ordering::SeqCst);
+        add_shape(&mut *ws.doc().lock().await, 3.0, 1);
+        ws.set_revision(5);
         let bytes = ws.snapshot_frame_bytes().await.unwrap();
         let (revision, doc) = canvas_core::wire::decode_snapshot(&bytes).unwrap();
         assert_eq!(revision, 5);
@@ -2282,15 +1833,15 @@ mod tests {
     async fn the_change_log_stays_bounded_with_kinds() {
         let state = AppState::new(PathBuf::from("."), None, true);
         let workspace = state.workspace(DEFAULT_WORKSPACE).await;
-        for index in 0..CHANGE_LOG_LIMIT + 5 {
+        for index in 0..crate::document::CHANGE_LOG_LIMIT + 5 {
             workspace.record_bulk(vec![format!("id-{index}")]).await;
         }
         let records = workspace.changes_since(0).await;
-        assert_eq!(records.len(), CHANGE_LOG_LIMIT);
+        assert_eq!(records.len(), crate::document::CHANGE_LOG_LIMIT);
         assert_eq!(records.first().unwrap().revision, 6);
         assert_eq!(
             records.last().unwrap().revision,
-            CHANGE_LOG_LIMIT as u64 + 5
+            crate::document::CHANGE_LOG_LIMIT as u64 + 5
         );
     }
 
@@ -2298,8 +1849,8 @@ mod tests {
     async fn a_stale_reconnect_cannot_overwrite_a_newer_mirror_element() {
         let state = AppState::new(PathBuf::from("."), None, true);
         let ws = state.workspace(DEFAULT_WORKSPACE).await;
-        ws.pages.store(1, Ordering::SeqCst);
-        let mut messages = ws.to_pages.subscribe();
+        ws.set_page_count(1);
+        let mut messages = ws.subscribe();
 
         let newer = versioned_shape("one", "a0", 50.0, 5);
         ws.apply_page_frame(1, patch(vec![newer.clone()])).await;
@@ -2310,7 +1861,7 @@ mod tests {
         assert!(!outcome.changed, "the stale upload lost");
         assert_eq!(outcome.base_revision, Some(1));
         assert_eq!(
-            ws.doc.lock().await.element("one").unwrap().version,
+            ws.doc().lock().await.element("one").unwrap().version,
             5,
             "the newer mirror copy survived"
         );
@@ -2338,7 +1889,7 @@ mod tests {
             .await;
         assert!(outcome.changed, "the explicit ledger record deletes");
         assert!(outcome.corrections.is_empty());
-        assert!(ws.doc.lock().await.element("one").unwrap().is_deleted);
+        assert!(ws.doc().lock().await.element("one").unwrap().is_deleted);
 
         // A later reconnect that only carries the old live copy cannot revive
         // the element: absence is irrelevant and the tombstone wins by LWW.
@@ -2347,7 +1898,7 @@ mod tests {
             .await;
         assert!(!outcome.changed);
         assert_eq!(outcome.corrections, vec![tombstone]);
-        assert!(ws.doc.lock().await.element("one").unwrap().is_deleted);
+        assert!(ws.doc().lock().await.element("one").unwrap().is_deleted);
     }
 
     #[tokio::test]
@@ -2356,11 +1907,11 @@ mod tests {
         let ws = state.workspace(DEFAULT_WORKSPACE).await;
         let live = versioned_shape("one", "a0", 0.0, 2);
         ws.apply_page_frame(1, patch(vec![live.clone()])).await;
-        let revision = ws.revision.load(Ordering::SeqCst);
+        let revision = ws.revision();
 
         let outcome = ws.apply_page_frame(2, snapshot(revision, [])).await;
         assert!(!outcome.changed, "absence alone must not delete");
-        assert_eq!(ws.doc.lock().await.element("one"), Some(&live));
+        assert_eq!(ws.doc().lock().await.element("one"), Some(&live));
         assert_eq!(
             outcome.corrections,
             vec![live],
@@ -2383,8 +1934,8 @@ mod tests {
         via_patch.apply_page_frame(1, patch(vec![second])).await;
 
         assert_eq!(
-            *via_snapshot.doc.lock().await,
-            *via_patch.doc.lock().await,
+            *via_snapshot.doc().lock().await,
+            *via_patch.doc().lock().await,
             "one collision policy for snapshots and patches"
         );
     }
@@ -2450,9 +2001,9 @@ mod tests {
             put: reconnected.corrections.clone(),
         };
         correction.apply_to(&mut page);
-        assert_eq!(*ws.doc.lock().await, page);
+        assert_eq!(*ws.doc().lock().await, page);
         assert_eq!(
-            ws.revision.load(Ordering::SeqCst),
+            ws.revision(),
             3,
             "a pure correction does not invent a revision"
         );
