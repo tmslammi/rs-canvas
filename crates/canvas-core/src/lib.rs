@@ -15,11 +15,6 @@ pub mod describe;
 pub mod display;
 pub mod editor;
 pub mod envelope;
-/// Compatibility alias for the pre-commands module name.
-#[doc(hidden)]
-pub mod edit {
-    pub use crate::commands::*;
-}
 pub mod geometry;
 pub mod glyphs;
 pub mod history;

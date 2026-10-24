@@ -482,7 +482,7 @@ fn orphan_facts(doc: &Document, element: &Element) -> Vec<LayoutFact> {
             });
         }
     }
-    if let Some(label) = crate::edit::owned_label(doc, &element.id) {
+    if let Some(label) = crate::commands::owned_label(doc, &element.id) {
         if let Some(state) = ref_state(doc, &label) {
             facts.push(LayoutFact::Orphan {
                 id: element.id.clone(),
