@@ -25,6 +25,7 @@ pub mod merge;
 pub mod model;
 pub mod nav;
 pub mod patch;
+pub mod relations;
 pub mod rough;
 pub mod scene;
 pub mod serialization;

@@ -352,6 +352,12 @@ struct ReadArgs {
     /// hundred tokens at any scale. Ignores scope and pagination.
     #[serde(default)]
     summary: bool,
+    /// Include the explicit ownership/connection graph after the element
+    /// lines: frame children, labels/containers, arrow endpoints and labels,
+    /// sticky stacks, and dangling references. Full and scoped reads only;
+    /// summary and since ignore it. Off by default.
+    #[serde(default)]
+    relations: bool,
     /// Read what the user is looking at: the view rect and zoom, selected
     /// handles, visible elements, elements just outside the view and an
     /// off-screen summary. Needs a page reporting view state; cannot be
@@ -1097,8 +1103,10 @@ impl CanvasServer {
                        selected handles, visible elements, elements just outside the view \
                        and an off-screen summary; it needs a page reporting view state and \
                        cannot be combined with ids, frame, query, selected or since. \
-                       This is the primary way to understand the workspace; a screenshot \
-                       adds only rendered appearance."
+                       relations adds the explicit graph of frame children, labels and \
+                       containers, connector endpoints/labels/routing, stacks, and dangling \
+                       references. This is the primary way to understand the workspace; a \
+                       screenshot adds only rendered appearance."
     )]
     async fn canvas_read(
         &self,
@@ -1271,6 +1279,15 @@ impl CanvasServer {
                     })
                 })
                 .collect();
+            let relation_scope: Option<std::collections::BTreeSet<String>> = if !args.relations {
+                None
+            } else if query.is_some() {
+                Some(matches.iter().map(|element| element.id.clone()).collect())
+            } else if has_scope {
+                Some(roots.clone())
+            } else {
+                None
+            };
             let limit = args.limit.unwrap_or(100).clamp(1, 500);
             let offset = args.offset.unwrap_or(0);
             let mut text = format!(
@@ -1304,6 +1321,11 @@ impl CanvasServer {
                         .map_err(|e| McpError::internal_error(e.to_string(), None))?;
                 }
                 elements.push(element_json);
+            }
+            if args.relations {
+                let graph =
+                    canvas_core::relations::RelationGraph::build(&doc, relation_scope.as_ref());
+                text.push_str(&graph.render(&mut *aliases));
             }
             if offset.saturating_add(limit) < matches.len() {
                 text.push_str(&format!(
@@ -2514,6 +2536,214 @@ mod tests {
         assert!(described.contains("rect"), "{described}");
         assert!(described.contains("\"API\""), "{described}");
         assert!(described.starts_with("revision 1"), "{described}");
+    }
+
+    #[tokio::test]
+    async fn canvas_read_relations_cover_ownership_connectors_and_dangling_refs() {
+        use canvas_core::geometry::Rect;
+        use canvas_core::model::{
+            Binding, ElementKind, Endpoint, Routing, ShapeKind, Style, TextAlign,
+        };
+
+        let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
+        let workspace = state.workspace(crate::state::DEFAULT_WORKSPACE).await;
+        let (frame_id, s1, s2, t1, t2, arrow_id, dangling_id, stack_id) = {
+            let mut doc = workspace.doc.lock().await;
+            let frame_id = doc.add_at(
+                ElementKind::Frame {
+                    rect: Rect::new(0.0, 0.0, 400.0, 300.0),
+                    name: "VPC".into(),
+                },
+                "a1".into(),
+                1,
+            );
+            let shape = |x: f64| ElementKind::Shape {
+                shape: ShapeKind::Rectangle,
+                rect: Rect::new(x, 0.0, 100.0, 60.0),
+                style: Style::default(),
+                bound_text_id: None,
+            };
+            let s1 = doc.add_at(shape(0.0), "a2".into(), 1);
+            let s2 = doc.add_at(shape(180.0), "a3".into(), 1);
+            let text = |text: &str, container: &str| ElementKind::Text {
+                rect: Rect::new(0.0, 0.0, 40.0, 20.0),
+                text: text.into(),
+                align: TextAlign::Center,
+                fixed_width: false,
+                container_id: Some(container.into()),
+                style: Style::default(),
+            };
+            let t1 = doc.add_at(text("API", &s1), "a4".into(), 1);
+            let t2 = doc.add_at(text("extra", &s2), "a5".into(), 1);
+            let t3 = doc.add_at(text("reads", &s1), "a6".into(), 1);
+            let arrow_id = doc.add_at(
+                ElementKind::Arrow {
+                    start: Endpoint {
+                        x: 0.0,
+                        y: 0.0,
+                        binding: Some(Binding {
+                            element_id: s1.clone(),
+                            focus: None,
+                        }),
+                    },
+                    end: Endpoint {
+                        x: 0.0,
+                        y: 0.0,
+                        binding: Some(Binding {
+                            element_id: s2.clone(),
+                            focus: None,
+                        }),
+                    },
+                    routing: Routing::Straight,
+                    start_arrowhead: false,
+                    end_arrowhead: true,
+                    style: Style::default(),
+                    waypoints: Vec::new(),
+                    label_id: Some(t3.clone()),
+                },
+                "a7".into(),
+                1,
+            );
+            let stack_id = doc.add_at(
+                ElementKind::StickyStack {
+                    rect: Rect::new(500.0, 0.0, 140.0, 140.0),
+                    style: Style::default(),
+                },
+                "a8".into(),
+                1,
+            );
+            let dangling_id = doc.add_at(
+                ElementKind::Arrow {
+                    start: Endpoint {
+                        x: 0.0,
+                        y: 0.0,
+                        binding: Some(Binding {
+                            element_id: s1.clone(),
+                            focus: None,
+                        }),
+                    },
+                    end: Endpoint {
+                        x: 0.0,
+                        y: 0.0,
+                        binding: Some(Binding {
+                            element_id: "ghost".into(),
+                            focus: None,
+                        }),
+                    },
+                    routing: Routing::Elbow,
+                    start_arrowhead: false,
+                    end_arrowhead: true,
+                    style: Style::default(),
+                    waypoints: Vec::new(),
+                    label_id: None,
+                },
+                "a9".into(),
+                1,
+            );
+            doc.element_mut(&s1).unwrap().frame_id = Some(frame_id.clone());
+            doc.element_mut(&s2).unwrap().frame_id = Some(frame_id.clone());
+            if let ElementKind::Shape { bound_text_id, .. } =
+                &mut doc.element_mut(&s1).unwrap().kind
+            {
+                *bound_text_id = Some(t1.clone());
+            }
+            // The arrow's label is t3; t2 is a container-only text on s2.
+            if let ElementKind::Text {
+                container_id: Some(owner),
+                ..
+            } = &mut doc.element_mut(&t3).unwrap().kind
+            {
+                *owner = arrow_id.clone();
+            }
+            (frame_id, s1, s2, t1, t2, arrow_id, dangling_id, stack_id)
+        };
+
+        let server = CanvasServer::new(state.clone());
+        let default_read = error_text(
+            &server
+                .canvas_read(Parameters(ReadArgs::default()))
+                .await
+                .unwrap(),
+        );
+        assert!(!default_read.contains("relations:"), "{default_read}");
+
+        let related = error_text(
+            &server
+                .canvas_read(Parameters(ReadArgs {
+                    relations: true,
+                    ..Default::default()
+                }))
+                .await
+                .unwrap(),
+        );
+        let handles = {
+            let mut aliases = workspace.aliases.lock().await;
+            (
+                aliases.handle(&frame_id),
+                aliases.handle(&s1),
+                aliases.handle(&s2),
+                aliases.handle(&t1),
+                aliases.handle(&t2),
+                aliases.handle(&arrow_id),
+                aliases.handle(&dangling_id),
+                aliases.handle(&stack_id),
+                aliases.handle("ghost"),
+            )
+        };
+        let (fh, s1h, s2h, t1h, t2h, ah, dh, sth, ghosth) = handles;
+        assert!(
+            related.contains("relations: 1 frame, 3 labels, 2 arrows, 1 stack, 1 dangling"),
+            "{related}"
+        );
+        assert!(
+            related.contains(&format!("frame {fh} \"VPC\": {s1h} {s2h}")),
+            "{related}"
+        );
+        assert!(
+            related.contains(&format!("label {t1h} -> {s1h}")),
+            "{related}"
+        );
+        assert!(
+            related.contains(&format!("container {t2h} -> {s2h}")),
+            "{related}"
+        );
+        assert!(
+            related.contains(&format!("arrow {ah}: {s1h} -> {s2h} straight \"reads\"")),
+            "{related}"
+        );
+        assert!(related.contains(&format!("stack {sth}")), "{related}");
+        assert!(
+            related.contains(&format!("dangling {dh} end -> {ghosth}")),
+            "{related}"
+        );
+
+        // The element section is identical; relations are opt-in and appended.
+        assert_eq!(
+            related.split("relations:").next().unwrap().trim_end(),
+            default_read.split("\nworkspace").next().unwrap().trim_end()
+        );
+
+        // A scoped read keeps the graph local but still names direct owners
+        // and children, so a single child reveals its frame and siblings.
+        let scoped = error_text(
+            &server
+                .canvas_read(Parameters(ReadArgs {
+                    ids: Some(vec![s1.clone()]),
+                    relations: true,
+                    ..Default::default()
+                }))
+                .await
+                .unwrap(),
+        );
+        assert!(
+            scoped.contains(&format!("frame {fh} \"VPC\": {s1h} {s2h}")),
+            "{scoped}"
+        );
+        assert!(
+            scoped.contains(&format!("label {t1h} -> {s1h}")),
+            "{scoped}"
+        );
+        assert!(!scoped.contains(&format!("stack {sth}")), "{scoped}");
     }
 
     #[tokio::test]
