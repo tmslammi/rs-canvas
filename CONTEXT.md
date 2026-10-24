@@ -36,6 +36,10 @@ _Avoid_: UI state, session
 A single reversible change to a document — add, update or remove an element. Every edit goes through one; undo replays its inverse.
 _Avoid_: Mutation, patch, operation
 
+**Command**:
+A committed document operation in `canvas-core::commands` that records one `Transaction` of deltas. The page and the agent server share commands; gesture previews are not commands.
+_Avoid_: Mutation, operation, action
+
 **Patch**:
 The wire projection of a gesture's deltas: the full elements that changed, tombstones included, merged element by element with last-writer-wins. What the page and the server exchange between snapshots.
 _Avoid_: Changeset, delta batch

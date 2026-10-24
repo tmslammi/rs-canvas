@@ -2,10 +2,11 @@
 //! when thinking together, not just building. Everything here is a normal
 //! document mutation, so it syncs, merges, saves and undoes like any edit.
 
+use canvas_core::commands::{self, owned_label};
 use canvas_core::geometry::{Point, Rect};
 use canvas_core::model::{Document, ElementId, ElementKind, Style, TextAlign};
 use canvas_core::text::{layout_text, ApproxMeasurer};
-use canvas_core::{connector, element_style_mut, translate_element};
+use canvas_core::{connector, element_style, element_style_mut, translate_element, Transaction};
 
 use crate::doc_ops::GAP;
 
@@ -20,6 +21,7 @@ const EMPHASIS_WIDTH: f64 = 3.5;
 /// that make up the mark (a cross is two strokes).
 pub fn annotate(
     doc: &mut Document,
+    tx: &mut Transaction,
     target: &str,
     mark: &str,
     now_ms: u64,
@@ -34,25 +36,28 @@ pub fn annotate(
         "cross" => Ok(vec![
             stroke(
                 doc,
+                tx,
                 &[
                     Point::new(rect.x, rect.y),
                     Point::new(rect.max_x(), rect.max_y()),
                 ],
                 CROSS_INK,
                 now_ms,
-            ),
+            )?,
             stroke(
                 doc,
+                tx,
                 &[
                     Point::new(rect.max_x(), rect.y),
                     Point::new(rect.x, rect.max_y()),
                 ],
                 CROSS_INK,
                 now_ms,
-            ),
+            )?,
         ]),
         "check" => Ok(vec![stroke(
             doc,
+            tx,
             &[
                 Point::new(rect.x, rect.y + rect.h * 0.55),
                 Point::new(rect.x + rect.w * 0.35, rect.max_y()),
@@ -60,7 +65,7 @@ pub fn annotate(
             ],
             CHECK_INK,
             now_ms,
-        )]),
+        )?]),
         "question" => {
             let style = Style {
                 stroke_color: QUESTION_INK.into(),
@@ -68,22 +73,20 @@ pub fn annotate(
                 ..Style::default()
             };
             let layout = layout_text("?", style.font_size, None, &ApproxMeasurer);
-            Ok(vec![doc.add(
-                ElementKind::Text {
-                    rect: Rect::new(
-                        center.x - layout.width / 2.0,
-                        center.y - layout.height / 2.0,
-                        layout.width.max(16.0),
-                        layout.height,
-                    ),
-                    text: "?".into(),
-                    align: TextAlign::Center,
-                    fixed_width: false,
-                    container_id: None,
-                    style,
-                },
+            Ok(vec![commands::add_text(
+                doc,
+                tx,
+                "?",
+                Rect::new(
+                    center.x - layout.width / 2.0,
+                    center.y - layout.height / 2.0,
+                    layout.width.max(16.0),
+                    layout.height,
+                ),
+                TextAlign::Center,
+                style,
                 now_ms,
-            )])
+            )?])
         }
         other => Err(format!(
             "unknown mark {other:?}; expected cross, check or question"
@@ -91,21 +94,20 @@ pub fn annotate(
     }
 }
 
-fn stroke(doc: &mut Document, points: &[Point], ink: &str, now_ms: u64) -> ElementId {
+fn stroke(
+    doc: &mut Document,
+    tx: &mut Transaction,
+    points: &[Point],
+    ink: &str,
+    now_ms: u64,
+) -> Result<ElementId, String> {
     let style = Style {
         stroke_color: ink.into(),
         stroke_width: ANNOTATION_WIDTH,
         ..Style::default()
     };
     let pressures = vec![0.5; points.len()];
-    doc.add(
-        ElementKind::Freehand {
-            points: points.to_vec(),
-            pressures,
-            style,
-        },
-        now_ms,
-    )
+    commands::add_freehand(doc, tx, points.to_vec(), pressures, style, now_ms)
 }
 
 /// Change emphasis through the style model: `dim` fades, `emphasize` restores
@@ -113,6 +115,7 @@ fn stroke(doc: &mut Document, points: &[Point], ink: &str, now_ms: u64) -> Eleme
 /// skipped.
 pub fn emphasis(
     doc: &mut Document,
+    tx: &mut Transaction,
     ids: &[String],
     mode: &str,
     now_ms: u64,
@@ -127,17 +130,22 @@ pub fn emphasis(
     };
     let mut changed = 0;
     for id in ids {
-        let Some(element) = doc.element_mut(id).filter(|element| !element.is_deleted) else {
+        let Some(element) = doc.element(id).filter(|element| !element.is_deleted) else {
             return Err(format!("unknown element {id:?}"));
         };
-        if let Some(style) = element_style_mut(element) {
-            style.opacity = opacity;
-            if let Some(width) = width {
-                style.stroke_width = width;
-            }
-            element.touch(now_ms);
-            changed += 1;
+        if element_style(element).is_none() {
+            continue;
         }
+        tx.update(doc, id, now_ms, |element| {
+            if let Some(style) = element_style_mut(element) {
+                style.opacity = opacity;
+                if let Some(width) = width {
+                    style.stroke_width = width;
+                }
+            }
+        })
+        .map_err(|error| error.to_string())?;
+        changed += 1;
     }
     Ok(changed)
 }
@@ -146,7 +154,12 @@ pub fn emphasis(
 /// reading order. Bound labels travel with their element and bound arrows
 /// re-resolve so they stay attached. Arrows themselves are skipped — they
 /// move with their endpoints.
-pub fn tidy(doc: &mut Document, ids: &[String], now_ms: u64) -> Result<usize, String> {
+pub fn tidy(
+    doc: &mut Document,
+    tx: &mut Transaction,
+    ids: &[String],
+    now_ms: u64,
+) -> Result<usize, String> {
     if ids.is_empty() {
         return Err("tidy needs at least one element".into());
     }
@@ -193,16 +206,16 @@ pub fn tidy(doc: &mut Document, ids: &[String], now_ms: u64) -> Result<usize, St
     }
 
     for (id, dx, dy) in &moved {
-        let label = linked_text(doc, id);
-        if let Some(element) = doc.element_mut(id) {
+        let label = owned_label(doc, id);
+        tx.update(doc, id, now_ms, |element| {
             translate_element(element, *dx, *dy);
-            element.touch(now_ms);
-        }
+        })
+        .map_err(|error| error.to_string())?;
         if let Some(label) = label {
-            if let Some(element) = doc.element_mut(&label) {
+            tx.update(doc, &label, now_ms, |element| {
                 translate_element(element, *dx, *dy);
-                element.touch(now_ms);
-            }
+            })
+            .map_err(|error| error.to_string())?;
         }
     }
 
@@ -224,7 +237,7 @@ pub fn tidy(doc: &mut Document, ids: &[String], now_ms: u64) -> Result<usize, St
                 _ => false,
             });
         if bound_to_moved {
-            refresh_arrow(doc, &arrow_id, now_ms);
+            refresh_arrow(doc, tx, &arrow_id, now_ms)?;
         }
     }
     Ok(moved.len())
@@ -232,95 +245,38 @@ pub fn tidy(doc: &mut Document, ids: &[String], now_ms: u64) -> Result<usize, St
 
 /// Tombstone a set of elements (frames take their children; containers take
 /// their labels). The tombstone is what the merge model propagates.
-pub fn clear(doc: &mut Document, ids: &[String], now_ms: u64) -> Result<usize, String> {
-    if ids.is_empty() {
-        return Err("clear needs at least one element".into());
-    }
-    for id in ids {
-        if doc
-            .element(id)
-            .filter(|element| !element.is_deleted)
-            .is_none()
-        {
-            return Err(format!("unknown element {id:?}"));
-        }
-    }
-    let mut queue: Vec<ElementId> = ids.to_vec();
-    let mut doomed: Vec<ElementId> = Vec::new();
-    while let Some(id) = queue.pop() {
-        if doomed.contains(&id) {
-            continue;
-        }
-        let Some(element) = doc.element(&id).filter(|element| !element.is_deleted) else {
-            continue;
-        };
-        if element.is_frame() {
-            let children: Vec<ElementId> = doc
-                .ordered_live()
-                .iter()
-                .filter(|child| child.frame_id.as_deref() == Some(id.as_str()))
-                .map(|child| child.id.clone())
-                .collect();
-            queue.extend(children);
-        }
-        if let Some(label) = linked_text(doc, &id) {
-            queue.push(label);
-        }
-        doomed.push(id);
-    }
-    // Connectors bound to doomed elements go with them: a bound arrow whose
-    // target is gone would otherwise linger on stale coordinates. Arrows can
-    // never be bind targets themselves, so one pass closes the set.
-    let attached: Vec<ElementId> = doc
-        .ordered_live()
-        .iter()
-        .filter(|element| {
-            !doomed.contains(&element.id)
-                && matches!(&element.kind, ElementKind::Arrow { start, end, .. }
-                    if start.binding.as_ref().is_some_and(|b| doomed.contains(&b.element_id))
-                        || end.binding.as_ref().is_some_and(|b| doomed.contains(&b.element_id)))
-        })
-        .map(|element| element.id.clone())
-        .collect();
-    for id in attached {
-        doomed.push(id);
-    }
-    for id in &doomed {
-        if let Some(element) = doc.element_mut(id) {
-            element.is_deleted = true;
-            element.touch(now_ms);
-        }
-    }
-    Ok(doomed.len())
+pub fn clear(
+    doc: &mut Document,
+    tx: &mut Transaction,
+    ids: &[String],
+    now_ms: u64,
+) -> Result<usize, String> {
+    Ok(commands::delete(doc, tx, ids, now_ms)?.len())
 }
 
-fn linked_text(doc: &Document, id: &str) -> Option<ElementId> {
-    match &doc.element(id)?.kind {
-        ElementKind::Shape { bound_text_id, .. } => bound_text_id.clone(),
-        ElementKind::Glyph { caption_id, .. } => caption_id.clone(),
-        ElementKind::Arrow { label_id, .. } => label_id.clone(),
-        _ => None,
-    }
-}
-
-fn refresh_arrow(doc: &mut Document, arrow_id: &str, now_ms: u64) {
+fn refresh_arrow(
+    doc: &mut Document,
+    tx: &mut Transaction,
+    arrow_id: &str,
+    now_ms: u64,
+) -> Result<(), String> {
     let Some(arrow) = doc.element(arrow_id).cloned() else {
-        return;
+        return Ok(());
     };
     let ElementKind::Arrow { start, end, .. } = &arrow.kind else {
-        return;
+        return Ok(());
     };
     let (start_point, _) = connector::resolve_endpoint(start, end.point(), doc);
     let (end_point, _) = connector::resolve_endpoint(end, start_point, doc);
-    if let Some(element) = doc.element_mut(arrow_id) {
+    tx.update(doc, arrow_id, now_ms, |element| {
         if let ElementKind::Arrow { start, end, .. } = &mut element.kind {
             start.x = start_point.x;
             start.y = start_point.y;
             end.x = end_point.x;
             end.y = end_point.y;
         }
-        element.touch(now_ms);
-    }
+    })
+    .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -331,6 +287,7 @@ mod tests {
     fn draw(doc: &mut Document, kind: &str, text: Option<&str>) -> ElementId {
         doc_ops::draw(
             doc,
+            &mut Transaction::begin(),
             &DrawRequest {
                 kind: kind.into(),
                 text: text.map(str::to_string),
@@ -346,6 +303,27 @@ mod tests {
             1,
         )
         .unwrap()
+    }
+
+    fn annotate(
+        doc: &mut Document,
+        target: &str,
+        mark: &str,
+        now: u64,
+    ) -> Result<Vec<ElementId>, String> {
+        super::annotate(doc, &mut Transaction::begin(), target, mark, now)
+    }
+
+    fn emphasis(doc: &mut Document, ids: &[String], mode: &str, now: u64) -> Result<usize, String> {
+        super::emphasis(doc, &mut Transaction::begin(), ids, mode, now)
+    }
+
+    fn tidy(doc: &mut Document, ids: &[String], now: u64) -> Result<usize, String> {
+        super::tidy(doc, &mut Transaction::begin(), ids, now)
+    }
+
+    fn clear(doc: &mut Document, ids: &[String], now: u64) -> Result<usize, String> {
+        super::clear(doc, &mut Transaction::begin(), ids, now)
     }
 
     #[test]

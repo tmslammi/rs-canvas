@@ -93,7 +93,7 @@ The page remains the interactive source of truth: the agent edits a mirrored doc
 
 ## How it works
 
-- `crates/canvas-core` — document model, geometry, history, merge logic, shape library and Canvas2D display list. No browser dependencies.
+- `crates/canvas-core` — document model, the shared command layer, geometry, history, merge logic, shape library and Canvas2D display list. No browser dependencies.
 - `crates/canvas-wasm` — the wasm-bindgen `Editor` façade and the Canvas2D renderer.
 - `crates/canvas-server` — static file server, live sync bridge, MCP tools and workspace persistence.
 - `web/` — ES modules, CSS and fonts. No build step beyond wasm-bindgen.

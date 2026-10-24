@@ -2,9 +2,13 @@
 //! can create. Everything here goes through `canvas-core`, so headless edits
 //! are shaped exactly like the ones the browser makes.
 
+use canvas_core::commands::{
+    self, default_shape_size, LabelSpot, DEFAULT_INK, FRAME_H, FRAME_W, GLYPH_SIZE, LABEL_PADDING,
+};
 use canvas_core::geometry::{Point, Rect};
-use canvas_core::model::{Document, ElementId, ElementKind, ShapeKind, Style, TextAlign};
+use canvas_core::model::{Document, ElementId, ShapeKind, Style, TextAlign};
 use canvas_core::text::{layout_text, ApproxMeasurer};
+use canvas_core::Transaction;
 
 /// Gap between a new element and the thing it is placed beside, in world px.
 pub const GAP: f64 = 40.0;
@@ -13,16 +17,6 @@ const MARGIN: f64 = 14.0;
 /// Cap on pen-stroke samples so a runaway caller cannot bloat the document.
 pub const MAX_STROKE_POINTS: usize = 10_000;
 const RING_LIMIT: i32 = 12;
-const SHAPE_W: f64 = 160.0;
-const SHAPE_H: f64 = 100.0;
-const STICKY_SIZE: f64 = 140.0;
-const FRAME_W: f64 = 360.0;
-const FRAME_H: f64 = 240.0;
-const GLYPH_SIZE: f64 = 96.0;
-const STICKY_FILL: &str = "#ffec99";
-const STICKY_INK: &str = "#3b2f1c";
-const DEFAULT_INK: &str = "#ece4d6";
-pub const LABEL_PADDING: f64 = 10.0;
 
 /// One `canvas_draw` request (or one script `draw` beat after resolution).
 pub struct DrawRequest {
@@ -42,8 +36,13 @@ pub struct DrawRequest {
     pub side: Option<String>,
 }
 
-/// Create one element, returning its id.
-pub fn draw(doc: &mut Document, request: &DrawRequest, now_ms: u64) -> Result<ElementId, String> {
+/// Create one element, returning its id. Every mutation is recorded in `tx`.
+pub fn draw(
+    doc: &mut Document,
+    tx: &mut Transaction,
+    request: &DrawRequest,
+    now_ms: u64,
+) -> Result<ElementId, String> {
     let text = request
         .text
         .as_deref()
@@ -51,55 +50,36 @@ pub fn draw(doc: &mut Document, request: &DrawRequest, now_ms: u64) -> Result<El
         .filter(|text| !text.is_empty());
     match request.kind.as_str() {
         "rectangle" | "ellipse" | "diamond" | "sticky" => {
-            let sticky = request.kind == "sticky";
             let shape = match request.kind.as_str() {
                 "ellipse" => ShapeKind::Ellipse,
                 "diamond" => ShapeKind::Diamond,
                 "sticky" => ShapeKind::Sticky,
                 _ => ShapeKind::Rectangle,
             };
-            let default = if sticky {
-                (STICKY_SIZE, STICKY_SIZE)
-            } else {
-                (SHAPE_W, SHAPE_H)
-            };
-            let (w, h) = size_of(request, default);
+            let (w, h) = size_of(request, default_shape_size(shape));
             let rect = placed_rect(doc, request, (w, h));
-            let style = if sticky {
-                Style {
-                    fill_color: STICKY_FILL.into(),
-                    stroke_color: STICKY_INK.into(),
-                    ..Style::default()
-                }
-            } else {
-                Style::default()
-            };
-            let id = doc.add(
-                ElementKind::Shape {
-                    shape,
-                    rect,
-                    style,
-                    bound_text_id: None,
-                },
+            commands::add_shape(
+                doc,
+                tx,
+                shape,
+                rect,
+                Style::default(),
+                text,
+                LabelSpot::Centre,
                 now_ms,
-            );
-            if let Some(text) = text {
-                let ink = if sticky { STICKY_INK } else { DEFAULT_INK };
-                let text_id = add_text(doc, text, TextAlign::Center, ink, now_ms);
-                place_label(doc, &id, text_id, LabelSpot::Centre);
-            }
-            Ok(id)
+                &ApproxMeasurer,
+            )
         }
         "frame" => {
             let (w, h) = size_of(request, (FRAME_W, FRAME_H));
             let rect = placed_rect(doc, request, (w, h));
-            Ok(doc.add(
-                ElementKind::Frame {
-                    rect,
-                    name: request.name.clone().unwrap_or_default(),
-                },
+            commands::add_frame(
+                doc,
+                tx,
+                rect,
+                request.name.as_deref().unwrap_or_default(),
                 now_ms,
-            ))
+            )
         }
         "glyph" => {
             let Some(glyph) = request.glyph.as_deref().filter(|glyph| !glyph.is_empty()) else {
@@ -110,43 +90,32 @@ pub fn draw(doc: &mut Document, request: &DrawRequest, now_ms: u64) -> Result<El
             }
             let (w, h) = size_of(request, (GLYPH_SIZE, GLYPH_SIZE));
             let rect = placed_rect(doc, request, (w, h));
-            let id = doc.add(
-                ElementKind::Glyph {
-                    glyph: glyph.to_string(),
-                    rect,
-                    style: Style::default(),
-                    caption_id: None,
-                },
+            commands::add_glyph(
+                doc,
+                tx,
+                glyph,
+                rect,
+                Style::default(),
+                text,
                 now_ms,
-            );
-            if let Some(text) = text {
-                let text_id = add_text(doc, text, TextAlign::Center, DEFAULT_INK, now_ms);
-                place_label(doc, &id, text_id, LabelSpot::Below);
-            }
-            Ok(id)
+                &ApproxMeasurer,
+            )
         }
         "text" => {
             let Some(text) = text else {
                 return Err("kind \"text\" needs a `text` value".into());
             };
-            let style = Style::default();
+            let style = Style {
+                stroke_color: DEFAULT_INK.into(),
+                ..Style::default()
+            };
             let layout = layout_text(text, style.font_size, None, &ApproxMeasurer);
             let w = request
                 .w
                 .unwrap_or((layout.width + 2.0 * LABEL_PADDING).max(40.0));
             let h = request.h.unwrap_or(layout.height.max(style.font_size * 1.3));
             let rect = placed_rect(doc, request, (w, h));
-            Ok(doc.add(
-                ElementKind::Text {
-                    rect,
-                    text: text.to_string(),
-                    align: TextAlign::Left,
-                    fixed_width: false,
-                    container_id: None,
-                    style,
-                },
-                now_ms,
-            ))
+            commands::add_text(doc, tx, text, rect, TextAlign::Left, style, now_ms)
         }
         other => Err(format!(
             "unknown kind {other:?}; expected rectangle, ellipse, diamond, sticky, frame, glyph or text"
@@ -169,7 +138,12 @@ pub struct PenRequest {
 /// strokes drawn by hand, with the pressure profile (taper, weight) and ink
 /// style (width, colour, roughness, dash, opacity, fill/shading) chosen by
 /// the caller.
-pub fn pen(doc: &mut Document, request: &PenRequest, now_ms: u64) -> Result<ElementId, String> {
+pub fn pen(
+    doc: &mut Document,
+    tx: &mut Transaction,
+    request: &PenRequest,
+    now_ms: u64,
+) -> Result<ElementId, String> {
     let points = &request.points;
     if points.len() < 2 {
         return Err("a pen stroke needs at least 2 points".into());
@@ -198,14 +172,14 @@ pub fn pen(doc: &mut Document, request: &PenRequest, now_ms: u64) -> Result<Elem
         .iter()
         .map(|pressure| pressure.clamp(0.0, 1.0))
         .collect();
-    Ok(doc.add(
-        ElementKind::Freehand {
-            points: points.clone(),
-            pressures,
-            style: request.style.clone(),
-        },
+    commands::add_freehand(
+        doc,
+        tx,
+        points.clone(),
+        pressures,
+        request.style.clone(),
         now_ms,
-    ))
+    )
 }
 
 fn size_of(request: &DrawRequest, default: (f64, f64)) -> (f64, f64) {
@@ -316,89 +290,18 @@ fn candidates(anchor: Rect, size: (f64, f64), side: &str, ring: i32) -> Vec<(f64
     spots
 }
 
-/// Where a bound label sits relative to its container.
-pub enum LabelSpot {
-    Centre,
-    Below,
-}
-
-/// Create a text element (not yet linked to a container).
-pub fn add_text(
-    doc: &mut Document,
-    text: &str,
-    align: TextAlign,
-    ink: &str,
-    now_ms: u64,
-) -> ElementId {
-    let style = Style {
-        stroke_color: ink.to_string(),
-        ..Style::default()
-    };
-    let layout = layout_text(text, style.font_size, None, &ApproxMeasurer);
-    doc.add(
-        ElementKind::Text {
-            rect: Rect::new(
-                0.0,
-                0.0,
-                (layout.width + 2.0 * LABEL_PADDING).max(20.0),
-                layout.height,
-            ),
-            text: text.to_string(),
-            align,
-            fixed_width: false,
-            container_id: None,
-            style,
-        },
-        now_ms,
-    )
-}
-
-/// Position `text_id` relative to its container and record the link.
-pub fn place_label(doc: &mut Document, container: &ElementId, text_id: ElementId, spot: LabelSpot) {
-    let Some(container_rect) = doc.framing_bounds(container) else {
-        return;
-    };
-    let Some(text_rect) = doc.element(&text_id).map(|element| element.bounds()) else {
-        return;
-    };
-    let rect = match spot {
-        LabelSpot::Centre => Rect::new(
-            container_rect.x + LABEL_PADDING,
-            container_rect.y + (container_rect.h - text_rect.h) / 2.0,
-            (container_rect.w - 2.0 * LABEL_PADDING).max(20.0),
-            text_rect.h,
-        ),
-        LabelSpot::Below => Rect::new(
-            container_rect.x,
-            container_rect.max_y() + 4.0,
-            container_rect.w,
-            text_rect.h,
-        ),
-    };
-    if let Some(element) = doc.element_mut(&text_id) {
-        if let ElementKind::Text {
-            rect: slot,
-            container_id,
-            ..
-        } = &mut element.kind
-        {
-            *slot = rect;
-            *container_id = Some(container.clone());
-        }
-    }
-    if let Some(element) = doc.element_mut(container) {
-        match &mut element.kind {
-            ElementKind::Shape { bound_text_id, .. } => *bound_text_id = Some(text_id),
-            ElementKind::Glyph { caption_id, .. } => *caption_id = Some(text_id),
-            ElementKind::Arrow { label_id, .. } => *label_id = Some(text_id),
-            _ => {}
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use canvas_core::ElementKind;
+
+    fn draw(doc: &mut Document, request: &DrawRequest, now: u64) -> Result<ElementId, String> {
+        super::draw(doc, &mut Transaction::begin(), request, now)
+    }
+
+    fn pen(doc: &mut Document, request: &PenRequest, now: u64) -> Result<ElementId, String> {
+        super::pen(doc, &mut Transaction::begin(), request, now)
+    }
 
     fn request(kind: &str) -> DrawRequest {
         DrawRequest {

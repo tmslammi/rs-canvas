@@ -15,6 +15,7 @@ use base64::Engine as _;
 use canvas_core::camera::Camera;
 use canvas_core::geometry::{Point, Rect};
 use canvas_core::model::{Document, Element, ElementKind, ShapeKind};
+use canvas_core::{Delta, Patch, Transaction};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
 use rmcp::{schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
@@ -854,7 +855,7 @@ impl CanvasServer {
         &self,
         workspace: &Workspace,
         source: &str,
-        run: impl FnOnce(&mut Document) -> Result<T, String>,
+        run: impl FnOnce(&mut Document, &mut Transaction) -> Result<T, String>,
     ) -> Result<T, String> {
         self.apply_transaction(workspace, source, None, None, run)
             .await
@@ -867,7 +868,7 @@ impl CanvasServer {
         source: &str,
         context: Option<&str>,
         revision: Option<u64>,
-        run: impl FnOnce(&mut Document) -> Result<T, String>,
+        run: impl FnOnce(&mut Document, &mut Transaction) -> Result<T, String>,
     ) -> Result<(T, serde_json::Value), String> {
         let observed = self.observed.lock().await.clone();
         let expected = context.or(observed.as_deref());
@@ -887,48 +888,59 @@ impl CanvasServer {
         if revision.is_some_and(|rev| rev != workspace.revision.load(Ordering::SeqCst)) {
             return Err("stale_revision: read the affected elements before retrying".into());
         }
-        let before = doc.clone();
-        let mut working = before.clone();
-        let result = run(&mut working)?;
-        let (revision, put) = workspace.record_change(&before, &working, source).await;
+        let mut tx = Transaction::begin();
+        let result = match run(&mut doc, &mut tx) {
+            Ok(result) => result,
+            Err(message) => {
+                if let Err(error) = tx.rollback(&mut doc) {
+                    tracing::error!(%error, "rollback failed after a rejected command");
+                }
+                return Err(message);
+            }
+        };
+        let deltas = tx.deltas().to_vec();
+        let put = Patch::from_deltas(&deltas, now_ms()).put;
+        let revision = if deltas.is_empty() {
+            workspace.revision.load(Ordering::SeqCst)
+        } else {
+            workspace.record_deltas(&deltas, source).await
+        };
         let mut aliases = workspace.aliases.lock().await;
         let changed: Vec<String> = put
             .iter()
             .filter(|e| !e.is_deleted)
-            .map(|e| canvas_core::describe::describe_element_with(&working, e, &mut *aliases))
+            .map(|e| canvas_core::describe::describe_element_with(&doc, e, &mut *aliases))
             .collect();
         let removed: Vec<String> = put
             .iter()
             .filter(|e| e.is_deleted)
             .map(|e| aliases.handle(&e.id))
             .collect();
-        let transaction = if put.is_empty() {
+        let transaction = if deltas.is_empty() {
             None
         } else {
             Some(format!("{}:{revision}", workspace.context()))
         };
         if let Some(id) = &transaction {
-            let changes = put
-                .iter()
-                .map(|e| (before.element(&e.id).cloned(), e.clone()))
-                .collect();
             let mut history = workspace.transactions.lock().await;
             history.push(crate::state::AgentTransaction {
                 id: id.clone(),
-                changes,
+                deltas,
             });
             if history.len() > 50 {
                 history.remove(0);
             }
         }
-        *doc = working;
         drop(aliases);
+        drop(doc);
         let receipt = serde_json::json!({
             "workspace": workspace.name, "context": workspace.context(), "revision": revision,
             "transaction": transaction, "changed": changed, "removed": removed,
         });
-        // Publish while serializing edits so a later revision cannot overtake this one.
-        workspace.publish_patch(revision, put).await;
+        if !put.is_empty() {
+            // Publish while serializing edits so a later revision cannot overtake this one.
+            workspace.publish_patch(revision, put).await;
+        }
         Ok((result, receipt))
     }
 
@@ -981,7 +993,15 @@ impl CanvasServer {
             .iter()
             .rev()
             .take(5)
-            .map(|edit| serde_json::json!({"transaction":edit.id,"elements":edit.changes.len()}))
+            .map(|edit| {
+                let elements = edit
+                    .deltas
+                    .iter()
+                    .map(|delta| delta.element_id())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len();
+                serde_json::json!({"transaction":edit.id,"elements":elements})
+            })
             .collect();
         *self.observed.lock().await = Some(workspace.context());
         let body = serde_json::json!({
@@ -1392,29 +1412,80 @@ impl CanvasServer {
         let Some(transaction) = transaction else {
             return Ok(CallToolResult::error(vec![ContentBlock::text("unknown or expired transaction; only the last 50 agent edits in this document lifetime are reversible")]));
         };
-        let outcome = self.apply_transaction(&workspace, "agent-revert", Some(&args.context), None, |doc| {
-            let touched: std::collections::HashSet<_> = transaction.changes.iter().map(|(_, after)| after.id.clone()).collect();
-            for (before, after) in &transaction.changes {
-                if doc.element(&after.id) != Some(after) {
-                    return Err(format!("revert_conflict: element {:?} changed after the experiment; read it and revise explicitly", after.id));
+        let outcome = self
+            .apply_transaction(&workspace, "agent-revert", Some(&args.context), None, |doc, tx| {
+                let touched: std::collections::HashSet<_> = transaction
+                    .deltas
+                    .iter()
+                    .map(|delta| delta.element_id().clone())
+                    .collect();
+                // The transaction journal may touch one element more than
+                // once (create, then link a label). Compare the document to
+                // the final state of each id, not to each intermediate step.
+                let mut expected: std::collections::BTreeMap<_, Option<_>> =
+                    std::collections::BTreeMap::new();
+                for delta in &transaction.deltas {
+                    let final_state = match delta {
+                        Delta::Add { element } => Some(element.clone()),
+                        Delta::Update { after, .. } => Some(after.clone()),
+                        Delta::Remove { before, tombstone } => {
+                            Some(tombstone.materialize(before))
+                        }
+                        Delta::Purge { .. } => None,
+                    };
+                    expected.insert(delta.element_id().clone(), final_state);
                 }
-                if before.is_none() {
-                    for element in doc.ordered_live().into_iter().filter(|e| !touched.contains(&e.id)) {
-                        let dependent = element.frame_id.as_deref() == Some(&after.id)
-                            || matches!(&element.kind, canvas_core::ElementKind::Text { container_id: Some(owner), .. } if owner == &after.id)
-                            || matches!(&element.kind, canvas_core::ElementKind::Arrow { start, end, .. } if [&start.binding, &end.binding].into_iter().flatten().any(|b| b.element_id == after.id));
-                        if dependent { return Err("revert_conflict: later elements depend on this experiment; revise them explicitly first".into()); }
+                for (id, after) in &expected {
+                    let conflict = match after {
+                        Some(after) => doc.element(id) != Some(after),
+                        None => doc.element(id).is_some(),
+                    };
+                    if conflict {
+                        return Err(format!(
+                            "revert_conflict: element {id:?} changed after the experiment; read it and revise explicitly"
+                        ));
                     }
                 }
-            }
-            for (before, after) in &transaction.changes {
-                let mut restored = before.clone().unwrap_or_else(|| { let mut e = after.clone(); e.is_deleted = true; e });
-                restored.version = after.version;
-                restored.touch(now_ms());
-                doc.apply(&canvas_core::Delta::Update { before: after.clone(), after: restored }).map_err(|e| e.to_string())?;
-            }
-            Ok(())
-        }).await;
+                // Later dependents only block reverting a creation that
+                // still exists at the end of the transaction. Updates to an
+                // existing frame, for example, may leave its children alone.
+                let created: std::collections::HashSet<_> = transaction
+                    .deltas
+                    .iter()
+                    .filter_map(|delta| match delta {
+                        Delta::Add { element } => Some(element.id.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                for id in &created {
+                    let still_live = expected
+                        .get(id)
+                        .and_then(Option::as_ref)
+                        .is_some_and(|element| !element.is_deleted);
+                    if !still_live {
+                        continue;
+                    }
+                    for dependent in doc
+                        .ordered_live()
+                        .into_iter()
+                        .filter(|candidate| !touched.contains(&candidate.id))
+                    {
+                        let depends = dependent.frame_id.as_deref() == Some(id)
+                            || matches!(&dependent.kind, canvas_core::ElementKind::Text { container_id: Some(owner), .. } if owner == id)
+                            || matches!(&dependent.kind, canvas_core::ElementKind::Arrow { start, end, .. } if [&start.binding, &end.binding].into_iter().flatten().any(|b| &b.element_id == id));
+                        if depends {
+                            return Err("revert_conflict: later elements depend on this experiment; revise them explicitly first".into());
+                        }
+                    }
+                }
+                for delta in transaction.deltas.iter().rev() {
+                    let inverse = canvas_core::inverse_for_replay(doc, delta, now_ms());
+                    tx.push_applied(doc, inverse)
+                        .map_err(|error| error.to_string())?;
+                }
+                Ok(())
+            })
+            .await;
         match outcome {
             Ok((_, receipt)) => Ok(CallToolResult::success(vec![ContentBlock::text(
                 receipt.to_string(),
@@ -1506,8 +1577,8 @@ impl CanvasServer {
             side: args.side,
         };
         let created = self
-            .apply_edit(&workspace, "agent", |doc| {
-                doc_ops::draw(doc, &request, now_ms())
+            .apply_edit(&workspace, "agent", |doc, tx| {
+                doc_ops::draw(doc, tx, &request, now_ms())
             })
             .await;
         match created {
@@ -1557,8 +1628,8 @@ impl CanvasServer {
         };
         let workspace = self.current().await;
         let result = self
-            .apply_edit(&workspace, "agent", |doc| {
-                doc_ops::pen(doc, &request, now_ms())
+            .apply_edit(&workspace, "agent", |doc, tx| {
+                doc_ops::pen(doc, tx, &request, now_ms())
             })
             .await;
         match result {
@@ -1656,9 +1727,13 @@ impl CanvasServer {
             }
         }
         let outcome = self
-            .apply_transaction(&workspace, "agent", context.as_deref(), revision, |doc| {
-                script::execute(doc, &beats, now_ms())
-            })
+            .apply_transaction(
+                &workspace,
+                "agent",
+                context.as_deref(),
+                revision,
+                |doc, tx| script::execute(doc, tx, &beats, now_ms()),
+            )
             .await;
         let (outcome, receipt) = match outcome {
             Ok(outcome) => outcome,
@@ -1996,8 +2071,8 @@ impl CanvasServer {
         let workspace = self.current().await;
         let id = workspace.resolve_id(&args.id).await;
         let result = self
-            .apply_edit(&workspace, "agent", |doc| {
-                verbs::annotate(doc, &id, &args.mark, now_ms())
+            .apply_edit(&workspace, "agent", |doc, tx| {
+                verbs::annotate(doc, tx, &id, &args.mark, now_ms())
             })
             .await;
         match result {
@@ -2025,8 +2100,8 @@ impl CanvasServer {
         let workspace = self.current().await;
         let ids = workspace.resolve_ids(&args.ids).await;
         let result = self
-            .apply_edit(&workspace, "agent", |doc| {
-                verbs::emphasis(doc, &ids, &args.mode, now_ms())
+            .apply_edit(&workspace, "agent", |doc, tx| {
+                verbs::emphasis(doc, tx, &ids, &args.mode, now_ms())
             })
             .await;
         match result {
@@ -2053,7 +2128,9 @@ impl CanvasServer {
         let workspace = self.current().await;
         let ids = workspace.resolve_ids(&args.ids).await;
         let result = self
-            .apply_edit(&workspace, "agent", |doc| verbs::tidy(doc, &ids, now_ms()))
+            .apply_edit(&workspace, "agent", |doc, tx| {
+                verbs::tidy(doc, tx, &ids, now_ms())
+            })
             .await;
         match result {
             Ok(moved) => {
@@ -2079,7 +2156,9 @@ impl CanvasServer {
         let workspace = self.current().await;
         let ids = workspace.resolve_ids(&args.ids).await;
         let result = self
-            .apply_edit(&workspace, "agent", |doc| verbs::clear(doc, &ids, now_ms()))
+            .apply_edit(&workspace, "agent", |doc, tx| {
+                verbs::clear(doc, tx, &ids, now_ms())
+            })
             .await;
         match result {
             Ok(cleared) => {
@@ -2387,7 +2466,22 @@ mod tests {
         assert_ne!(result.is_error, Some(true));
         let created: serde_json::Value = serde_json::from_str(&error_text(&result)).unwrap();
         assert_eq!(created["elements"], 2, "sticky plus its bound label");
-        assert!(workspace.doc.lock().await.live_count() == 2);
+        let doc = workspace.doc.lock().await;
+        assert!(doc.live_count() == 2);
+        let sticky = doc
+            .ordered_live()
+            .into_iter()
+            .find(|element| element.is_sticky())
+            .expect("sticky exists");
+        let canvas_core::ElementKind::Shape { style, .. } = &sticky.kind else {
+            panic!("expected a sticky shape");
+        };
+        assert_eq!(
+            style.fill_style,
+            canvas_core::FillPattern::Solid,
+            "agent-created stickies use the same solid fill as hand-drawn ones"
+        );
+        drop(doc);
 
         let frame: serde_json::Value =
             serde_json::from_str(&from_server.recv().await.unwrap().json.unwrap()).unwrap();

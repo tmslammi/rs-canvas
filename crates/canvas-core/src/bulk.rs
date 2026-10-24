@@ -283,12 +283,7 @@ pub fn build_shapes(
                 };
                 let mut style = style_for(spec.fill.as_deref(), defaults);
                 if spec.kind == ShapeCode::Sticky {
-                    style.fill_color = spec
-                        .fill
-                        .clone()
-                        .or(defaults.fill.clone())
-                        .unwrap_or("#ffec99".into());
-                    style.stroke_color = "#3b2f1c".into();
+                    style = crate::commands::sticky_style(style);
                 }
                 let kind = ElementKind::Shape {
                     shape,
@@ -304,9 +299,12 @@ pub fn build_shapes(
                     .filter(|t| !t.is_empty())
                 {
                     let ink = if spec.kind == ShapeCode::Sticky {
-                        "#3b2f1c"
+                        crate::commands::STICKY_INK
                     } else {
-                        defaults.ink.as_deref().unwrap_or("#ece4d6")
+                        defaults
+                            .ink
+                            .as_deref()
+                            .unwrap_or(crate::commands::DEFAULT_INK)
                     };
                     let layout = layout_text(label, 20.0, None, &ApproxMeasurer);
                     let label_kind = ElementKind::Text {
@@ -634,6 +632,35 @@ mod tests {
             stats.new_ids.len(),
             "bulk draws exactly one id per element, never one it discards"
         );
+    }
+
+    #[test]
+    fn bulk_stickies_use_the_shared_solid_style() {
+        let mut doc = doc();
+        let mut chain = KeyChain::new(&doc);
+        let mut stats = BulkStats::default();
+        build_shapes(
+            &mut doc,
+            &mut chain,
+            &[ShapeSpec {
+                kind: ShapeCode::Sticky,
+                rect: Rect::new(0.0, 0.0, 140.0, 140.0),
+                fill: None,
+                label: Some("Cache".into()),
+            }],
+            &BulkStyle::default(),
+            1,
+            None,
+            &mut stats,
+        )
+        .unwrap();
+        let sticky = doc.element(&stats.shape_ids[0]).expect("sticky inserted");
+        let crate::model::ElementKind::Shape { style, .. } = &sticky.kind else {
+            panic!("expected a sticky shape");
+        };
+        assert_eq!(style.fill_style, crate::model::FillPattern::Solid);
+        assert_eq!(style.fill_color, crate::commands::STICKY_FILL);
+        assert_eq!(style.stroke_color, crate::commands::STICKY_INK);
     }
 
     #[test]
