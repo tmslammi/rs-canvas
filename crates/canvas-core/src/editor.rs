@@ -12,6 +12,9 @@ use crate::delta::Delta;
 use crate::geometry::{Point, Rect};
 use crate::history::{History, Transaction};
 use crate::id::{new_element_id, new_version_nonce};
+use crate::interaction::{
+    AttachedDrag, EndpointEnd, Interaction, InteractionController, WaypointDrag,
+};
 use crate::model::{
     Binding, Document, Element, ElementId, ElementKind, Endpoint, Routing, ShapeKind, Style,
     StylePatch, TextAlign,
@@ -128,13 +131,6 @@ impl Handle {
     }
 }
 
-/// Which end of a connector an `ArrowEndpoint` drag is moving.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum EndpointEnd {
-    Start,
-    End,
-}
-
 /// A draggable bend on a selected connector's route.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ArrowHandle {
@@ -158,113 +154,6 @@ impl ArrowHandle {
     }
 }
 
-/// What an `ArrowWaypoint` drag is moving.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum WaypointDrag {
-    Existing {
-        index: usize,
-    },
-    /// A segment midpoint: the first real move inserts two waypoints (a bow)
-    /// and then slides them perpendicular to the segment.
-    Bow {
-        start: Point,
-        end: Point,
-        /// Where the pointer grabbed the handle; a click with no movement
-        /// must not change the route.
-        grab: Point,
-        insert_at: usize,
-        /// Filled in after insertion: first waypoint index, and whether the
-        /// segment is horizontal.
-        inserted: Option<(usize, bool)>,
-    },
-}
-
-/// Attached (non-selected) arrow preview state, computed once when a move
-/// gesture starts. Ends bound to selected targets advance arithmetically
-/// with the drag (uniform translation never flips the anchor side); other
-/// ends freeze. The document is untouched until release.
-#[derive(Clone, Debug, PartialEq)]
-struct AttachedDrag {
-    id: ElementId,
-    a: Point,
-    b: Point,
-    a_follows: bool,
-    b_follows: bool,
-    style: Style,
-    /// Pre-gesture element for the release undo step.
-    pre: Element,
-    /// Whether this arrow's rubber band is installed (later moves refresh
-    /// the layer's points in place instead of rebuilding).
-    built: bool,
-}
-
-#[derive(Clone, Debug, Default, PartialEq)]
-enum Interaction {
-    #[default]
-    Idle,
-    Drawing {
-        id: ElementId,
-        start: Point,
-    },
-    Marquee {
-        start: Point,
-    },
-    Moving {
-        start: Point,
-        originals: Vec<Element>,
-        /// Arrows bound to moved elements but not moved themselves: stretched
-        /// by the drag, rubber-banded per move, re-routed on release.
-        arrow_ids: Vec<ElementId>,
-        /// True when the drag began on empty space inside the selection's
-        /// bounding box: a click with no movement then clears the selection
-        /// instead of moving anything.
-        started_in_selection: bool,
-    },
-    Resizing {
-        handle: Handle,
-        start: Point,
-        bounds: Rect,
-        originals: Vec<Element>,
-    },
-    Freehand {
-        id: ElementId,
-    },
-    Line {
-        id: ElementId,
-        start: Point,
-    },
-    Connecting {
-        id: ElementId,
-        start: Point,
-    },
-    /// Dragging one endpoint of a selected connector to rebind or detach it.
-    ArrowEndpoint {
-        id: ElementId,
-        end: EndpointEnd,
-    },
-    /// Dragging a bend on a selected connector's route.
-    ArrowWaypoint {
-        id: ElementId,
-        drag: WaypointDrag,
-    },
-    /// Dragging a fresh note off a sticky stack; released away from the pile
-    /// it becomes a real note, released on the pile it is discarded.
-    PullingSticky {
-        id: ElementId,
-        origin: Point,
-    },
-    Erasing {
-        erased: BTreeSet<ElementId>,
-    },
-    FrameNameEditing {
-        id: ElementId,
-    },
-    TextEditing {
-        id: ElementId,
-        original: Box<Option<Element>>,
-    },
-}
-
 /// The editable session.
 pub struct Editor {
     pub doc: Document,
@@ -273,36 +162,12 @@ pub struct Editor {
     pub(crate) view: ViewState,
     /// Scene cache, routing obstacles and hit index (derived state).
     pub(crate) projection: Projection,
-    /// Total snapped drag delta already previewed (see `Interaction::Moving`):
-    /// preview moves translate incrementally, clone-free. Reset whenever a
-    /// move gesture starts.
-    drag_applied: Point,
-    /// Scene-layer slots of the dragged selection, resolved once when the
-    /// gesture starts (no structural edits mid-drag, so they stay valid).
-    /// Lets every preview move shift caches without per-id map lookups.
-    drag_slots: Vec<u32>,
-    /// Contiguous preview truth for the in-flight drag: translated in place
-    /// every move (no clones, no map lookups), written back to the document
-    /// once on release, dropped on cancel. The document is never touched
-    /// mid-gesture, so cancel needs no restore.
-    drag_working: Vec<Element>,
-    /// Selected-arrow endpoints frozen to static anchors:
-    /// (working index, start freeze, end freeze). Ends bound to selected
-    /// targets ride the drag rigidly and need no entry.
-    drag_frozen: Vec<(usize, Option<Point>, Option<Point>)>,
-    /// Attached-arrow preview state for the in-flight drag.
-    drag_attached: Vec<AttachedDrag>,
-    interaction: Interaction,
-    tx: Option<Transaction>,
-    marquee_current: Option<Point>,
+    /// In-flight gesture, its transaction and drag-preview caches.
+    pub(crate) gesture: InteractionController,
     clipboard: Vec<Element>,
     /// How many pastes the current clipboard has produced; each paste lands
     /// further from the source so copies never stack invisibly.
     paste_serial: u32,
-    last_pressure: f64,
-    hover_anchors: Option<(ElementId, Vec<Point>)>,
-    /// The sticky stack under the pointer, if its pull zone is hovered.
-    hover_stack: Option<ElementId>,
 }
 
 impl Editor {
@@ -312,19 +177,9 @@ impl Editor {
             history: History::new(),
             view: ViewState::new(),
             projection: Projection::new(),
-            drag_applied: Point::ZERO,
-            drag_slots: Vec::new(),
-            drag_working: Vec::new(),
-            drag_frozen: Vec::new(),
-            drag_attached: Vec::new(),
-            interaction: Interaction::Idle,
-            tx: None,
-            marquee_current: None,
+            gesture: InteractionController::new(),
             clipboard: Vec::new(),
             paste_serial: 0,
-            last_pressure: 0.5,
-            hover_anchors: None,
-            hover_stack: None,
         };
         editor.refresh_scene();
         editor
@@ -495,7 +350,7 @@ impl Editor {
 
     /// Whether a gesture is in progress (no committed save point yet).
     pub fn is_interacting(&self) -> bool {
-        self.interaction != Interaction::Idle
+        self.gesture.is_interacting()
     }
 
     /// Replace the whole document (used when opening a file or restoring).
@@ -503,11 +358,7 @@ impl Editor {
         self.doc = doc;
         self.history = History::new();
         self.view.clear_selection();
-        self.interaction = Interaction::Idle;
-        self.tx = None;
-        self.marquee_current = None;
-        self.hover_anchors = None;
-        self.hover_stack = None;
+        self.gesture.reset();
         self.refresh_scene();
         Effects {
             repaint_all: true,
@@ -626,7 +477,7 @@ impl Editor {
 
     /// The shell reports pointer pressure for freehand capture.
     pub fn set_pressure(&mut self, pressure: f64) {
-        self.last_pressure = pressure.clamp(0.0, 1.0);
+        self.gesture.set_pressure(pressure);
     }
 
     fn tolerance(&self) -> f64 {
@@ -640,12 +491,6 @@ impl Editor {
     /// The nearest grid point when snapping is enabled.
     fn snap(&self, point: Point) -> Point {
         self.view.snap(point)
-    }
-
-    /// A drag delta adjusted so the moving set's top-left corner lands on the
-    /// grid (relative positions inside the set stay intact).
-    fn snap_delta(&self, originals: &[Element], dx: f64, dy: f64) -> (f64, f64) {
-        self.view.snap_delta(originals, dx, dy)
     }
 
     // -- selection ---------------------------------------------------------
@@ -687,10 +532,7 @@ impl Editor {
     /// live copy, and drawing the committed text underneath it ghosted two
     /// versions together whenever their wrapping or metrics differed.
     pub fn editing_text_id(&self) -> Option<&str> {
-        match &self.interaction {
-            Interaction::TextEditing { id, .. } => Some(id.as_str()),
-            _ => None,
-        }
+        self.gesture.editing_text_id()
     }
 
     /// Bounds of the current selection, in world space.
@@ -700,12 +542,7 @@ impl Editor {
 
     /// The in-progress marquee rectangle, if any.
     pub fn marquee_rect(&self) -> Option<Rect> {
-        match self.interaction {
-            Interaction::Marquee { start } => self
-                .marquee_current
-                .map(|end| Rect::from_points(start, end)),
-            _ => None,
-        }
+        self.gesture.marquee_rect()
     }
 
     // -- pointer -----------------------------------------------------------
@@ -717,7 +554,7 @@ impl Editor {
         mods: Modifiers,
         now: u64,
     ) -> Effects {
-        if let Interaction::TextEditing { id, .. } = &self.interaction {
+        if let Interaction::TextEditing { id, .. } = &self.gesture.interaction {
             let id = id.clone();
             let current = self
                 .doc
@@ -764,19 +601,37 @@ impl Editor {
                 ..Effects::default()
             };
         }
+        // Selection drags mutate through `&mut self` and drive the
+        // performance-critical preview path; keep them out of the match so
+        // the controller can own the contiguous caches.
+        if matches!(self.gesture.interaction, Interaction::Moving { .. }) {
+            self.gesture.hover_anchors = None;
+            let current = self.view.camera.screen_to_world(screen);
+            if !self
+                .gesture
+                .preview_move(current, &mut self.view, &mut self.projection)
+            {
+                return Effects::default();
+            }
+            return Effects {
+                preview: true,
+                overlay_changed: true,
+                ..Effects::default()
+            };
+        }
         // The eraser mutates through `&mut self`, so handle it before the
         // read-only match below (this also keeps the match clone-free).
-        if let Interaction::Erasing { erased } = &self.interaction {
+        if let Interaction::Erasing { erased } = &self.gesture.interaction {
             let mut erased = erased.clone();
             let world = self.view.camera.screen_to_world(screen);
             let mut effects = Effects::default();
             self.erase_at(world, &mut erased, &mut effects, now);
-            self.interaction = Interaction::Erasing { erased };
+            self.gesture.interaction = Interaction::Erasing { erased };
             return effects;
         }
         // Waypoint drags mutate through `&mut self` too: a segment bow is
         // inserted on the first move, then dragged.
-        if let Interaction::ArrowWaypoint { id, drag } = &self.interaction {
+        if let Interaction::ArrowWaypoint { id, drag } = &self.gesture.interaction {
             let id = id.clone();
             let mut drag = *drag;
             let current = self.snap(self.view.camera.screen_to_world(screen));
@@ -785,7 +640,7 @@ impl Editor {
                 overlay_changed: true,
                 ..Effects::default()
             };
-            if let Some(tx) = self.tx.as_mut() {
+            if let Some(tx) = self.gesture.tx.as_mut() {
                 match &mut drag {
                     WaypointDrag::Existing { index } => {
                         let target = *index;
@@ -808,7 +663,7 @@ impl Editor {
                         // zero-distance move) must leave the route alone.
                         if inserted.is_none() {
                             if current.distance(*grab) <= 2.0 / self.view.camera.zoom {
-                                self.interaction = Interaction::ArrowWaypoint { id, drag };
+                                self.gesture.interaction = Interaction::ArrowWaypoint { id, drag };
                                 return effects;
                             }
                             let horizontal = (end.y - start.y).abs() <= (end.x - start.x).abs();
@@ -863,18 +718,18 @@ impl Editor {
                     }
                 }
             }
-            self.interaction = Interaction::ArrowWaypoint { id, drag };
+            self.gesture.interaction = Interaction::ArrowWaypoint { id, drag };
             return effects;
         }
         // Hover dots belong to the Select tool alone; while any other
         // interaction is in flight the overlay is owned by that interaction.
         if !matches!(
-            self.interaction,
+            self.gesture.interaction,
             Interaction::Idle | Interaction::Connecting { .. } | Interaction::ArrowEndpoint { .. }
         ) {
-            self.hover_anchors = None;
+            self.gesture.hover_anchors = None;
         }
-        match &self.interaction {
+        match &self.gesture.interaction {
             Interaction::Idle => {
                 let world = self.view.camera.screen_to_world(screen);
                 self.update_hover(world)
@@ -890,7 +745,7 @@ impl Editor {
                     return Effects::default();
                 }
                 let rect = self.drawn_rect(*start, current, mods);
-                if let Some(tx) = self.tx.as_mut() {
+                if let Some(tx) = self.gesture.tx.as_mut() {
                     if let Err(err) =
                         tx.update(&mut self.doc, id, now, |element| match &mut element.kind {
                             ElementKind::Shape { rect: r, .. }
@@ -904,90 +759,14 @@ impl Editor {
                 Effects::changed(id.clone())
             }
             Interaction::Marquee { start: _ } => {
-                self.marquee_current = Some(self.view.camera.screen_to_world(screen));
+                self.gesture.marquee_current = Some(self.view.camera.screen_to_world(screen));
                 let _ = mods;
                 Effects {
                     overlay_changed: true,
                     ..Effects::default()
                 }
             }
-            Interaction::Moving {
-                start, originals, ..
-            } => {
-                let current = self.view.camera.screen_to_world(screen);
-                let (dx, dy) = (current.x - start.x, current.y - start.y);
-                if dx.abs() < 1e-9 && dy.abs() < 1e-9 {
-                    return Effects::default();
-                }
-                let (dx, dy) = self.snap_delta(originals, dx, dy);
-                // Incremental since the last preview: the document already
-                // holds everything up to `applied`, so this move shifts by
-                // the difference only — no per-move clones, no rebuilds.
-                let (inc_x, inc_y) = (dx - self.drag_applied.x, dy - self.drag_applied.y);
-                if inc_x.abs() < 1e-9 && inc_y.abs() < 1e-9 {
-                    return Effects::default();
-                }
-                self.drag_applied = Point::new(dx, dy);
-                // Preview truth lives in `drag_working` (contiguous,
-                // cache-hot): translate it in place, snap frozen ends back
-                // to their static anchors. No clones, no map lookups, and
-                // no doc writes until release.
-                for element in self.drag_working.iter_mut() {
-                    translate_element(element, inc_x, inc_y);
-                }
-                for (idx, freeze_start, freeze_end) in self.drag_frozen.iter() {
-                    let Some(element) = self.drag_working.get_mut(*idx) else {
-                        continue;
-                    };
-                    let ElementKind::Arrow { start, end, .. } = &mut element.kind else {
-                        continue;
-                    };
-                    if let Some(point) = freeze_start {
-                        start.x = point.x;
-                        start.y = point.y;
-                    }
-                    if let Some(point) = freeze_end {
-                        end.x = point.x;
-                        end.y = point.y;
-                    }
-                }
-                // Attached arrows: following ends advance arithmetically
-                // (uniform translation never flips the anchor side), frozen
-                // ends stay. The first rubber band per arrow installs fresh
-                // ops; later moves refresh the layer's points in place: one
-                // small head-polygon allocation per arrow, nothing else.
-                for meta in self.drag_attached.iter_mut() {
-                    if meta.a_follows {
-                        meta.a.x += inc_x;
-                        meta.a.y += inc_y;
-                    }
-                    if meta.b_follows {
-                        meta.b.x += inc_x;
-                        meta.b.y += inc_y;
-                    }
-                    let width = meta.style.stroke_width;
-                    let bounds = crate::rough::rubber_band_bounds(meta.a, meta.b, width);
-                    if meta.built {
-                        self.projection
-                            .refresh_preview_ops(&meta.id, meta.a, meta.b, width, bounds);
-                    } else {
-                        let style = meta.style.clone();
-                        let (ops, _) = crate::rough::rubber_band_ops(meta.a, meta.b, &style);
-                        self.projection.set_preview_ops(&meta.id, ops, bounds);
-                        meta.built = true;
-                    }
-                }
-                // Scene: rigid-shift the selection by gesture-stable slots.
-                // The changed set stays empty: preview paints from the drained
-                // dirty rects, and release recomputes the full set for settle.
-                self.projection.shift_slots(&self.drag_slots, inc_x, inc_y);
-                self.view.shift_selection_bounds(inc_x, inc_y);
-                Effects {
-                    preview: true,
-                    overlay_changed: true,
-                    ..Effects::default()
-                }
-            }
+            Interaction::Moving { .. } => unreachable!("handled above"),
             Interaction::Resizing {
                 handle,
                 start,
@@ -1001,7 +780,7 @@ impl Editor {
                     let mut scaled = original.clone();
                     scale_element(&mut scaled, *bounds, target);
                     let kind = scaled.kind;
-                    if let Some(tx) = self.tx.as_mut() {
+                    if let Some(tx) = self.gesture.tx.as_mut() {
                         if let Err(err) = tx.update(&mut self.doc, &original.id, now, |element| {
                             element.kind = kind;
                         }) {
@@ -1026,8 +805,8 @@ impl Editor {
                     .map(|last| last.distance(current) >= 1.5 / self.view.camera.zoom)
                     .unwrap_or(false);
                 if far_enough {
-                    let pressure = self.last_pressure;
-                    if let Some(tx) = self.tx.as_mut() {
+                    let pressure = self.gesture.last_pressure;
+                    if let Some(tx) = self.gesture.tx.as_mut() {
                         let _ = tx.update(&mut self.doc, id, now, |element| {
                             if let ElementKind::Freehand {
                                 points, pressures, ..
@@ -1048,7 +827,7 @@ impl Editor {
                 // An angle-constrained end is already intentional; snapping it
                 // would shear the angle.
                 let end = if mods.shift { end } else { self.snap(end) };
-                if let Some(tx) = self.tx.as_mut() {
+                if let Some(tx) = self.gesture.tx.as_mut() {
                     let _ = tx.update(&mut self.doc, id, now, |element| {
                         if let ElementKind::Arrow { end: e, .. } = &mut element.kind {
                             e.x = end.x;
@@ -1101,7 +880,7 @@ impl Editor {
                     }
                     None => (self.snap(current), None, None),
                 };
-                self.hover_anchors = hover;
+                self.gesture.hover_anchors = hover;
                 let _ = start;
                 // Store the resolved anchor, not the heuristic one: endpoint
                 // coordinates must describe the drawn geometry so bounds(),
@@ -1139,7 +918,7 @@ impl Editor {
                         }
                         _ => None,
                     });
-                if let Some(tx) = self.tx.as_mut() {
+                if let Some(tx) = self.gesture.tx.as_mut() {
                     let _ = tx.update(&mut self.doc, id, now, |element| {
                         if let ElementKind::Arrow { start, end: e, .. } = &mut element.kind {
                             e.x = stored_end.x;
@@ -1198,7 +977,7 @@ impl Editor {
                     }
                     None => (self.snap(current), None, None),
                 };
-                self.hover_anchors = hover;
+                self.gesture.hover_anchors = hover;
                 // Store the resolved anchor so endpoint coordinates describe
                 // the drawn geometry (see the Connecting arm).
                 let stored_point = match (&binding, approach) {
@@ -1231,7 +1010,7 @@ impl Editor {
                         }
                         _ => None,
                     });
-                if let Some(tx) = self.tx.as_mut() {
+                if let Some(tx) = self.gesture.tx.as_mut() {
                     let _ = tx.update(&mut self.doc, &id, now, |element| {
                         if let ElementKind::Arrow {
                             start, end: tail, ..
@@ -1265,7 +1044,7 @@ impl Editor {
                     .map(|element| element.bounds())
                     .map(|bounds| (bounds.w, bounds.h))
                     .unwrap_or((STICKY_SIZE, STICKY_SIZE));
-                if let Some(tx) = self.tx.as_mut() {
+                if let Some(tx) = self.gesture.tx.as_mut() {
                     let _ = tx.update(&mut self.doc, id, now, |element| {
                         if let ElementKind::Shape { rect, .. } = &mut element.kind {
                             *rect = Rect::new(
@@ -1288,7 +1067,7 @@ impl Editor {
         }
         // Take the interaction out rather than cloning it: `Moving`/`Resizing`
         // carry the original elements, which must not be copied per event.
-        let interaction = std::mem::replace(&mut self.interaction, Interaction::Idle);
+        let interaction = self.gesture.take_interaction();
         let mut effects = match interaction {
             Interaction::Drawing { .. }
             | Interaction::Moving { .. }
@@ -1298,20 +1077,20 @@ impl Editor {
             | Interaction::ArrowWaypoint { .. }
             | Interaction::PullingSticky { .. }
             | Interaction::Line { .. } => {
-                self.interaction = interaction;
+                self.gesture.interaction = interaction;
                 self.pointer_move(screen, mods, now)
             }
             other => {
-                self.interaction = other;
+                self.gesture.interaction = other;
                 Effects::default()
             }
         };
-        let interaction = std::mem::replace(&mut self.interaction, Interaction::Idle);
+        let interaction = self.gesture.take_interaction();
         match interaction {
             Interaction::Idle => {}
             Interaction::FrameNameEditing { id } => {
                 // The shell owns the frame-name editor; stay in the state.
-                self.interaction = Interaction::FrameNameEditing { id };
+                self.gesture.interaction = Interaction::FrameNameEditing { id };
             }
             Interaction::Drawing { id, .. } => {
                 let tiny = self
@@ -1322,9 +1101,9 @@ impl Editor {
                         b.w < self.min_draw_size() || b.h < self.min_draw_size()
                     })
                     .unwrap_or(true);
-                self.marquee_current = None;
+                self.gesture.marquee_current = None;
                 if tiny {
-                    self.tx = None;
+                    self.gesture.tx = None;
                     let purged = self.doc.element(&id).cloned();
                     if let Some(element) = purged {
                         let _ = self.doc.apply(&Delta::Purge { element });
@@ -1336,7 +1115,7 @@ impl Editor {
                     });
                 } else {
                     self.sync_frame_membership(now);
-                    if let Some(tx) = self.tx.take() {
+                    if let Some(tx) = self.gesture.tx.take() {
                         tx.commit(&mut self.history);
                     }
                     self.finish_tool_use();
@@ -1348,7 +1127,7 @@ impl Editor {
             Interaction::Marquee { start } => {
                 let end = self.view.camera.screen_to_world(screen);
                 let rect = Rect::from_points(start, end);
-                self.marquee_current = None;
+                self.gesture.marquee_current = None;
                 // Dropping the marquee is an overlay change even when the
                 // selection outcome is a no-op (empty rect, or only frames
                 // that the marquee failed to enclose). Without this the
@@ -1400,19 +1179,18 @@ impl Editor {
                 let end = self.view.camera.screen_to_world(screen);
                 let moved = end.distance(start) > 0.5 / self.view.camera.zoom;
                 // Preview ran iff the pointer actually moved the drag total.
-                let previewed =
-                    self.drag_applied.x.abs() > 1e-9 || self.drag_applied.y.abs() > 1e-9;
+                let previewed = self.gesture.previewed();
                 // Commit the preview truth: write working + attached endpoints
                 // back (single pass each), unless this was a click.
                 let mut attached_pres: Vec<(ElementId, Element)> = Vec::new();
                 if previewed {
-                    for element in std::mem::take(&mut self.drag_working) {
+                    for element in self.gesture.take_working() {
                         if let Some(slot) = self.doc.element_mut(&element.id) {
                             *slot = element;
                             slot.touch(now);
                         }
                     }
-                    for meta in std::mem::take(&mut self.drag_attached) {
+                    for meta in self.gesture.take_attached() {
                         attached_pres.push((meta.id.clone(), meta.pre.clone()));
                         if let Some(element) = self.doc.element_mut(&meta.id) {
                             if let ElementKind::Arrow { start, end, .. } = &mut element.kind {
@@ -1439,7 +1217,7 @@ impl Editor {
                 let attached: BTreeSet<ElementId> = arrow_ids.iter().cloned().collect();
                 if previewed && !attached.is_empty() {
                     let reflows = self.bound_text_reflows(&attached);
-                    if let Some(tx) = self.tx.as_mut() {
+                    if let Some(tx) = self.gesture.tx.as_mut() {
                         for (text_id, rect) in &reflows {
                             let _ = tx.update(&mut self.doc, text_id, now, |element| {
                                 if let ElementKind::Text { rect: r, .. } = &mut element.kind {
@@ -1454,7 +1232,7 @@ impl Editor {
                         self.projection.unmark_preview(text_id);
                     }
                 }
-                if let Some(mut tx) = self.tx.take() {
+                if let Some(mut tx) = self.gesture.tx.take() {
                     // Stage the whole gesture as one undo step: pre-gesture
                     // befores plus afters from the just-written document.
                     // (Preview moves bypass per-move staging.)
@@ -1499,12 +1277,11 @@ impl Editor {
                 if started_in_selection && !moved {
                     effects.merge(self.clear_selection());
                 }
-                self.drag_applied = Point::ZERO;
-                self.drag_slots.clear();
-                self.drag_frozen.clear();
+                self.gesture.settle_move();
             }
             Interaction::Resizing { .. } => {
                 let changed: BTreeSet<ElementId> = self
+                    .gesture
                     .tx
                     .as_ref()
                     .map(|tx| tx.deltas().iter().map(|d| d.element_id().clone()).collect())
@@ -1514,7 +1291,7 @@ impl Editor {
                 // their labels reflow only after the new geometry is in place.
                 let arrow_updates = self.connected_arrow_updates(&changed);
                 let mut reflow_targets = changed.clone();
-                if let Some(tx) = self.tx.as_mut() {
+                if let Some(tx) = self.gesture.tx.as_mut() {
                     for (arrow_id, start_point, end_point) in arrow_updates {
                         reflow_targets.insert(arrow_id.clone());
                         let _ = tx.update(&mut self.doc, &arrow_id, now, |element| {
@@ -1528,7 +1305,7 @@ impl Editor {
                     }
                 }
                 let reflows = self.bound_text_reflows(&reflow_targets);
-                if let Some(tx) = self.tx.as_mut() {
+                if let Some(tx) = self.gesture.tx.as_mut() {
                     for (text_id, rect) in &reflows {
                         let _ = tx.update(&mut self.doc, text_id, now, |element| {
                             if let ElementKind::Text { rect: r, .. } = &mut element.kind {
@@ -1537,7 +1314,7 @@ impl Editor {
                         });
                     }
                 }
-                if let Some(tx) = self.tx.take() {
+                if let Some(tx) = self.gesture.tx.take() {
                     let mut changed_now: BTreeSet<ElementId> =
                         tx.deltas().iter().map(|d| d.element_id().clone()).collect();
                     changed_now.extend(changed);
@@ -1550,7 +1327,7 @@ impl Editor {
                 }
             }
             Interaction::Erasing { erased } => {
-                if let Some(tx) = self.tx.take() {
+                if let Some(tx) = self.gesture.tx.take() {
                     tx.commit(&mut self.history);
                 }
                 effects.changed.extend(erased);
@@ -1558,10 +1335,10 @@ impl Editor {
             }
             Interaction::TextEditing { id, original } => {
                 // The shell owns the text editor; stay in the state.
-                self.interaction = Interaction::TextEditing { id, original };
+                self.gesture.interaction = Interaction::TextEditing { id, original };
             }
             Interaction::Freehand { id } => {
-                if let Some(tx) = self.tx.as_mut() {
+                if let Some(tx) = self.gesture.tx.as_mut() {
                     let _ = tx.update(&mut self.doc, &id, now, |element| {
                         if let ElementKind::Freehand {
                             points, pressures, ..
@@ -1586,7 +1363,7 @@ impl Editor {
                     })
                     .unwrap_or(true);
                 if tiny {
-                    self.tx = None;
+                    self.gesture.tx = None;
                     let purged = self.doc.element(&id).cloned();
                     if let Some(element) = purged {
                         let _ = self.doc.apply(&Delta::Purge { element });
@@ -1598,7 +1375,7 @@ impl Editor {
                     });
                 } else {
                     self.sync_frame_membership(now);
-                    if let Some(tx) = self.tx.take() {
+                    if let Some(tx) = self.gesture.tx.take() {
                         tx.commit(&mut self.history);
                     }
                     self.finish_tool_use();
@@ -1617,7 +1394,7 @@ impl Editor {
                     })
                     .unwrap_or(true);
                 if tiny {
-                    self.tx = None;
+                    self.gesture.tx = None;
                     let purged = self.doc.element(&id).cloned();
                     if let Some(element) = purged {
                         let _ = self.doc.apply(&Delta::Purge { element });
@@ -1629,7 +1406,7 @@ impl Editor {
                     });
                 } else {
                     self.sync_frame_membership(now);
-                    if let Some(tx) = self.tx.take() {
+                    if let Some(tx) = self.gesture.tx.take() {
                         tx.commit(&mut self.history);
                     }
                     self.finish_tool_use();
@@ -1643,7 +1420,7 @@ impl Editor {
                 let pulled = end.distance(origin) > 3.0 / self.view.camera.zoom;
                 if pulled {
                     self.sync_frame_membership(now);
-                    if let Some(tx) = self.tx.take() {
+                    if let Some(tx) = self.gesture.tx.take() {
                         tx.commit(&mut self.history);
                     }
                     self.finish_tool_use();
@@ -1652,7 +1429,7 @@ impl Editor {
                     effects.merge(selection_effects);
                 } else {
                     // A click on the pile leaves it as it was.
-                    self.tx = None;
+                    self.gesture.tx = None;
                     let purged = self.doc.element(&id).cloned();
                     if let Some(element) = purged {
                         let _ = self.doc.apply(&Delta::Purge { element });
@@ -1666,7 +1443,7 @@ impl Editor {
                 }
             }
             Interaction::Connecting { id, .. } => {
-                self.hover_anchors = None;
+                self.gesture.hover_anchors = None;
                 let tiny = self
                     .doc
                     .element(&id)
@@ -1676,7 +1453,7 @@ impl Editor {
                     })
                     .unwrap_or(true);
                 if tiny {
-                    self.tx = None;
+                    self.gesture.tx = None;
                     let purged = self.doc.element(&id).cloned();
                     if let Some(element) = purged {
                         let _ = self.doc.apply(&Delta::Purge { element });
@@ -1688,7 +1465,7 @@ impl Editor {
                     });
                 } else {
                     self.sync_frame_membership(now);
-                    if let Some(tx) = self.tx.take() {
+                    if let Some(tx) = self.gesture.tx.take() {
                         tx.commit(&mut self.history);
                     }
                     self.finish_tool_use();
@@ -1698,10 +1475,10 @@ impl Editor {
                 }
             }
             Interaction::ArrowEndpoint { id, .. } | Interaction::ArrowWaypoint { id, .. } => {
-                self.hover_anchors = None;
+                self.gesture.hover_anchors = None;
                 // The connector's label rides along its new geometry.
                 let reflows = self.bound_text_reflows(&[id.clone()].into_iter().collect());
-                if let Some(tx) = self.tx.as_mut() {
+                if let Some(tx) = self.gesture.tx.as_mut() {
                     for (text_id, rect) in &reflows {
                         let _ = tx.update(&mut self.doc, text_id, now, |element| {
                             if let ElementKind::Text { rect: r, .. } = &mut element.kind {
@@ -1711,7 +1488,7 @@ impl Editor {
                     }
                 }
                 self.sync_frame_membership(now);
-                if let Some(tx) = self.tx.take() {
+                if let Some(tx) = self.gesture.tx.take() {
                     let changed: BTreeSet<ElementId> =
                         tx.deltas().iter().map(|d| d.element_id().clone()).collect();
                     tx.commit(&mut self.history);
@@ -1731,7 +1508,7 @@ impl Editor {
 
     /// Double-click: edit text, or create bound text inside a shape/glyph.
     pub fn double_click(&mut self, screen: Point, now: u64) -> Effects {
-        if self.interaction != Interaction::Idle {
+        if self.gesture.interaction != Interaction::Idle {
             return Effects::default();
         }
         let world = self.view.camera.screen_to_world(screen);
@@ -1832,7 +1609,7 @@ impl Editor {
                 }
             }
             Target::Frame { id, rect, name } => {
-                self.interaction = Interaction::FrameNameEditing { id: id.clone() };
+                self.gesture.interaction = Interaction::FrameNameEditing { id: id.clone() };
                 let top_left = self
                     .view
                     .camera
@@ -1919,7 +1696,7 @@ impl Editor {
 
     /// Create a point-text element and open the editor.
     pub fn start_text(&mut self, world: Point, now: u64) -> Effects {
-        if self.interaction != Interaction::Idle {
+        if self.gesture.interaction != Interaction::Idle {
             return Effects::default();
         }
         let mut tx = Transaction::begin();
@@ -1950,8 +1727,8 @@ impl Editor {
         if let Err(err) = tx.add(&mut self.doc, element) {
             debug_assert!(false, "text add failed: {err}");
         }
-        self.tx = Some(tx);
-        self.interaction = Interaction::TextEditing {
+        self.gesture.tx = Some(tx);
+        self.gesture.interaction = Interaction::TextEditing {
             id: id.clone(),
             original: Box::new(None),
         };
@@ -1974,8 +1751,8 @@ impl Editor {
             ElementKind::Text { text, .. } => text.clone(),
             _ => return Effects::default(),
         };
-        self.tx = Some(Transaction::begin());
-        self.interaction = Interaction::TextEditing {
+        self.gesture.tx = Some(Transaction::begin());
+        self.gesture.interaction = Interaction::TextEditing {
             id: id.clone(),
             original: Box::new(Some(element)),
         };
@@ -2060,8 +1837,8 @@ impl Editor {
         ) {
             debug_assert!(false, "container link failed: {err}");
         }
-        self.tx = Some(tx);
-        self.interaction = Interaction::TextEditing {
+        self.gesture.tx = Some(tx);
+        self.gesture.interaction = Interaction::TextEditing {
             id: text_id.clone(),
             original: Box::new(None),
         };
@@ -2120,11 +1897,11 @@ impl Editor {
 
     /// Commit the open text edit with the shell's textarea contents.
     pub fn commit_text(&mut self, id: &str, text: &str, now: u64) -> Effects {
-        if let Interaction::FrameNameEditing { id: editing_id } = &self.interaction {
+        if let Interaction::FrameNameEditing { id: editing_id } = &self.gesture.interaction {
             if editing_id != id {
                 return Effects::default();
             }
-            self.interaction = Interaction::Idle;
+            self.gesture.interaction = Interaction::Idle;
             let effects = Effects {
                 changed: [id.to_string()].into_iter().collect(),
                 overlay_changed: true,
@@ -2142,10 +1919,10 @@ impl Editor {
             }
             return effects;
         }
-        if !matches!(self.interaction, Interaction::TextEditing { .. }) {
+        if !matches!(self.gesture.interaction, Interaction::TextEditing { .. }) {
             return Effects::default();
         }
-        let interaction = std::mem::replace(&mut self.interaction, Interaction::Idle);
+        let interaction = self.gesture.take_interaction();
         let Interaction::TextEditing {
             id: editing_id,
             original,
@@ -2157,8 +1934,8 @@ impl Editor {
         if editing_id != id {
             return Effects::default();
         }
-        let tx = self.tx.take();
-        self.interaction = Interaction::Idle;
+        let tx = self.gesture.tx.take();
+        self.gesture.interaction = Interaction::Idle;
         let mut effects = Effects {
             changed: [id.to_string()].into_iter().collect(),
             overlay_changed: true,
@@ -2222,9 +1999,9 @@ impl Editor {
             });
             // Text committed inside a frame becomes its child, like any other
             // element, so the frame carries it when it moves.
-            self.tx = Some(tx);
+            self.gesture.tx = Some(tx);
             self.sync_frame_membership(now);
-            if let Some(tx) = self.tx.take() {
+            if let Some(tx) = self.gesture.tx.take() {
                 tx.commit(&mut self.history);
             }
             self.view.selection = [id.to_string()].into_iter().collect();
@@ -2414,13 +2191,13 @@ impl Editor {
     }
 
     pub fn cancel(&mut self) -> Effects {
-        let interaction = std::mem::take(&mut self.interaction);
-        let current = self.marquee_current.take();
+        let interaction = std::mem::take(&mut self.gesture.interaction);
+        let current = self.gesture.marquee_current.take();
         let _ = current;
         match interaction {
             Interaction::Idle => self.clear_selection(),
             Interaction::Drawing { id, .. } | Interaction::PullingSticky { id, .. } => {
-                self.tx = None;
+                self.gesture.tx = None;
                 let purged = self.doc.element(&id).cloned();
                 if let Some(element) = purged {
                     let _ = self.doc.apply(&Delta::Purge { element });
@@ -2436,28 +2213,10 @@ impl Editor {
                 ..Effects::default()
             },
             Interaction::Moving { .. } => {
-                self.hover_anchors = None;
+                self.gesture.hover_anchors = None;
                 // Preview never touched the document: unshift the rigid scene
-                // preview and rebuild the rubber-banded arrows exactly. The
-                // unshift restores bounds; ops points were deferred all
-                // along, so nothing else needs restoring.
-                let total = self.drag_applied;
-                let attached: BTreeSet<ElementId> = self
-                    .drag_attached
-                    .iter()
-                    .map(|meta| meta.id.clone())
-                    .collect();
-                self.drag_working.clear();
-                self.drag_frozen.clear();
-                self.drag_attached.clear();
-                let _ = self.tx.take();
-                self.drag_applied = Point::ZERO;
-                if total.x.abs() > 1e-9 || total.y.abs() > 1e-9 {
-                    let slots = std::mem::take(&mut self.drag_slots);
-                    self.projection.shift_slots(&slots, -total.x, -total.y);
-                } else {
-                    self.drag_slots.clear();
-                }
+                // preview and rebuild the rubber-banded arrows exactly.
+                let attached = self.gesture.cancel_move(&mut self.projection);
                 Effects {
                     changed: attached,
                     overlay_changed: true,
@@ -2467,11 +2226,11 @@ impl Editor {
             Interaction::Resizing { .. }
             | Interaction::ArrowEndpoint { .. }
             | Interaction::ArrowWaypoint { .. } => {
-                self.hover_anchors = None;
+                self.gesture.hover_anchors = None;
                 // Drop gesture-preview caches (rigid shifts, rubber bands):
                 // the changed set below rebuilds everything exactly.
                 self.projection.discard_preview();
-                if let Some(tx) = self.tx.take() {
+                if let Some(tx) = self.gesture.tx.take() {
                     for delta in tx.deltas().iter().rev() {
                         let _ = self.doc.apply(&delta.invert());
                     }
@@ -2489,7 +2248,7 @@ impl Editor {
                 }
             }
             Interaction::Erasing { erased } => {
-                if let Some(tx) = self.tx.take() {
+                if let Some(tx) = self.gesture.tx.take() {
                     for delta in tx.deltas().iter().rev() {
                         let _ = self.doc.apply(&delta.invert());
                     }
@@ -2501,7 +2260,7 @@ impl Editor {
                 }
             }
             Interaction::Freehand { id } | Interaction::Line { id, .. } => {
-                self.tx = None;
+                self.gesture.tx = None;
                 let purged = self.doc.element(&id).cloned();
                 if let Some(element) = purged {
                     let _ = self.doc.apply(&Delta::Purge { element });
@@ -2513,8 +2272,8 @@ impl Editor {
                 }
             }
             Interaction::Connecting { id, .. } => {
-                self.tx = None;
-                self.hover_anchors = None;
+                self.gesture.tx = None;
+                self.gesture.hover_anchors = None;
                 let purged = self.doc.element(&id).cloned();
                 if let Some(element) = purged {
                     let _ = self.doc.apply(&Delta::Purge { element });
@@ -2529,7 +2288,7 @@ impl Editor {
                 let mut changed: BTreeSet<ElementId> = [id.clone()].into_iter().collect();
                 match *original {
                     Some(orig) => {
-                        self.tx = None;
+                        self.gesture.tx = None;
                         if let Some(current) = self.doc.element(&id).cloned() {
                             let _ = self.doc.apply(&Delta::Update {
                                 before: current,
@@ -2537,7 +2296,7 @@ impl Editor {
                             });
                         }
                     }
-                    None => match self.tx.take() {
+                    None => match self.gesture.tx.take() {
                         Some(tx) => changed.extend(self.revert_transaction(&tx)),
                         None => {
                             if let Some(element) = self.doc.element(&id).cloned() {
@@ -2554,7 +2313,7 @@ impl Editor {
                 }
             }
             Interaction::FrameNameEditing { id } => {
-                self.interaction = Interaction::Idle;
+                self.gesture.interaction = Interaction::Idle;
                 Effects {
                     changed: [id].into_iter().collect(),
                     overlay_changed: true,
@@ -2567,7 +2326,7 @@ impl Editor {
     // -- commands ----------------------------------------------------------
 
     pub fn delete_selection(&mut self, now: u64) -> Effects {
-        if self.interaction != Interaction::Idle {
+        if self.gesture.interaction != Interaction::Idle {
             return self.cancel();
         }
         if self.view.selection.is_empty() {
@@ -2691,24 +2450,21 @@ impl Editor {
                 built: false,
             });
         }
-        let working = originals.clone();
-        self.tx = Some(Transaction::begin());
-        self.drag_applied = Point::ZERO;
-        self.drag_slots = self.scene_slot_subset(
+        let slots = self.scene_slot_subset(
             &originals
                 .iter()
                 .map(|e| e.id.clone())
                 .collect::<BTreeSet<ElementId>>(),
         );
-        self.drag_working = working;
-        self.drag_frozen = frozen;
-        self.drag_attached = attached;
-        self.interaction = Interaction::Moving {
-            start: world,
+        self.gesture.begin_move(
+            world,
             originals,
             arrow_ids,
             started_in_selection,
-        };
+            slots,
+            frozen,
+            attached,
+        );
         Effects {
             overlay_changed: true,
             ..Effects::default()
@@ -2723,8 +2479,8 @@ impl Editor {
         // radius matches the resize handles so the affordance is the same.
         if !mods.shift {
             if let Some((id, end)) = self.arrow_endpoint_at(world) {
-                self.tx = Some(Transaction::begin());
-                self.interaction = Interaction::ArrowEndpoint { id, end };
+                self.gesture.tx = Some(Transaction::begin());
+                self.gesture.interaction = Interaction::ArrowEndpoint { id, end };
                 return Effects {
                     overlay_changed: true,
                     ..Effects::default()
@@ -2732,7 +2488,7 @@ impl Editor {
             }
             // A bend on a selected connector: drag it to reshape the path.
             if let Some((id, handle)) = self.arrow_handle_at(world) {
-                self.tx = Some(Transaction::begin());
+                self.gesture.tx = Some(Transaction::begin());
                 let drag = match handle {
                     ArrowHandle::Waypoint { index, .. } => WaypointDrag::Existing { index },
                     ArrowHandle::Insert {
@@ -2748,7 +2504,7 @@ impl Editor {
                         inserted: None,
                     },
                 };
-                self.interaction = Interaction::ArrowWaypoint { id, drag };
+                self.gesture.interaction = Interaction::ArrowWaypoint { id, drag };
                 return Effects {
                     overlay_changed: true,
                     ..Effects::default()
@@ -2774,8 +2530,8 @@ impl Editor {
                     .iter()
                     .filter_map(|sid| self.doc.element(sid).cloned())
                     .collect();
-                self.tx = Some(Transaction::begin());
-                self.interaction = Interaction::Resizing {
+                self.gesture.tx = Some(Transaction::begin());
+                self.gesture.interaction = Interaction::Resizing {
                     handle,
                     start: world,
                     bounds,
@@ -2837,8 +2593,8 @@ impl Editor {
                         }
                     }
                 }
-                self.marquee_current = Some(world);
-                self.interaction = Interaction::Marquee { start: world };
+                self.gesture.marquee_current = Some(world);
+                self.gesture.interaction = Interaction::Marquee { start: world };
                 Effects {
                     overlay_changed: true,
                     ..Effects::default()
@@ -2868,8 +2624,8 @@ impl Editor {
         if let Err(err) = tx.add(&mut self.doc, element) {
             debug_assert!(false, "drawing add failed: {err}");
         }
-        self.tx = Some(tx);
-        self.interaction = Interaction::Drawing {
+        self.gesture.tx = Some(tx);
+        self.gesture.interaction = Interaction::Drawing {
             id: id.clone(),
             start: world,
         };
@@ -3004,13 +2760,13 @@ impl Editor {
         let mut effects = Effects::default();
         // Hovering a sticky stack's pull zone offers to drag a note off it.
         let next_stack = self.stack_pull_at(world);
-        if self.hover_stack != next_stack {
-            self.hover_stack = next_stack;
+        if self.gesture.hover_stack != next_stack {
+            self.gesture.hover_stack = next_stack;
             effects.overlay_changed = true;
         }
         // Keep the current nodes while the pointer is out on one of them:
         // they float outside the element, so a fresh hit test would miss.
-        if let Some((_, nodes)) = &self.hover_anchors {
+        if let Some((_, nodes)) = &self.gesture.hover_anchors {
             if nodes.iter().any(|p| p.distance(world) <= self.node_grab()) {
                 return effects;
             }
@@ -3030,8 +2786,8 @@ impl Editor {
                     Some((id, self.node_points_for(element)))
                 })
             });
-        if self.hover_anchors != next {
-            self.hover_anchors = next;
+        if self.gesture.hover_anchors != next {
+            self.gesture.hover_anchors = next;
             effects.overlay_changed = true;
         }
         effects
@@ -3039,7 +2795,8 @@ impl Editor {
 
     /// Drop the hover state (pointer left the canvas, tool changed, …).
     pub fn clear_hover(&mut self) -> Effects {
-        let changed = self.hover_anchors.take().is_some() | self.hover_stack.take().is_some();
+        let changed =
+            self.gesture.hover_anchors.take().is_some() | self.gesture.hover_stack.take().is_some();
         if changed {
             Effects {
                 overlay_changed: true,
@@ -3073,7 +2830,7 @@ impl Editor {
 
     /// Whether the pointer is offering to pull a note off a stack.
     pub fn stack_pull_hover(&self) -> bool {
-        self.hover_stack.is_some()
+        self.gesture.hover_stack.is_some()
     }
 
     /// Draggable bends on the selected lone connector: one handle per
@@ -3198,7 +2955,7 @@ impl Editor {
             return Effects::default();
         }
         patch.apply_to(&mut self.view.style);
-        if self.view.selection.is_empty() || self.interaction != Interaction::Idle {
+        if self.view.selection.is_empty() || self.gesture.interaction != Interaction::Idle {
             return Effects::default();
         }
         let ids: Vec<ElementId> = self.view.selection.iter().cloned().collect();
@@ -3254,7 +3011,7 @@ impl Editor {
         let Some(definition) = crate::glyphs::lookup(glyph) else {
             return Effects::default();
         };
-        if self.interaction != Interaction::Idle {
+        if self.gesture.interaction != Interaction::Idle {
             return Effects::default();
         }
         let center = self.view.camera.screen_to_world(Point::new(
@@ -3357,8 +3114,8 @@ impl Editor {
         if let Err(err) = tx.add(&mut self.doc, element) {
             debug_assert!(false, "sticky add failed: {err}");
         }
-        self.tx = Some(tx);
-        self.interaction = Interaction::Drawing {
+        self.gesture.tx = Some(tx);
+        self.gesture.interaction = Interaction::Drawing {
             id: id.clone(),
             start: world,
         };
@@ -3371,7 +3128,7 @@ impl Editor {
 
     /// Place a new infinite sticky stack.
     fn begin_sticky_stack(&mut self, world: Point, now: u64) -> Effects {
-        if self.interaction != Interaction::Idle {
+        if self.gesture.interaction != Interaction::Idle {
             return Effects::default();
         }
         let size = STICKY_SIZE;
@@ -3388,10 +3145,10 @@ impl Editor {
         if let Err(err) = tx.add(&mut self.doc, element) {
             debug_assert!(false, "sticky stack add failed: {err}");
         }
-        self.tx = Some(tx);
+        self.gesture.tx = Some(tx);
         // A stack placed inside a frame belongs to it like any note.
         self.sync_frame_membership(now);
-        if let Some(tx) = self.tx.take() {
+        if let Some(tx) = self.gesture.tx.take() {
             tx.commit(&mut self.history);
         }
         self.view.selection = [id.clone()].into_iter().collect();
@@ -3448,8 +3205,8 @@ impl Editor {
         if let Err(err) = tx.add(&mut self.doc, element) {
             debug_assert!(false, "pulled sticky add failed: {err}");
         }
-        self.tx = Some(tx);
-        self.interaction = Interaction::PullingSticky {
+        self.gesture.tx = Some(tx);
+        self.gesture.interaction = Interaction::PullingSticky {
             id: id.clone(),
             origin: world,
         };
@@ -3461,11 +3218,11 @@ impl Editor {
     }
 
     fn begin_erase(&mut self, world: Point, now: u64) -> Effects {
-        self.tx = Some(Transaction::begin());
+        self.gesture.tx = Some(Transaction::begin());
         let mut erased = BTreeSet::new();
         let mut effects = Effects::default();
         self.erase_at(world, &mut erased, &mut effects, now);
-        self.interaction = Interaction::Erasing { erased };
+        self.gesture.interaction = Interaction::Erasing { erased };
         effects.overlay_changed = true;
         effects
     }
@@ -3491,8 +3248,8 @@ impl Editor {
         if let Err(err) = tx.add(&mut self.doc, element) {
             debug_assert!(false, "frame add failed: {err}");
         }
-        self.tx = Some(tx);
-        self.interaction = Interaction::Drawing {
+        self.gesture.tx = Some(tx);
+        self.gesture.interaction = Interaction::Drawing {
             id: id.clone(),
             start: world,
         };
@@ -3508,7 +3265,7 @@ impl Editor {
         let element = Element::new(
             ElementKind::Freehand {
                 points: vec![world],
-                pressures: vec![self.last_pressure],
+                pressures: vec![self.gesture.last_pressure],
                 style: self.view.style.clone(),
             },
             self.next_index(),
@@ -3518,8 +3275,8 @@ impl Editor {
         if let Err(err) = tx.add(&mut self.doc, element) {
             debug_assert!(false, "freehand add failed: {err}");
         }
-        self.tx = Some(tx);
-        self.interaction = Interaction::Freehand { id: id.clone() };
+        self.gesture.tx = Some(tx);
+        self.gesture.interaction = Interaction::Freehand { id: id.clone() };
         Effects {
             changed: [id].into_iter().collect(),
             overlay_changed: true,
@@ -3529,7 +3286,8 @@ impl Editor {
 
     /// Anchor points to highlight during a connector drag.
     pub fn hover_anchor_points(&self) -> &[Point] {
-        self.hover_anchors
+        self.gesture
+            .hover_anchors
             .as_ref()
             .map(|(_, points)| points.as_slice())
             .unwrap_or_default()
@@ -3610,8 +3368,8 @@ impl Editor {
         if let Err(err) = tx.add(&mut self.doc, element) {
             debug_assert!(false, "connector add failed: {err}");
         }
-        self.tx = Some(tx);
-        self.interaction = Interaction::Connecting {
+        self.gesture.tx = Some(tx);
+        self.gesture.interaction = Interaction::Connecting {
             id: id.clone(),
             start: world,
         };
@@ -3776,7 +3534,7 @@ impl Editor {
 
     /// Reconcile frame membership inside the open transaction.
     fn sync_frame_membership(&mut self, now: u64) {
-        let Some(tx) = self.tx.as_ref() else {
+        let Some(tx) = self.gesture.tx.as_ref() else {
             return;
         };
         let ids: BTreeSet<ElementId> = tx.deltas().iter().map(|d| d.element_id().clone()).collect();
@@ -3787,11 +3545,11 @@ impl Editor {
     /// transaction does not yet hold the staged ids, e.g. drag release after
     /// preview moves bypassed per-move staging).
     fn sync_frame_membership_for(&mut self, ids: &BTreeSet<ElementId>, now: u64) {
-        if self.tx.is_none() {
+        if self.gesture.tx.is_none() {
             return;
         }
         let updates = self.frame_membership_updates(ids);
-        if let Some(tx) = self.tx.as_mut() {
+        if let Some(tx) = self.gesture.tx.as_mut() {
             for (id, frame_id) in updates {
                 let _ = tx.update(&mut self.doc, &id, now, |element| {
                     element.frame_id = frame_id.clone();
@@ -3821,8 +3579,8 @@ impl Editor {
         if let Err(err) = tx.add(&mut self.doc, element) {
             debug_assert!(false, "line add failed: {err}");
         }
-        self.tx = Some(tx);
-        self.interaction = Interaction::Line {
+        self.gesture.tx = Some(tx);
+        self.gesture.interaction = Interaction::Line {
             id: id.clone(),
             start: world,
         };
@@ -3849,7 +3607,7 @@ impl Editor {
                 if erased.contains(&target) {
                     continue;
                 }
-                if let Some(tx) = self.tx.as_mut() {
+                if let Some(tx) = self.gesture.tx.as_mut() {
                     if tx.remove(&mut self.doc, &target, now).is_ok() {
                         effects.changed.insert(target.clone());
                         erased.insert(target);
@@ -3931,7 +3689,7 @@ impl Editor {
 
     /// Move the selection by a world-space delta, one undo step.
     pub fn nudge(&mut self, dx: f64, dy: f64, now: u64) -> Effects {
-        if self.view.selection.is_empty() || self.interaction != Interaction::Idle {
+        if self.view.selection.is_empty() || self.gesture.interaction != Interaction::Idle {
             return Effects::default();
         }
         let originals = self.selection_with_followers();
@@ -3987,7 +3745,7 @@ impl Editor {
 
     /// Duplicate the selection with a small offset.
     pub fn duplicate(&mut self, now: u64) -> Effects {
-        if self.interaction != Interaction::Idle {
+        if self.gesture.interaction != Interaction::Idle {
             return Effects::default();
         }
         let source = self.selection_with_followers();
@@ -4062,7 +3820,7 @@ impl Editor {
 
     /// Move the selection one step forward (`1`) or backward (`-1`) in z-order.
     pub fn reorder(&mut self, direction: i32, now: u64) -> Effects {
-        if self.view.selection.is_empty() || self.interaction != Interaction::Idle {
+        if self.view.selection.is_empty() || self.gesture.interaction != Interaction::Idle {
             return Effects::default();
         }
         let mut seq: Vec<ElementId> = self
@@ -4758,6 +4516,40 @@ mod tests {
     }
 
     #[test]
+    fn preview_moves_do_not_touch_the_document() {
+        let mut e = editor();
+        drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(100.0, 50.0), 1);
+        let id = e.doc.ordered_live()[0].id.clone();
+        let before = e.doc.element(&id).unwrap().bounds();
+        let start = before.center();
+        e.select([id.clone()]);
+
+        let down = e.pointer_down(start, 0, Modifiers::default(), 10);
+        pump(&mut e, &down);
+        let moved = e.pointer_move(
+            Point::new(start.x + 40.0, start.y + 10.0),
+            Modifiers::default(),
+            11,
+        );
+        assert!(moved.preview, "a move previews instead of committing");
+        assert_eq!(
+            e.doc.element(&id).unwrap().bounds(),
+            before,
+            "preview truth lives in the controller until release"
+        );
+
+        let up = e.pointer_up(
+            Point::new(start.x + 40.0, start.y + 10.0),
+            Modifiers::default(),
+            12,
+        );
+        pump(&mut e, &up);
+        let after = e.doc.element(&id).unwrap().bounds();
+        assert_eq!(after.x, before.x + 40.0);
+        assert_eq!(after.y, before.y + 10.0);
+    }
+
+    #[test]
     fn marquee_selects_everything_it_touches() {
         let mut e = editor();
         drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(50.0, 50.0), 1);
@@ -5083,7 +4875,7 @@ mod tests {
         }
         e.key_down("Escape", mods, 4);
         assert!(e.doc.is_empty());
-        assert_eq!(e.interaction, Interaction::Idle);
+        assert_eq!(e.gesture.interaction, Interaction::Idle);
     }
 
     #[test]
@@ -6559,7 +6351,7 @@ mod tests {
             "the overlay types in the note's own ink, not the light canvas default"
         );
         pump(&mut e, &fx);
-        let text_id = match &e.interaction {
+        let text_id = match &e.gesture.interaction {
             Interaction::TextEditing { id, .. } => id.clone(),
             other => panic!("expected the text editor, got {other:?}"),
         };
@@ -6722,7 +6514,7 @@ mod tests {
             let fx = e.pointer_down(Point::new(60.0, 40.0), 0, mods, 3);
             pump(&mut e, &fx);
         }
-        let text_id = match &e.interaction {
+        let text_id = match &e.gesture.interaction {
             Interaction::TextEditing { id, .. } => id.clone(),
             other => panic!("expected the text editor, got {other:?}"),
         };
@@ -6862,7 +6654,7 @@ mod tests {
             let fx = e.pointer_down(Point::new(200.0, 150.0), 0, mods, 6);
             pump(&mut e, &fx);
         }
-        let text_id = match &e.interaction {
+        let text_id = match &e.gesture.interaction {
             Interaction::TextEditing { id, .. } => id.clone(),
             other => panic!("expected the text editor, got {other:?}"),
         };

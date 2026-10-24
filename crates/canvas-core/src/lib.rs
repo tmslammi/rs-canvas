@@ -21,6 +21,7 @@ pub mod history;
 pub mod hit;
 pub mod id;
 pub mod index;
+mod interaction;
 pub mod layout;
 pub mod merge;
 pub mod model;
