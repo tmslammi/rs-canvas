@@ -103,6 +103,20 @@ test("create, switch and reopen preserve separate documents and other URL state"
   expect(await count(page)).toBe(2);
 });
 
+test("the server mirror is written in the binary envelope", async ({ page }) => {
+  const docPath = path.join(directory, "current.json");
+  await page.goto(`${BASE}/`);
+  await ready(page);
+  await drawRectangle(page);
+  await expect.poll(() => {
+    try {
+      return fs.readFileSync(docPath).subarray(0, 8).toString();
+    } catch {
+      return "";
+    }
+  }).toBe("RSCDOC\r\n");
+});
+
 test("validation and picker keyboard controls do not edit the canvas", async ({ page }) => {
   await page.goto(`${BASE}/?ws=ui-validation`);
   await ready(page);

@@ -1,8 +1,13 @@
 //! Rust-owned persistence: the current document autosaves to IndexedDB.
+//!
+//! Records written since the binary format store a `Uint8Array` under `bytes`;
+//! records from older builds store a JSON string under `json`. Loads read
+//! either and the next save replaces the whole record with binary.
 
 use idb::builder::{DatabaseBuilder, ObjectStoreBuilder};
 use idb::{Database, KeyPath, Query, TransactionMode};
-use wasm_bindgen::JsValue;
+use js_sys::Uint8Array;
+use wasm_bindgen::{JsCast, JsValue};
 
 const DB_NAME: &str = "rs-canvas";
 const STORE: &str = "documents";
@@ -35,7 +40,7 @@ async fn open() -> Result<Database, String> {
 }
 
 /// Persist a serialized document as the current autosave.
-pub async fn save_document(json: &str, workspace: &str) -> Result<(), String> {
+pub async fn save_document(bytes: &[u8], workspace: &str) -> Result<(), String> {
     let db = open().await?;
     let transaction = db
         .transaction(&[STORE], TransactionMode::ReadWrite)
@@ -47,7 +52,7 @@ pub async fn save_document(json: &str, workspace: &str) -> Result<(), String> {
         &"id".into(),
         &JsValue::from_str(&autosave_key(workspace)),
     );
-    let _ = js_sys::Reflect::set(&value, &"json".into(), &JsValue::from_str(json));
+    let _ = js_sys::Reflect::set(&value, &"bytes".into(), &Uint8Array::from(bytes));
     let _ = js_sys::Reflect::set(
         &value,
         &"updated".into(),
@@ -66,8 +71,12 @@ pub async fn save_document(json: &str, workspace: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Load the current autosave, if any.
-pub async fn load_document(workspace: &str) -> Result<Option<String>, String> {
+/// Load the current autosave, if any, as raw document bytes.
+///
+/// Binary records are returned as stored. A legacy JSON string is returned as
+/// its UTF-8 bytes; `serialization::from_bytes` auto-detects it and the next
+/// autosave upgrades the record.
+pub async fn load_document(workspace: &str) -> Result<Option<Vec<u8>>, String> {
     let db = open().await?;
     let transaction = db
         .transaction(&[STORE], TransactionMode::ReadOnly)
@@ -81,8 +90,12 @@ pub async fn load_document(workspace: &str) -> Result<Option<String>, String> {
     let Some(value) = value else {
         return Ok(None);
     };
+    let bytes = js_sys::Reflect::get(&value, &"bytes".into()).map_err(error_string)?;
+    if bytes.is_instance_of::<Uint8Array>() {
+        return Ok(Some(Uint8Array::from(bytes).to_vec()));
+    }
     let json = js_sys::Reflect::get(&value, &"json".into()).map_err(error_string)?;
-    Ok(json.as_string())
+    Ok(json.as_string().map(String::into_bytes))
 }
 
 /// Discover autosaves written before the browser catalogue existed.

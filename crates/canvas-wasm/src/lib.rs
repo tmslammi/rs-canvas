@@ -527,6 +527,11 @@ impl Editor {
         canvas_core::serialization::to_json_pretty(&self.core.doc).unwrap_or_default()
     }
 
+    /// Serialize the document in the binary persistence format.
+    pub fn save_bytes(&self) -> Vec<u8> {
+        canvas_core::serialization::to_bytes(&self.core.doc).unwrap_or_default()
+    }
+
     /// The live document as compact JSON for the agent bridge.
     pub fn snapshot_json(&self) -> String {
         canvas_core::serialization::to_json(&self.core.doc).unwrap_or_default()
@@ -591,10 +596,12 @@ impl Editor {
     /// autosave calls this; serializing inside input handlers is what makes
     /// large documents stutter).
     pub fn flush_save(&self) {
-        let json = canvas_core::serialization::to_json(&self.core.doc).unwrap_or_default();
+        let Ok(bytes) = canvas_core::serialization::to_bytes(&self.core.doc) else {
+            return;
+        };
         let workspace = self.workspace.clone();
         wasm_bindgen_futures::spawn_local(async move {
-            let _ = storage::save_document(&json, &workspace).await;
+            let _ = storage::save_document(&bytes, &workspace).await;
         });
     }
 
@@ -700,6 +707,17 @@ impl Editor {
     /// Replace the document from a JSON file; errors are user-facing messages.
     pub fn load_json(&mut self, json: &str) -> Result<(), JsValue> {
         let doc = canvas_core::serialization::from_json(json)
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        let effects = self.core.replace_document(doc);
+        self.apply(effects);
+        Ok(())
+    }
+
+    /// Replace the document from persisted bytes. Legacy JSON bytes are
+    /// accepted, so autosaves and checkpoints written before the binary
+    /// format still restore.
+    pub fn load_bytes(&mut self, bytes: &[u8]) -> Result<(), JsValue> {
+        let doc = canvas_core::serialization::from_bytes(bytes)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
         let effects = self.core.replace_document(doc);
         self.apply(effects);
@@ -2108,14 +2126,26 @@ impl Editor {
     }
 }
 
-/// Load the workspace's autosaved document, if any (the shell calls this at
-/// boot).
+/// Load the workspace's autosaved document bytes, if any (the shell calls this
+/// at boot). Legacy JSON autosaves are returned as JSON bytes.
 #[wasm_bindgen]
-pub async fn load_saved_json(workspace: Option<String>) -> Option<String> {
+pub async fn load_saved_document(workspace: Option<String>) -> Option<Vec<u8>> {
     storage::load_document(workspace.as_deref().unwrap_or("default"))
         .await
         .ok()
         .flatten()
+}
+
+/// Load the workspace's autosave as JSON. Kept for callers that expect the
+/// historical JSON API; the shell itself uses `load_saved_document`.
+#[wasm_bindgen]
+pub async fn load_saved_json(workspace: Option<String>) -> Option<String> {
+    let bytes = storage::load_document(workspace.as_deref().unwrap_or("default"))
+        .await
+        .ok()
+        .flatten()?;
+    let doc = canvas_core::serialization::from_bytes(&bytes).ok()?;
+    canvas_core::serialization::to_json(&doc).ok()
 }
 
 /// Names of workspace autosaves in this browser.
@@ -2125,12 +2155,28 @@ pub async fn list_saved_workspaces() -> String {
         .unwrap_or_else(|_| "[]".into())
 }
 
-/// Await a save before leaving or managing a workspace.
+/// Await a save of already-serialized document bytes before leaving or
+/// managing a workspace. The bytes are validated and rewritten canonically, so
+/// a legacy JSON payload also upgrades to binary here.
+#[wasm_bindgen]
+pub async fn save_workspace_bytes(workspace: String, bytes: Vec<u8>) -> Result<(), JsValue> {
+    let doc = canvas_core::serialization::from_bytes(&bytes)
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    let bytes = canvas_core::serialization::to_bytes(&doc)
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    storage::save_document(&bytes, &workspace)
+        .await
+        .map_err(|error| JsValue::from_str(&error))
+}
+
+/// Await a save before leaving or managing a workspace (legacy JSON API).
 #[wasm_bindgen]
 pub async fn save_workspace_json(workspace: String, json: String) -> Result<(), JsValue> {
-    canvas_core::serialization::from_json(&json)
+    let doc = canvas_core::serialization::from_json(&json)
         .map_err(|error| JsValue::from_str(&error.to_string()))?;
-    storage::save_document(&json, &workspace)
+    let bytes = canvas_core::serialization::to_bytes(&doc)
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    storage::save_document(&bytes, &workspace)
         .await
         .map_err(|error| JsValue::from_str(&error))
 }

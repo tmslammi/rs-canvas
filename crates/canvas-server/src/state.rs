@@ -332,10 +332,10 @@ impl Workspace {
                 *self.discussion.lock().await = notes;
             }
         }
-        let Ok(json) = tokio::fs::read_to_string(path).await else {
+        let Ok(bytes) = tokio::fs::read(path).await else {
             return;
         };
-        match serialization::from_json(&json) {
+        match serialization::from_bytes(&bytes) {
             Ok(doc) => {
                 let elements = doc.live_count();
                 *self.doc.lock().await = doc;
@@ -347,7 +347,8 @@ impl Workspace {
         }
     }
 
-    /// The mirror as compact JSON.
+    /// The mirror as compact JSON, for tests that compare frames.
+    #[cfg(test)]
     pub async fn document_json(&self) -> String {
         let doc = self.doc.lock().await;
         serialization::to_json(&doc).unwrap_or_default()
@@ -619,7 +620,7 @@ impl Workspace {
         };
         if let Some(path) = &self.doc_path {
             let json = serde_json::to_string_pretty(&updated).map_err(|e| e.to_string())?;
-            write_atomic(&path.with_extension("discussion.json"), &json)
+            write_atomic(&path.with_extension("discussion.json"), json.as_bytes())
                 .await
                 .map_err(|e| e.to_string())?;
         }
@@ -688,8 +689,17 @@ impl Workspace {
         let Some(path) = &self.doc_path else {
             return;
         };
-        let json = self.document_json().await;
-        if let Err(error) = write_atomic(path, &json).await {
+        let bytes = {
+            let doc = self.doc.lock().await;
+            match serialization::to_bytes(&doc) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    tracing::warn!(%error, path = %path.display(), "could not serialize document");
+                    return;
+                }
+            }
+        };
+        if let Err(error) = write_atomic(path, &bytes).await {
             tracing::warn!(%error, path = %path.display(), "could not persist document");
         }
     }
@@ -877,9 +887,9 @@ impl AppState {
         if let Some(new_name) = renamed {
             let destination = Arc::new(self.build_workspace(new_name));
             if let Some(path) = &destination.doc_path {
-                let json =
-                    serialization::to_json(&merged).map_err(|error| Invalid(error.to_string()))?;
-                write_atomic(path, &json).await.map_err(Io)?;
+                let bytes =
+                    serialization::to_bytes(&merged).map_err(|error| Invalid(error.to_string()))?;
+                write_atomic(path, &bytes).await.map_err(Io)?;
             }
             // Remove the old file only once the new document is durable.
             if let Some(path) = &source.doc_path {
@@ -1038,7 +1048,7 @@ impl AppState {
         };
         if let Some(path) = &self.settings_path {
             if let Ok(json) = serde_json::to_string_pretty(&settings) {
-                if let Err(error) = write_atomic(path, &json).await {
+                if let Err(error) = write_atomic(path, json.as_bytes()).await {
                     tracing::warn!(%error, path = %path.display(), "could not persist settings");
                 }
             }
@@ -1067,11 +1077,11 @@ impl AppState {
     }
 }
 
-async fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
+async fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    let temp = path.with_extension("json.tmp");
+    let temp = path.with_extension("tmp");
     tokio::fs::write(&temp, contents).await?;
     tokio::fs::rename(&temp, path).await
 }
@@ -1135,9 +1145,73 @@ mod tests {
         add_shape(&mut *ws.doc.lock().await, 10.0, 1);
         ws.persist_document().await;
 
+        let bytes = tokio::fs::read(&path).await.unwrap();
+        assert!(
+            canvas_core::envelope::is_binary(&bytes),
+            "the mirror is written in the binary envelope"
+        );
+
         let restored = AppState::new(PathBuf::from("."), Some(path), true);
         let restored_ws = restored.workspace(DEFAULT_WORKSPACE).await;
         assert_eq!(restored_ws.doc.lock().await.live_count(), 1);
+        let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+
+    #[tokio::test]
+    async fn legacy_json_mirrors_load_and_upgrade_on_the_next_save() {
+        let dir = std::env::temp_dir().join(format!(
+            "rs-canvas-legacy-mirror-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("document.json");
+        let mut doc = Document::new();
+        add_shape(&mut doc, 10.0, 1);
+        tokio::fs::write(&path, serialization::to_json_pretty(&doc).unwrap())
+            .await
+            .unwrap();
+
+        let state = AppState::new(PathBuf::from("."), Some(path.clone()), true);
+        let ws = state.workspace(DEFAULT_WORKSPACE).await;
+        assert_eq!(ws.doc.lock().await.live_count(), 1);
+        ws.persist_document().await;
+
+        let bytes = tokio::fs::read(&path).await.unwrap();
+        assert!(
+            canvas_core::envelope::is_binary(&bytes),
+            "the next save rewrites the legacy JSON mirror as binary"
+        );
+        let restored = AppState::new(PathBuf::from("."), Some(path), true);
+        assert_eq!(
+            restored
+                .workspace(DEFAULT_WORKSPACE)
+                .await
+                .doc
+                .lock()
+                .await
+                .live_count(),
+            1
+        );
+        let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+
+    #[tokio::test]
+    async fn future_binary_mirrors_are_ignored() {
+        let dir = std::env::temp_dir().join(format!(
+            "rs-canvas-future-mirror-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("document.json");
+        let bytes =
+            canvas_core::envelope::encode(99, canvas_core::envelope::Codec::Postcard, &[]).unwrap();
+        tokio::fs::write(&path, bytes).await.unwrap();
+
+        let state = AppState::new(PathBuf::from("."), Some(path), true);
+        let ws = state.workspace(DEFAULT_WORKSPACE).await;
+        assert_eq!(ws.doc.lock().await.live_count(), 0);
         let _ = tokio::fs::remove_dir_all(dir).await;
     }
 
@@ -1222,6 +1296,13 @@ mod tests {
         assert!(
             !dir.join("workspaces/alpha.json").exists(),
             "a late persist cannot recreate the old file"
+        );
+        let renamed = tokio::fs::read(dir.join("workspaces/beta.json"))
+            .await
+            .unwrap();
+        assert!(
+            canvas_core::envelope::is_binary(&renamed),
+            "workspace rename writes the same binary format"
         );
         let restarted = AppState::new(PathBuf::from("."), Some(dir.join("current.json")), true);
         assert_eq!(*restarted.workspace("beta").await.doc.lock().await, before);
