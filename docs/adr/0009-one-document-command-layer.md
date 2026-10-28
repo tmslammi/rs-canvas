@@ -7,7 +7,7 @@ This keeps ADR-0002's single Delta seam and ADR-0005's page-authoritative mirror
 ## Consequences
 
 - `canvas_bulk` remains a batched builder with an additions-only record path; it still shares the command layer's element defaults.
-- Typed, revisioned binary wire frames landed independently in the binary-sync work. A tombstone ledger that removes deletion-by-absence, and splitting `Editor`/`Workspace`, remain follow-ups; this decision only fixes where committed edits live.
+- Typed, revisioned binary wire frames landed independently in the binary-sync work. The tombstone ledger that removes deletion-by-absence landed in ADR-0011; splitting `Editor`/`Workspace` remains a follow-up. This decision only fixes where committed edits live.
 
 ## Considered options
 

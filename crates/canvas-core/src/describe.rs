@@ -3,8 +3,8 @@
 //!
 //! This is the LLM-facing projection of a `Document` — the model reads it to
 //! learn handles and available space before drawing. It is deliberately
-//! separate from the JSON wire format: the wire is for machines, this is for
-//! tokens. Handles come from an [`IdMap`]; the server's alias registry maps
+//! separate from the binary document formats: those are for machines, this is
+//! for tokens. Handles come from an [`IdMap`]; the server's alias registry maps
 //! element UUIDs to stable short names (`e12`), while tests and file-facing
 //! code use [`UuidMap`].
 //!

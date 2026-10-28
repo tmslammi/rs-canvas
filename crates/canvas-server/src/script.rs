@@ -189,7 +189,7 @@ impl UpdateBeat {
                 .transpose()
         };
         let frame = reference(&self.frame)?;
-        let update = canvas_core::edit::ElementUpdate {
+        let update = canvas_core::commands::ElementUpdate {
             x: self.x,
             y: self.y,
             w: self.w,

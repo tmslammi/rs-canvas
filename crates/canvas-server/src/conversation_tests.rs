@@ -185,7 +185,7 @@ async fn revert_preserves_unrelated_work_and_conflicts_on_later_edits() {
     let id = workspace.resolve_id(worker).await;
     let mut doc = workspace.doc.lock().await;
     let before = doc.clone();
-    let label = canvas_core::edit::owned_label(&doc, &id).unwrap();
+    let label = canvas_core::commands::owned_label(&doc, &id).unwrap();
     let element = doc.element_mut(&label).unwrap();
     if let canvas_core::ElementKind::Text { text, .. } = &mut element.kind {
         *text = "Human preference".into();
@@ -301,7 +301,7 @@ async fn discussion_persists_per_workspace_and_rejects_stale_replacement() {
         "rs-canvas-discussion-{}",
         canvas_core::id::new_element_id()
     ));
-    let path = dir.join("current.json");
+    let path = dir.join("current.rsc");
     let server = CanvasServer::new(Arc::new(AppState::new(
         std::path::PathBuf::from("."),
         Some(path.clone()),

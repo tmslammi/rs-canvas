@@ -43,3 +43,11 @@ _Avoid_: Mutation, operation, action
 **Patch**:
 The wire projection of a gesture's deltas: the full elements that changed, tombstones included, merged element by element with last-writer-wins. What the page and the server exchange between snapshots.
 _Avoid_: Changeset, delta batch
+
+**Base revision**:
+The server document revision a page's snapshot was built from, carried on the snapshot so catch-up can be reasoned about. It never authorizes a deletion; element-level merge rules still decide.
+_Avoid_: Snapshot version, client revision
+
+**Purge ledger**:
+The page's record of explicit removals whose element entry is gone locally, such as undoing a creation. Its tombstones ride snapshots and autosaves, so an absent element is never mistaken for a deleted one.
+_Avoid_: Tombstone cache, delete diff

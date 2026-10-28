@@ -13,8 +13,6 @@ use crate::state::{AppState, WorkspaceManagementError};
 #[derive(Deserialize)]
 pub struct RenameRequest {
     name: String,
-    #[serde(default)]
-    doc: Option<serde_json::Value>,
 }
 
 pub async fn rename(
@@ -22,23 +20,11 @@ pub async fn rename(
     Path(source): Path<String>,
     Json(request): Json<RenameRequest>,
 ) -> Response {
-    let doc = match request
-        .doc
-        .map(canvas_core::serialization::from_value)
-        .transpose()
-    {
-        Ok(doc) => doc,
-        Err(error) => return failure(StatusCode::BAD_REQUEST, error.to_string()),
-    };
-    result(
-        state
-            .manage_workspace(&source, Some(&request.name), doc)
-            .await,
-    )
+    result(state.manage_workspace(&source, Some(&request.name)).await)
 }
 
 pub async fn delete(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
-    result(state.manage_workspace(&name, None, None).await)
+    result(state.manage_workspace(&name, None).await)
 }
 
 fn result(result: Result<(), WorkspaceManagementError>) -> Response {

@@ -25,11 +25,12 @@
 //! is not a document, and a receiver that is handed the wrong bytes can reject
 //! them before touching the payload.
 //!
-//! The revision is the sender's document revision. A page has no independent
-//! revision, so it echoes the last revision it applied (zero before the first
-//! server frame); the server ignores page revisions. Revisions are diagnostic
-//! and resync metadata only — element-level last-writer-wins still decides
-//! every merge.
+//! For a server-to-page frame the revision is the sender's document revision.
+//! For a page-to-server snapshot it is the page's base: the last server
+//! revision it applied (zero before the first server frame). The server
+//! records the base and returns it in the frame outcome, but revisions are
+//! catch-up metadata only — element-level last-writer-wins decides every
+//! merge, and absence never deletes. Page-to-server patches ignore the field.
 
 use std::fmt;
 

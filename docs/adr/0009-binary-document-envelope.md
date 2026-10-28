@@ -1,6 +1,6 @@
 # Persist documents in a versioned binary envelope (postcard payload)
 
-Persistence uses a binary document envelope while JSON remains the import, export and wire format. The envelope is independent of the document schema: it carries the schema version and codec id, so a reader can reject a future document before decoding its payload and a future codec can reuse the same container. This amends ADR-0003: the schema is still rs-canvas's own, but its persistence encoding is now binary.
+Persistence uses a binary document envelope. JSON remains the explicit import and export format; the document wire is binary too (ADR-0010). The envelope is independent of the document schema: it carries the schema version and codec id, so a reader can reject a future document before decoding its payload and a future codec can reuse the same container. This amends ADR-0003: the schema is still rs-canvas's own, but persisted documents are always binary.
 
 ## Envelope layout
 
@@ -12,7 +12,7 @@ Persistence uses a binary document envelope while JSON remains the import, expor
 | 13 | 4 | payload length, little-endian `u32` |
 | 17 | n | codec payload |
 
-The header is strict: fewer bytes than the header, a payload shorter or longer than the declared length, or an unknown codec id is rejected. Bytes without the full magic are treated as legacy UTF-8 JSON; there is no ambiguity because JSON cannot start with `RSCDOC\r\n`. The same bytes and paths are reused (`current-v2` IndexedDB keys, checkpoint keys, `--doc` and `workspaces/<name>.json` mirror files), so old autosaves, checkpoints and mirrors load directly and the next save overwrites them with the binary envelope. The `.json` mirror name is kept until a later migration so existing `--doc` arguments, workspace listings and user expectations keep working.
+The header is strict: fewer bytes than the header, a payload shorter or longer than the declared length, an unknown codec id, or missing magic are rejected. Persistence has no second encoding: autosaves (`current-v2` IndexedDB keys), unload checkpoints, `--doc` and `workspaces/<name>.rsc` mirror files are binary documents.
 
 ## Payload codec
 
@@ -38,14 +38,14 @@ The CBOR and MessagePack rows are payload-only probe timings; the JSON rows are 
 - `SCHEMA_VERSION` in `canvas-core` is the single document schema version. The writer stamps it in the envelope; the payload does not repeat it.
 - Read order is: envelope magic → header integrity → schema version and codec id → payload. A version newer than the build is `UnsupportedVersion`; a version with no migration path is `Invalid`; an unknown codec id is rejected before payload decoding.
 - Version 1 is the first binary schema. `decode_binary` dispatches on the envelope version and version 1 decodes through the frozen v1 schema. When the document schema bumps, add a frozen v1 reader (or an explicit v1 → v2 migration) instead of editing the v1 structs; never renumber variants, fields or codec ids.
-- Both JSON and binary loads funnel into `finish_document`: normalize the schema version, check element ids against map keys, validate order keys, clear dangling references and normalize inverted rectangles. Hostile-file treatment is therefore identical for both formats.
-- JSON import remains available (`from_json`, `from_value`) with the existing `schemaVersion` migration seam; JSON export remains available (`to_json`, `to_json_pretty`, `to_file_json`). `from_value` stays the wire entry point, and the MCP/agent surface continues to render JSON on demand.
-- A binary document this build cannot decode can still be recovered by importing a JSON export from the build that wrote it. Binary migrations are preferred, but JSON is the documented escape hatch.
-- `from_bytes` auto-detects legacy JSON through the absence of the magic. This is the transition rule for autosaves, unload checkpoints and server mirrors; no separate migration job or key rename is needed.
+- JSON imports and binary loads funnel into `finish_document`: normalize the schema version, check element ids against map keys, validate order keys, clear dangling references and normalize inverted rectangles. Hostile-file treatment is therefore identical for both formats.
+- JSON import remains available (`from_json`, `from_value`) with the existing `schemaVersion` migration seam; JSON export remains available (`to_json`, `to_json_pretty`, `to_file_json`). `from_value` stays the workspace-management import entry point, and the MCP/agent surface continues to render JSON on demand.
+- A binary document this build cannot decode can still be recovered by importing a JSON export from the build that wrote it. Binary migrations are preferred, but JSON import is the documented escape hatch.
+- `from_bytes` accepts only the binary envelope. Bytes without the magic are rejected as `NotBinary`.
 
 ## Consequences
 
-- Autosave writes a `Uint8Array` under `bytes` in IndexedDB instead of a JSON string under `json`; a legacy `json` record is still read and replaced on the next save.
-- `localStorage` is string-only, so unload checkpoints encode the binary envelope as base64 with a `rsc-bin1:` prefix. A checkpoint without the prefix is old JSON and is decoded as UTF-8 bytes.
+- Autosave writes a `Uint8Array` under `bytes` in IndexedDB. Loads read that record only; there is no JSON fallback.
+- `localStorage` is string-only, so unload checkpoints encode the binary envelope as base64 with a `rsc-bin1:` prefix. A value without the prefix is not a checkpoint and is ignored.
 - The server mirror is written from `to_bytes` and loaded with `from_bytes`; rename and merge use the same path. Discussion notes and settings stay JSON because they are not documents.
 - The envelope module (`canvas_core::envelope`) is intentionally reusable for #34: `encode`/`decode`/`is_binary`, `Codec`, and `Envelope { schema_version, codec, payload }`.

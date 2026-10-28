@@ -20,9 +20,6 @@ export function connectAgentBridge(editor, hooks = {}) {
   // Servers can disable document sync (plain static serving for tests); the
   // hello frame says so before any snapshot is sent.
   let syncEnabled = true;
-  // Capability negotiated from hello. Until it says binary_sync, the bridge
-  // speaks the legacy JSON wire both ways.
-  let binarySync = false;
   let lastHint = "";
   const publishHint = (force = false) => {
     if (!syncEnabled || !socket || socket.readyState !== WebSocket.OPEN) return;
@@ -34,31 +31,25 @@ export function connectAgentBridge(editor, hooks = {}) {
 
   // Hand the server the page's current document; the server reconciles it
   // with its mirror and answers with the merged result if anything differs.
-  // Snapshots only travel on connect and resync now — steady state is patches.
-  // The binary path hands wasm's Uint8Array straight to send().
+  // Snapshots only travel on connect and resync — steady state is patches.
   const publishDocument = () => {
     if (!syncEnabled) return;
     if (socket && socket.readyState === WebSocket.OPEN) {
-      socket.send(
-        binarySync ? editor.snapshot_frame_bytes() : editor.snapshot_frame_json(),
-      );
+      socket.send(editor.snapshot_frame_bytes());
     }
   };
 
-  // Deltas committed since the last drain travel as one patch per gesture.
-  // Drain even when disconnected or when the server disabled sync, so the
-  // wasm outbox cannot grow; the snapshot sent on reconnect catches the
-  // server up.
+  // Deltas committed since the last drain travel as one binary patch per
+  // gesture. Drain even when disconnected or when the server disabled sync,
+  // so the wasm outbox cannot grow; the snapshot sent on reconnect catches
+  // the server up.
   const publishChanges = () => {
     if (!syncEnabled || !socket || socket.readyState !== WebSocket.OPEN) {
       editor.discard_outbound();
       return;
     }
-    const frame = binarySync
-      ? editor.take_outbound_frame_bytes()
-      : editor.take_outbound_frame();
-    const empty = typeof frame === "string" ? !frame : !frame?.byteLength;
-    if (empty) return;
+    const frame = editor.take_outbound_frame_bytes();
+    if (!frame?.byteLength) return;
     socket.send(frame);
   };
 
@@ -93,10 +84,10 @@ export function connectAgentBridge(editor, hooks = {}) {
     requestAnimationFrame(step);
   };
 
-  // Binary document frames are routed by their wire kind and decoded by wasm.
+  // Document frames are binary, routed by their wire kind and decoded by wasm.
   // No string is built and JSON.parse/stringify never sees them.
   const handleBinary = (bytes) => {
-    if (!syncEnabled || !binarySync) return;
+    if (!syncEnabled) return;
     const kind = editor.wire_frame_kind(bytes);
     if (kind === 1) {
       if (editor.reconcile_bytes(bytes)) hooks.onRemoteChange?.();
@@ -114,15 +105,22 @@ export function connectAgentBridge(editor, hooks = {}) {
     }
     if (message.type === "hello") {
       syncEnabled = message.sync !== false;
-      binarySync = Number.isInteger(message.binary_sync) && message.binary_sync >= 1;
       hooks.onDiscussionChange?.(message.discussion, message.discussion_persisted);
       if (message.settings) {
         hooks.onSettingsChange?.(message.settings);
       }
       publishHint(true);
-      // The upload waits for hello so its encoding matches the server's
-      // advertised capability. A legacy server gets JSON, as it always did.
+      // The upload waits for hello so a server with document sync disabled
+      // receives nothing.
       publishDocument();
+      return;
+    }
+    if (message.type === "synced") {
+      // The acknowledgement carries the revision no correction patch needed
+      // to repeat, so the next snapshot has an accurate base.
+      if (Number.isSafeInteger(message.rev) && message.rev >= 0) {
+        editor.set_wire_revision(message.rev);
+      }
       return;
     }
     if (message.type === "discussion") {
@@ -137,20 +135,6 @@ export function connectAgentBridge(editor, hooks = {}) {
       if (reducedMotion()) message.animate = false;
       if (editor.apply_view_command(JSON.stringify(message))) {
         pumpAnimations();
-      }
-      return;
-    }
-    if (message.type === "snapshot" && message.doc) {
-      if (!syncEnabled) return;
-      if (editor.reconcile_json(JSON.stringify(message.doc))) {
-        hooks.onRemoteChange?.();
-      }
-      return;
-    }
-    if (message.type === "patch" && Array.isArray(message.put)) {
-      if (!syncEnabled) return;
-      if (editor.merge_patch_json(JSON.stringify(message.put))) {
-        hooks.onRemoteChange?.();
       }
       return;
     }
@@ -192,9 +176,6 @@ export function connectAgentBridge(editor, hooks = {}) {
     const scheme = location.protocol === "https:" ? "wss" : "ws";
     const workspace = hooks.workspace || "default";
     const params = new URLSearchParams({ ws: workspace });
-    // Test/simulation hook: `?wire=json` makes the server withhold the
-    // capability, standing in for an old server.
-    if (hooks.wire === "json") params.set("wire", "json");
     socket = new WebSocket(`${scheme}://${location.host}/ws?${params}`);
 
     // Binary frames must arrive as ArrayBuffer, never Blob: the hot path
@@ -204,14 +185,11 @@ export function connectAgentBridge(editor, hooks = {}) {
     socket.addEventListener("open", () => {
       retry = RETRY_MIN_MS;
       lastHint = "";
-      binarySync = false;
       window.__rsAgentConnected = true;
-      // Register this page and its view immediately, before hello decides the
-      // document encoding: the agent's current-workspace resolution follows
-      // page activity. Hints are control frames and stay JSON.
+      // Register this page and its view immediately: the agent's
+      // current-workspace resolution follows page activity. Hints are control
+      // frames and stay JSON. The document upload happens on hello.
       publishHint(true);
-      // The document upload happens on hello, once the server has advertised
-      // whether it speaks the binary wire.
     });
 
     socket.addEventListener("message", (event) => {
@@ -265,7 +243,6 @@ export function connectAgentBridge(editor, hooks = {}) {
 
   const close = () => {
     stopped = true;
-    binarySync = false;
     window.__rsAgentConnected = false;
     socket?.close();
   };

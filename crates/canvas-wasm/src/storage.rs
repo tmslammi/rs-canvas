@@ -1,8 +1,7 @@
 //! Rust-owned persistence: the current document autosaves to IndexedDB.
 //!
-//! Records written since the binary format store a `Uint8Array` under `bytes`;
-//! records from older builds store a JSON string under `json`. Loads read
-//! either and the next save replaces the whole record with binary.
+//! Each record stores the binary document envelope as a `Uint8Array` under
+//! `bytes`. Loads read that record only.
 
 use idb::builder::{DatabaseBuilder, ObjectStoreBuilder};
 use idb::{Database, KeyPath, Query, TransactionMode};
@@ -71,11 +70,7 @@ pub async fn save_document(bytes: &[u8], workspace: &str) -> Result<(), String> 
     Ok(())
 }
 
-/// Load the current autosave, if any, as raw document bytes.
-///
-/// Binary records are returned as stored. A legacy JSON string is returned as
-/// its UTF-8 bytes; `serialization::from_bytes` auto-detects it and the next
-/// autosave upgrades the record.
+/// Load the current autosave, if any, as raw binary document bytes.
 pub async fn load_document(workspace: &str) -> Result<Option<Vec<u8>>, String> {
     let db = open().await?;
     let transaction = db
@@ -94,11 +89,10 @@ pub async fn load_document(workspace: &str) -> Result<Option<Vec<u8>>, String> {
     if bytes.is_instance_of::<Uint8Array>() {
         return Ok(Some(Uint8Array::from(bytes).to_vec()));
     }
-    let json = js_sys::Reflect::get(&value, &"json".into()).map_err(error_string)?;
-    Ok(json.as_string().map(String::into_bytes))
+    Ok(None)
 }
 
-/// Discover autosaves written before the browser catalogue existed.
+/// List this browser's workspace autosaves from their IndexedDB keys.
 pub async fn list_workspaces() -> Result<Vec<String>, String> {
     let db = open().await?;
     let transaction = db

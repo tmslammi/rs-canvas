@@ -1,10 +1,10 @@
 //! Version 1 binary payload: a compact, explicit schema for the document
 //! model.
 //!
-//! The JSON representation is shaped for people and the wire (field names,
-//! internally tagged enums, `flatten`), which makes it a poor fit for
+//! The JSON representation is shaped for people and import/export (field
+//! names, internally tagged enums, `flatten`), which makes it a poor fit for
 //! positional binary codecs. This module keeps a frozen, deliberately plain
-//! mirror of the model for persistence:
+//! mirror of the model for persistence and the wire:
 //!
 //! * structs become positional fields in declaration order;
 //! * enums become a variant index plus positional fields;

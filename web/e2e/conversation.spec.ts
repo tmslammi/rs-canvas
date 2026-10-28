@@ -16,7 +16,7 @@ test("explore, revise, back out and revisit an engineering discussion", async ({
   await new Promise<void>((resolve) => listener.close(() => resolve()));
   const base = `http://127.0.0.1:${port}`;
   const binary = path.resolve(process.cwd(), "..", "target", "debug", "canvas-server");
-  const start = () => spawn(binary, ["--web", ".", "--port", `${port}`, "--doc", path.join(dir, "current.json")], { cwd: process.cwd(), stdio: "ignore" });
+  const start = () => spawn(binary, ["--web", ".", "--port", `${port}`, "--doc", path.join(dir, "current.rsc")], { cwd: process.cwd(), stdio: "ignore" });
   const ready = async () => {
     await expect.poll(async () => {
       try { return (await request.get(base)).ok(); } catch { return false; }

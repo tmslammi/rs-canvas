@@ -48,16 +48,15 @@ impl Patch {
         Patch { put }
     }
 
-    /// Merge every element into `doc`; returns the ids that changed (empty
-    /// when the patch was fully stale).
+    /// Merge every element into `doc` through the shared reconcile policy;
+    /// returns the ids that changed (empty when the patch was fully stale).
+    /// Index collisions are resolved exactly as a snapshot merge would.
     pub fn apply_to(&self, doc: &mut Document) -> Vec<ElementId> {
-        let mut changed = Vec::new();
-        for element in &self.put {
-            if merge_element(doc, element) {
-                changed.push(element.id.clone());
-            }
-        }
-        changed
+        crate::merge::merge_elements(doc, &self.put)
+            .changed
+            .into_iter()
+            .map(|change| change.after.id)
+            .collect()
     }
 }
 
