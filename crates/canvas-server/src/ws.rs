@@ -12,7 +12,6 @@
 //! A connection belongs to exactly one workspace, named by the `?ws=` query
 //! parameter (ADR-0007); without one it lands on `default`.
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -58,11 +57,11 @@ async fn connected(mut socket: WebSocket, state: Arc<AppState>, workspace: Arc<W
     if !state.register_page(&workspace).await {
         return;
     }
-    let pages = workspace.pages.load(Ordering::SeqCst);
-    tracing::info!(pages, workspace = %workspace.name, "page connected");
+    let pages = workspace.page_count();
+    tracing::info!(pages, workspace = %workspace.name(), "page connected");
     // Subscribe before capturing initial state; concurrent edits/notes can then
     // be replayed rather than disappearing between hello and subscription.
-    let mut to_pages = workspace.to_pages.subscribe();
+    let mut to_pages = workspace.subscribe();
 
     let settings = state.current_settings().await;
     let hello = serde_json::json!({
@@ -70,10 +69,10 @@ async fn connected(mut socket: WebSocket, state: Arc<AppState>, workspace: Arc<W
         "server": "rs-canvas",
         "version": env!("CARGO_PKG_VERSION"),
         "sync": state.sync,
-        "workspace": workspace.name,
+        "workspace": workspace.name(),
         "settings": settings,
-        "discussion": workspace.discussion.lock().await.clone(),
-        "discussion_persisted": workspace.doc_path.is_some(),
+        "discussion": workspace.discussion().await,
+        "discussion_persisted": workspace.discussion_persisted(),
     });
     let hello = hello.to_string();
 
@@ -109,8 +108,8 @@ async fn connected(mut socket: WebSocket, state: Arc<AppState>, workspace: Arc<W
                             break;
                         }
                         let discussion = serde_json::json!({
-                            "type": "discussion", "discussion": workspace.discussion.lock().await.clone(),
-                            "discussion_persisted": workspace.doc_path.is_some(),
+                            "type": "discussion", "discussion": workspace.discussion().await,
+                            "discussion_persisted": workspace.discussion_persisted(),
                         }).to_string();
                         if socket.send(Message::Text(discussion.into())).await.is_err() {
                             break;
@@ -124,7 +123,7 @@ async fn connected(mut socket: WebSocket, state: Arc<AppState>, workspace: Arc<W
                         if !state.sync {
                             continue;
                         }
-                        if workspace.retired.load(Ordering::SeqCst) { break; }
+                        if workspace.is_retired() { break; }
                         if let Ok(frame) = serde_json::from_str::<Value>(&text) {
                             workspace.note_page_activity();
                             handle_frame(&state, &workspace, &frame).await;
@@ -134,7 +133,7 @@ async fn connected(mut socket: WebSocket, state: Arc<AppState>, workspace: Arc<W
                         if !state.sync {
                             continue;
                         }
-                        if workspace.retired.load(Ordering::SeqCst) { break; }
+                        if workspace.is_retired() { break; }
                         workspace.note_page_activity();
                         if let Some(outcome) = handle_binary_frame(&workspace, id, &bytes).await {
                             fallback_armed = false;
@@ -157,10 +156,10 @@ async fn connected(mut socket: WebSocket, state: Arc<AppState>, workspace: Arc<W
         }
     }
 
-    workspace.pages.fetch_sub(1, Ordering::SeqCst);
+    workspace.release_page();
     state.release_workspace(&workspace).await;
-    let remaining = workspace.pages.load(Ordering::SeqCst);
-    tracing::info!(pages = remaining, workspace = %workspace.name, "page disconnected");
+    let remaining = workspace.page_count();
+    tracing::info!(pages = remaining, workspace = %workspace.name(), "page disconnected");
 }
 
 /// Send one broadcast frame: JSON for control, binary for documents.
@@ -223,7 +222,7 @@ async fn handle_frame(state: &Arc<AppState>, workspace: &Arc<Workspace>, frame: 
                     .get("cancelled")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                let _ = workspace.present_acks.send((id, cancelled));
+                workspace.acknowledge_presentation(id, cancelled);
             }
         }
         Some("screenshot_done") => {
@@ -232,12 +231,12 @@ async fn handle_frame(state: &Arc<AppState>, workspace: &Arc<Workspace>, frame: 
                     .get("data_url")
                     .and_then(|v| v.as_str())
                     .map(str::to_string);
-                let _ = workspace.screenshot_replies.send((id, data_url));
+                workspace.reply_screenshot(id, data_url);
             }
         }
         Some("hint") => {
             if let Ok(hint) = serde_json::from_value::<crate::state::ViewHint>(frame.clone()) {
-                *workspace.view_hint.lock().await = Some(hint);
+                workspace.set_view_hint(hint).await;
             }
         }
         Some("settings") => {

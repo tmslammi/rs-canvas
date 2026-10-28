@@ -8,10 +8,12 @@ mod storage;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap};
 
+use canvas_core::paint::{self, Surface, ViewSnapshot};
 use canvas_core::{
     wire, Affine, ArrowHandle, Camera, CameraTween, Dash, Document, DrawOp, Editor as CoreEditor,
-    Effects, FillStyle, Modifiers, Point, PurgeLedger, Rect, Renderer, ShellAction, StrokeStyle,
-    StylePatch, TextAlign, TextMeasurer, TextOp, Tool,
+    Effects, FillStyle, FrameApply, Modifiers, PageSession, PendingFrame, Point,
+    PresentationAdvance, PresentationCues, Rect, Renderer, ShellAction, StrokeStyle, StylePatch,
+    TextAlign, TextMeasurer, TextOp, Tool, DEFAULT_PRESENT_ZOOM_CAP,
 };
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -27,24 +29,8 @@ const GRID_MIN_SPACING_PX: f64 = 6.0;
 const CAMERA_TWEEN_MS: u64 = 380;
 /// How long a `point` highlight pulses for.
 const PULSE_MS: u64 = 1100;
-/// Focus never zooms past this unless the server grants a higher cap: small
-/// elements should not cause a dramatic jump.
-const DEFAULT_FOCUS_MAX_ZOOM: f64 = 2.0;
 /// A focus target already inside the viewport by this margin is left alone.
 const FOCUS_MARGIN_PX: f64 = 32.0;
-/// Below this zoom the renderer switches to the batched overview (LOD) path:
-/// one filled rect per element, grouped by color into a single fill each,
-/// text skipped. At 0.25 a 140-unit shape covers 35 screen px and hachure
-/// gaps are sub-pixel, so rough detail is imperceptible — while full ops
-/// would submit ~5 Canvas2D calls per element (500k calls at 100k elements).
-/// Interaction and hit-testing still use full geometry; zooming back in
-/// restores exact hand-drawn rendering with no invalidation lag (same frame).
-const LOD_ZOOM: f64 = 0.25;
-
-fn default_zoom_cap() -> f64 {
-    DEFAULT_FOCUS_MAX_ZOOM
-}
-
 /// Clamp a camera's zoom without moving the world point at its centre.
 fn cap_zoom(camera: Camera, viewport: (f64, f64), cap: f64) -> Camera {
     if camera.zoom <= cap {
@@ -216,6 +202,22 @@ impl Renderer for Canvas2dRenderer {
         // state in `end_frame`, which also drops this clip.
     }
 
+    fn fill_rects(&mut self, rects: &[Rect], color: &str) {
+        if rects.is_empty() {
+            return;
+        }
+        self.ctx.begin_path();
+        for rect in rects {
+            // Sub-pixel boxes still paint a hairline so dense overviews read
+            // solid instead of sparkling.
+            self.ctx
+                .rect(rect.x, rect.y, rect.w.max(0.5), rect.h.max(0.5));
+        }
+        self.ctx.set_fill_style_str(color);
+        self.ctx.set_global_alpha(1.0);
+        self.ctx.fill();
+    }
+
     fn draw_path(&mut self, op: &canvas_core::PathOp) {
         if op.points.len() < 2 {
             return;
@@ -279,65 +281,12 @@ impl Renderer for Canvas2dRenderer {
     }
 }
 
-/// The camera the scene canvas currently shows, so a pan can shift the
-/// existing pixels instead of redrawing the whole document.
-#[derive(Clone, Copy)]
-struct ViewSnapshot {
-    scroll: Point,
-    zoom: f64,
-    width: u32,
-    height: u32,
-}
-
 /// A fading highlight ring the agent asked for; view state only.
 #[derive(Clone, Copy)]
 struct Pulse {
     bounds: Rect,
     started_ms: u64,
     duration_ms: u64,
-}
-
-/// One step of an agent presentation timeline.
-#[derive(Clone, Debug, serde::Deserialize)]
-struct PresentStep {
-    #[serde(default)]
-    reveal: Vec<canvas_core::ElementId>,
-    #[serde(default)]
-    focus: Option<canvas_core::ElementId>,
-    #[serde(default)]
-    point: Option<canvas_core::ElementId>,
-    #[serde(default)]
-    caption: Option<String>,
-    #[serde(default)]
-    hold_ms: u64,
-}
-
-#[derive(Clone, Debug, serde::Deserialize)]
-struct PresentScript {
-    id: u64,
-    steps: Vec<PresentStep>,
-    #[serde(default = "default_zoom_cap")]
-    zoom_cap: f64,
-}
-
-/// Playback of an agent explanation: the document is already final; this is
-/// the reveal frontier, caption and camera cue over it. View state only.
-struct Presentation {
-    id: u64,
-    steps: Vec<PresentStep>,
-    index: usize,
-    step_started_ms: u64,
-    /// Elements not yet revealed.
-    hidden: BTreeSet<canvas_core::ElementId>,
-    caption: Option<String>,
-    /// The server's zoom cap for focus beats.
-    zoom_cap: f64,
-}
-
-#[derive(Clone, Debug, serde::Serialize)]
-struct PresentOutcome {
-    id: u64,
-    cancelled: bool,
 }
 
 /// The editor handle the shell talks to.
@@ -363,22 +312,9 @@ pub struct Editor {
     tween: Option<CameraTween>,
     /// Agent highlight pulse in flight, if any (view state only).
     pulse: Option<Pulse>,
-    /// A server snapshot that arrived mid-gesture, applied on pointer-up.
-    pending_remote: Option<Vec<u8>>,
-    /// Server patches that arrived mid-gesture, applied on pointer-up.
-    pending_patches: Vec<Vec<u8>>,
-    /// The last server revision this page has seen (a binary frame header or
-    /// the `synced` acknowledgement). Outbound snapshot and patch frames carry
-    /// it as the page's base revision; merging never depends on it.
-    wire_revision: u64,
-    /// Explicit deletions whose element entry was purged locally (undo of a
-    /// creation). The live document has no entry left, so the ledger is folded
-    /// into snapshots and autosaves; absence alone is never a deletion.
-    purge_ledger: PurgeLedger,
-    /// Agent explanation playback in flight, if any (view state only).
-    presentation: Option<Presentation>,
-    /// Finished/cancelled playbacks the shell must acknowledge.
-    present_outcomes: Vec<PresentOutcome>,
+    /// Browser-free page state: base revision, purge ledger, deferred frames,
+    /// outbound projection and presentation playback.
+    page: PageSession,
 }
 
 fn offscreen_ctx() -> Result<CanvasRenderingContext2d, JsValue> {
@@ -442,12 +378,7 @@ impl Editor {
             last_paint: None,
             tween: None,
             pulse: None,
-            pending_remote: None,
-            pending_patches: Vec::new(),
-            wire_revision: 0,
-            purge_ledger: PurgeLedger::default(),
-            presentation: None,
-            present_outcomes: Vec::new(),
+            page: PageSession::new(),
         };
         editor
             .core
@@ -482,17 +413,17 @@ impl Editor {
     pub fn new_document(&mut self) {
         // View preferences survive replacing the document.
         let (grid_visible, snap_to_grid, grid_size) = (
-            self.core.grid_visible,
-            self.core.snap_to_grid,
-            self.core.grid_size,
+            self.core.grid_visible(),
+            self.core.snap_enabled(),
+            self.core.grid_size(),
         );
-        let zoom_sensitivity = self.core.nav.zoom_sensitivity();
+        let zoom_sensitivity = self.core.nav().zoom_sensitivity();
         self.core = CoreEditor::new(Document::new());
-        self.purge_ledger.clear();
-        self.core.grid_visible = grid_visible;
-        self.core.snap_to_grid = snap_to_grid;
-        self.core.grid_size = grid_size;
-        self.core.nav.set_zoom_sensitivity(zoom_sensitivity);
+        self.page.clear_purge_ledger();
+        self.core.set_grid_visible(grid_visible);
+        self.core.set_snap_enabled(snap_to_grid);
+        self.core.set_grid_size(grid_size);
+        self.core.nav_mut().set_zoom_sensitivity(zoom_sensitivity);
         self.core
             .set_measurer(Box::new(FontMeasurer::new(self.measure_ctx.clone())));
         self.core.set_viewport(self.css_width(), self.css_height());
@@ -509,7 +440,7 @@ impl Editor {
     pub fn load_benchmark_fixture(&mut self, count: usize) {
         let doc = canvas_core::benchmark_fixture(count);
         let effects = self.core.replace_document(doc);
-        self.purge_ledger.clear();
+        self.page.clear_purge_ledger();
         self.apply(effects);
     }
 
@@ -518,7 +449,7 @@ impl Editor {
     pub fn load_connected_fixture(&mut self, nodes: usize, arrows_per_node: usize) {
         let doc = canvas_core::benchmark::connected_fixture(nodes, arrows_per_node);
         let effects = self.core.replace_document(doc);
-        self.purge_ledger.clear();
+        self.page.clear_purge_ledger();
         self.apply(effects);
     }
 
@@ -559,8 +490,7 @@ impl Editor {
     /// revision is the page's base), then the versioned document envelope.
     /// No JSON pass and no string.
     pub fn snapshot_frame_bytes(&self) -> Vec<u8> {
-        let doc = self.synced_document();
-        wire::encode_snapshot(self.wire_revision, &doc).unwrap_or_default()
+        self.page.snapshot_frame(self.core.document())
     }
 
     /// Record the server revision carried by the `synced` control frame.
@@ -569,7 +499,7 @@ impl Editor {
     /// next snapshot uploads a truthful base.
     pub fn set_wire_revision(&mut self, revision: f64) {
         if revision.is_finite() && revision >= 0.0 {
-            self.wire_revision = revision as u64;
+            self.page.set_wire_revision(revision as u64);
         }
     }
 
@@ -578,11 +508,15 @@ impl Editor {
     /// A snapshot that lands mid-gesture is deferred to pointer-up: replacing
     /// the document under an in-flight drag would corrupt the gesture.
     pub fn reconcile_bytes(&mut self, bytes: &[u8]) -> Result<bool, JsValue> {
-        if self.core.is_interacting() {
-            self.pending_remote = Some(bytes.to_vec());
-            return Ok(false);
+        match self.page.apply_snapshot(&mut self.core, bytes) {
+            Ok(FrameApply::Deferred | FrameApply::Unchanged) => Ok(false),
+            Ok(FrameApply::Changed { .. }) => {
+                self.last_paint = None;
+                self.render();
+                Ok(true)
+            }
+            Err(error) => Err(JsValue::from_str(&error.to_string())),
         }
-        self.reconcile_bytes_now(bytes)
     }
 
     /// The kind of a wire frame (1 snapshot, 2 patch, 0 malformed). The shell
@@ -596,32 +530,29 @@ impl Editor {
     /// frame: header, revision, then the frozen v1 element list. No JSON pass
     /// and no string.
     pub fn take_outbound_frame_bytes(&mut self) -> Vec<u8> {
-        let Some(patch) = self.take_outbound_patch() else {
-            return Vec::new();
-        };
-        wire::encode_patch(self.wire_revision, &patch.put).unwrap_or_default()
+        let deltas = self.core.drain_outbox();
+        self.page.take_outbound_frame(&deltas, now_ms())
     }
 
     /// Drop pending deltas without projecting them; the reconnect snapshot
     /// carries the document instead. Purges still enter the ledger so the
     /// snapshot cannot forget an explicit deletion.
     pub fn discard_outbound(&mut self) {
-        let deltas = self.core.history.drain_outbox();
-        if deltas.is_empty() {
-            return;
-        }
-        let projected = canvas_core::Patch::from_deltas(&deltas, now_ms());
-        self.purge_ledger.record(&deltas, &projected);
+        let deltas = self.core.drain_outbox();
+        self.page.discard_outbound(&deltas, now_ms());
     }
 
     /// Merge a binary patch wire frame. Elements are merged per element with
     /// last-writer-wins. Mid-gesture patches are deferred to pointer-up.
     pub fn merge_patch_bytes(&mut self, bytes: &[u8]) -> Result<bool, JsValue> {
-        if self.core.is_interacting() {
-            self.pending_patches.push(bytes.to_vec());
-            return Ok(false);
+        match self.page.apply_patch(&mut self.core, bytes) {
+            Ok(FrameApply::Deferred | FrameApply::Unchanged) => Ok(false),
+            Ok(FrameApply::Changed { ids }) => {
+                self.paint_remote_change(ids);
+                Ok(true)
+            }
+            Err(error) => Err(JsValue::from_str(&error.to_string())),
         }
-        self.merge_patch_bytes_now(bytes)
     }
 
     /// Serialize the document and hand it to storage (the shell's debounced
@@ -639,7 +570,7 @@ impl Editor {
 
     /// Export the drawing as a standalone SVG.
     pub fn export_svg(&self) -> String {
-        canvas_core::svg::to_svg(&self.core.doc, self.core.measurer())
+        canvas_core::svg::to_svg(self.core.document(), self.core.measurer())
     }
 
     /// Export the drawing as a PNG data URL at the requested scale.
@@ -651,8 +582,7 @@ impl Editor {
         }
         let bounds = self
             .core
-            .scene
-            .bounds()
+            .scene_bounds()
             .unwrap_or(Rect::new(0.0, 0.0, 100.0, 100.0))
             .expand(16.0);
         let scale = scale.clamp(0.25, 4.0);
@@ -677,12 +607,12 @@ impl Editor {
         let mut renderer = Canvas2dRenderer::new(ctx);
         renderer.clear(BACKGROUND);
         renderer.set_transform(Affine::translate(-bounds.x, -bounds.y).then(Affine::scale(scale)));
-        self.core.scene.flush_pending_ops();
-        if let Some(all) = self.core.scene.cached_bounds() {
+        self.core.flush_pending_ops();
+        if let Some(all) = self.core.cached_scene_bounds() {
             self.core.ensure_area(all);
         }
-        self.core.scene.flush_all_preview_stale();
-        for layer in &self.core.scene.layers {
+        self.core.flush_all_preview_stale();
+        for layer in self.core.scene_layers() {
             renderer.draw_ops(&layer.ops);
         }
         canvas.to_data_url_with_type("image/png")
@@ -718,18 +648,18 @@ impl Editor {
             .ok_or_else(|| JsValue::from_str("no 2d context"))?
             .dyn_into::<CanvasRenderingContext2d>()?;
 
-        let hidden = self.presentation.as_ref().map(|p| &p.hidden);
+        let hidden = self.page.hidden_elements();
         let editing = self.core.editing_text_id().map(str::to_string);
         let skip =
             |id: &str| editing.as_deref() == Some(id) || hidden.is_some_and(|set| set.contains(id));
         let mut renderer = Canvas2dRenderer::new(ctx);
         renderer.clear(BACKGROUND);
-        renderer.set_transform(self.core.camera.transform().then(Affine::scale(scale)));
-        let viewport = self.core.camera.viewport(css_w, css_h);
-        self.core.scene.flush_pending_ops();
+        renderer.set_transform(self.core.camera().transform().then(Affine::scale(scale)));
+        let viewport = self.core.camera().viewport(css_w, css_h);
+        self.core.flush_pending_ops();
         self.core.ensure_area(viewport);
-        self.core.scene.flush_preview_stale(viewport);
-        for layer in self.core.scene.visible(viewport) {
+        self.core.flush_preview_stale(viewport);
+        for layer in self.core.visible_layers(viewport) {
             if skip(&layer.element_id) {
                 continue;
             }
@@ -743,7 +673,7 @@ impl Editor {
         let doc = canvas_core::serialization::from_json(json)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
         let effects = self.core.replace_document(doc);
-        self.purge_ledger.clear();
+        self.page.clear_purge_ledger();
         self.apply(effects);
         Ok(())
     }
@@ -753,7 +683,7 @@ impl Editor {
         let doc = canvas_core::serialization::from_bytes(bytes)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
         let effects = self.core.replace_document(doc);
-        self.purge_ledger.clear();
+        self.page.clear_purge_ledger();
         self.apply(effects);
         Ok(())
     }
@@ -787,27 +717,27 @@ impl Editor {
     }
 
     pub fn scroll(&self) -> Vec<f64> {
-        vec![self.core.camera.scroll.x, self.core.camera.scroll.y]
+        vec![self.core.camera().scroll.x, self.core.camera().scroll.y]
     }
 
     pub fn zoom(&self) -> f64 {
-        self.core.camera.zoom
+        self.core.camera().zoom
     }
 
     pub fn element_count(&self) -> usize {
-        self.core.doc.live_count()
+        self.core.document().live_count()
     }
 
     pub fn active_tool(&self) -> String {
-        self.core.tool.name().into()
+        self.core.tool().name().into()
     }
 
     pub fn can_undo(&self) -> bool {
-        self.core.history.can_undo()
+        self.core.can_undo()
     }
 
     pub fn can_redo(&self) -> bool {
-        self.core.history.can_redo()
+        self.core.can_redo()
     }
 
     /// Selection bounds in world space, or undefined.
@@ -825,59 +755,59 @@ impl Editor {
     }
 
     pub fn toggle_tool_lock(&mut self) {
-        self.core.tool_locked = !self.core.tool_locked;
+        self.core.toggle_tool_lock();
     }
 
     pub fn is_tool_locked(&self) -> bool {
-        self.core.tool_locked
+        self.core.tool_locked()
     }
 
     /// Show or hide the optional grid.
     pub fn set_grid_visible(&mut self, visible: bool) {
-        self.core.grid_visible = visible;
+        self.core.set_grid_visible(visible);
         self.draw_grid();
     }
 
     pub fn grid_visible(&self) -> bool {
-        self.core.grid_visible
+        self.core.grid_visible()
     }
 
     /// Set the grid spacing (world units). Out-of-range values are clamped;
     /// non-finite values are ignored.
     pub fn set_grid_size(&mut self, size: f64) {
         if size.is_finite() {
-            self.core.grid_size = size.clamp(4.0, 400.0);
+            self.core.set_grid_size(size.clamp(4.0, 400.0));
             self.draw_grid();
         }
     }
 
     pub fn grid_size(&self) -> f64 {
-        self.core.grid_size
+        self.core.grid_size()
     }
 
     /// Multiplier on wheel-zoom strength (1 is the tuned default).
     pub fn set_zoom_sensitivity(&mut self, sensitivity: f64) {
-        self.core.nav.set_zoom_sensitivity(sensitivity);
+        self.core.nav_mut().set_zoom_sensitivity(sensitivity);
     }
 
     pub fn zoom_sensitivity(&self) -> f64 {
-        self.core.nav.zoom_sensitivity()
+        self.core.nav().zoom_sensitivity()
     }
 
     /// Enable or disable snapping edits to the grid.
     pub fn set_snap_enabled(&mut self, enabled: bool) {
-        self.core.snap_to_grid = enabled;
+        self.core.set_snap_enabled(enabled);
     }
 
     pub fn snap_enabled(&self) -> bool {
-        self.core.snap_to_grid
+        self.core.snap_enabled()
     }
 
     /// Load the seed demo: a small cloud architecture to explore.
     pub fn seed_demo(&mut self) {
         let doc = canvas_core::demo_document();
         let effects = self.core.replace_document(doc);
-        self.purge_ledger.clear();
+        self.page.clear_purge_ledger();
         self.apply(effects);
     }
 
@@ -893,156 +823,13 @@ impl Editor {
 
     /// Draw everything visible for this frame.
     pub fn render(&mut self) {
-        if self.core.camera.zoom < LOD_ZOOM {
-            self.render_lod();
-            return;
-        }
-        // Bulk drift defers cached-point shifts (bounds move eagerly); the
-        // first full-detail frame after a drift pays one flush. LOD frames
-        // never touch ops, so drift loops at overview zoom skip it entirely.
-        self.core.scene.flush_pending_ops();
-        let (w, h) = self.core.viewport_size();
-        let viewport = self.core.camera.viewport(w, h);
-        self.core.ensure_area(viewport);
-        self.core.scene.flush_preview_stale(viewport);
-        // During playback, unrevealed elements stay off the canvas. The
-        // document is final the whole time; this is view state only.
-        // Borrowed, never cloned: the old per-frame BTreeSet clone cost
-        // O(hidden) allocations on every frame even when idle.
-        let hidden = self.presentation.as_ref().map(|p| &p.hidden);
-        // The shell's textarea is the live copy of the text being edited;
-        // painting the committed element underneath would ghost two versions.
-        let editing = self.core.editing_text_id();
-        let skip = |id: &str| editing == Some(id) || hidden.is_some_and(|set| set.contains(id));
-        let transform = self.core.camera.transform().then(Affine::scale(self.dpr));
-        {
-            let scene = &self.core.scene;
-            let renderer = &mut self.renderer;
-            renderer.begin_frame();
-            renderer.clear(BACKGROUND);
-            renderer.set_transform(transform);
-            // Contains-all fast path: the cached union makes the check O(1);
-            // overviews skip 100k per-layer intersection tests.
-            let all_visible = scene
-                .cached_bounds()
-                .is_some_and(|b| viewport_contains(&viewport, &b));
-            if all_visible {
-                for layer in scene.all_layers() {
-                    if skip(&layer.element_id) {
-                        continue;
-                    }
-                    renderer.draw_ops(&layer.ops);
-                }
-            } else {
-                for layer in scene.visible(viewport) {
-                    if skip(&layer.element_id) {
-                        continue;
-                    }
-                    renderer.draw_ops(&layer.ops);
-                }
-            }
-            renderer.end_frame();
-        }
-        self.draw_overlay();
-        self.remember_view();
-    }
-
-    /// Zoomed-out overview: batched rects grouped by color, text skipped.
-    /// Same layout and palette as full rendering at a fraction of the
-    /// submission cost; zooming back in flushes the deferred drift once and
-    /// restores exact ink (full ops stay cached, bounds stay exact throughout).
-    fn render_lod(&mut self) {
-        let (w, h) = self.core.viewport_size();
-        let viewport = self.core.camera.viewport(w, h);
-        let hidden = self.presentation.as_ref().map(|p| &p.hidden);
-        let editing = self.core.editing_text_id();
-        let skip = |id: &str| editing == Some(id) || hidden.is_some_and(|set| set.contains(id));
-        let transform = self.core.camera.transform().then(Affine::scale(self.dpr));
-        let renderer = &mut self.renderer;
-        renderer.begin_frame();
-        renderer.clear(BACKGROUND);
-        renderer.set_transform(transform);
-        // Collect the palette indices present in this view (a handful for
-        // diagram boards) so each color submits exactly one fill. Integer
-        // compares only — no per-frame string work. Two passes over layers,
-        // zero per-rect allocation.
-        let all_visible = self
-            .core
-            .scene
-            .cached_bounds()
-            .is_some_and(|b| viewport_contains(&viewport, &b));
-        // Pass 1: distinct palette indices, in first-seen (z) order.
-        let mut lod_present: Vec<u32> = Vec::new();
-        if all_visible {
-            for layer in self.core.scene.all_layers() {
-                let Some(idx) = layer.lod else {
-                    continue;
-                };
-                if skip(&layer.element_id) {
-                    continue;
-                }
-                if !lod_present.contains(&idx) {
-                    lod_present.push(idx);
-                    if lod_present.len() >= 64 {
-                        break;
-                    }
-                }
-            }
-        } else {
-            for layer in self.core.scene.visible(viewport) {
-                let Some(idx) = layer.lod else {
-                    continue;
-                };
-                if skip(&layer.element_id) {
-                    continue;
-                }
-                if !lod_present.contains(&idx) {
-                    lod_present.push(idx);
-                    if lod_present.len() >= 64 {
-                        break;
-                    }
-                }
-            }
-        }
-        // Pass 2: one path + fill per palette entry. `rect` calls stay in
-        // world space under the scene transform; sub-pixel boxes still paint
-        // a hairline so dense overviews read solid instead of sparkling.
-        // Palette strings are cloned once per color per frame (a handful of
-        // small allocs); rects stream with no allocation.
-        let palette: Vec<String> = self.core.scene.palette().to_vec();
-        for idx in &lod_present {
-            let Some(color) = palette.get(*idx as usize) else {
-                continue;
-            };
-            renderer.ctx.begin_path();
-            if all_visible {
-                for layer in self.core.scene.all_layers() {
-                    if layer.lod != Some(*idx) {
-                        continue;
-                    }
-                    if skip(&layer.element_id) {
-                        continue;
-                    }
-                    let b = layer.bounds;
-                    renderer.ctx.rect(b.x, b.y, b.w.max(0.5), b.h.max(0.5));
-                }
-            } else {
-                for layer in self.core.scene.visible(viewport) {
-                    if layer.lod != Some(*idx) {
-                        continue;
-                    }
-                    if skip(&layer.element_id) {
-                        continue;
-                    }
-                    let b = layer.bounds;
-                    renderer.ctx.rect(b.x, b.y, b.w.max(0.5), b.h.max(0.5));
-                }
-            }
-            renderer.ctx.set_fill_style_str(color);
-            renderer.ctx.set_global_alpha(1.0);
-            renderer.ctx.fill();
-        }
-        renderer.end_frame();
+        let surface = self.paint_surface();
+        paint::render(
+            &mut self.core,
+            &mut self.renderer,
+            &surface,
+            self.page.hidden_elements(),
+        );
         self.draw_overlay();
         self.remember_view();
     }
@@ -1097,7 +884,7 @@ impl Editor {
     /// Abort an interrupted pointer gesture instead of committing its last
     /// preview. Used by browser pointer cancellation and touch pinch takeover.
     pub fn pointer_cancel(&mut self) {
-        self.core.nav.cancel();
+        self.core.nav_mut().cancel();
         if self.core.is_interacting() {
             let effects = self.core.cancel();
             self.apply(effects);
@@ -1113,9 +900,7 @@ impl Editor {
         }
         self.cancel_camera_transition();
         self.cancel_presentation();
-        self.core
-            .nav
-            .wheel(&mut self.core.camera, Point::new(x, y), dx, dy, ctrl);
+        self.core.wheel(Point::new(x, y), dx, dy, ctrl);
         if !self.try_paint_pan_current() {
             self.render();
         }
@@ -1127,7 +912,7 @@ impl Editor {
         }
         self.cancel_camera_transition();
         self.cancel_presentation();
-        self.core.camera.zoom_at(Point::new(x, y), factor);
+        self.core.camera_mut().zoom_at(Point::new(x, y), factor);
         self.render();
     }
 
@@ -1192,27 +977,27 @@ impl Editor {
     }
 
     pub fn blur(&mut self) {
-        self.core.nav.set_space(false);
-        self.core.nav.cancel();
+        self.core.nav_mut().set_space(false);
+        self.core.nav_mut().cancel();
         self.core.clear_hover();
         self.settle_view();
         self.draw_overlay();
     }
 
     pub fn cursor(&self) -> String {
-        if self.core.nav.is_panning() {
+        if self.core.nav().is_panning() {
             return "grabbing".into();
         }
-        if self.core.nav.space_held() || self.core.tool == Tool::Hand {
+        if self.core.nav().space_held() || self.core.tool() == Tool::Hand {
             return "grab".into();
         }
-        if self.core.tool == Tool::Select && !self.core.hover_anchor_points().is_empty() {
+        if self.core.tool() == Tool::Select && !self.core.hover_anchor_points().is_empty() {
             return "crosshair".into();
         }
-        if self.core.tool == Tool::Select && self.core.stack_pull_hover() {
+        if self.core.tool() == Tool::Select && self.core.stack_pull_hover() {
             return "grab".into();
         }
-        match self.core.tool {
+        match self.core.tool() {
             Tool::Select => "default".into(),
             Tool::Text => "text".into(),
             _ => "crosshair".into(),
@@ -1221,8 +1006,8 @@ impl Editor {
 
     pub fn zoom_to_fit(&mut self) {
         self.cancel_camera_transition();
-        if let Some(bounds) = self.core.scene.bounds() {
-            self.core.camera.zoom_to_fit(
+        if let Some(bounds) = self.core.scene_bounds() {
+            self.core.camera_mut().zoom_to_fit(
                 bounds,
                 (
                     self.scene_canvas.client_width() as f64,
@@ -1231,7 +1016,7 @@ impl Editor {
                 48.0,
             );
         } else {
-            self.core.camera = canvas_core::Camera::default();
+            self.core.set_camera(canvas_core::Camera::default());
         }
         self.render();
     }
@@ -1242,7 +1027,7 @@ impl Editor {
             self.scene_canvas.client_width() as f64 / 2.0,
             self.scene_canvas.client_height() as f64 / 2.0,
         );
-        self.core.camera.set_zoom_at(center, 1.0);
+        self.core.camera_mut().set_zoom_at(center, 1.0);
         self.render();
     }
 
@@ -1267,7 +1052,7 @@ impl Editor {
         let zoom_cap = command
             .get("zoom_cap")
             .and_then(|value| value.as_f64())
-            .unwrap_or(DEFAULT_FOCUS_MAX_ZOOM);
+            .unwrap_or(DEFAULT_PRESENT_ZOOM_CAP);
         match action {
             "focus" => {
                 let id = command.get("id").and_then(|value| value.as_str());
@@ -1288,12 +1073,12 @@ impl Editor {
                 let viewport = (self.css_width(), self.css_height());
                 let target = match mode {
                     "in" => {
-                        let mut camera = self.core.camera;
+                        let mut camera = self.core.camera();
                         camera.zoom_at(Point::new(viewport.0 / 2.0, viewport.1 / 2.0), 1.3);
                         Some(cap_zoom(camera, viewport, zoom_cap))
                     }
                     "out" => {
-                        let mut camera = self.core.camera;
+                        let mut camera = self.core.camera();
                         camera.zoom_at(Point::new(viewport.0 / 2.0, viewport.1 / 2.0), 1.0 / 1.3);
                         Some(camera)
                     }
@@ -1302,7 +1087,7 @@ impl Editor {
                         .focus_camera(None, 48.0)
                         .map(|camera| cap_zoom(camera, viewport, zoom_cap)),
                     "reset" => Some(Camera::from_center(
-                        self.core.camera.center(viewport),
+                        self.core.camera().center(viewport),
                         1.0,
                         viewport,
                     )),
@@ -1316,7 +1101,7 @@ impl Editor {
                 let Some(id) = command.get("id").and_then(|value| value.as_str()) else {
                     return false;
                 };
-                let Some(bounds) = self.core.doc.framing_bounds(id) else {
+                let Some(bounds) = self.core.document().framing_bounds(id) else {
                     return false;
                 };
                 self.pulse = Some(Pulse {
@@ -1343,7 +1128,7 @@ impl Editor {
         if let Some(tween) = self.tween {
             let viewport = (self.css_width(), self.css_height());
             let (camera, done) = tween.camera_at(now, viewport);
-            self.core.camera = camera;
+            self.core.set_camera(camera);
             if done {
                 self.tween = None;
             } else {
@@ -1365,27 +1150,23 @@ impl Editor {
         // Presentation pacing: hold the step, then reveal the next one (or
         // finish). The pump stays alive for the whole timeline; pure holds
         // cost a rAF tick, not a repaint.
-        let advance_step = match &self.presentation {
-            Some(presentation) => {
-                now >= presentation.step_started_ms + presentation.steps[presentation.index].hold_ms
+        match self.page.advance_presentation(now) {
+            PresentationAdvance::Step(cues) => {
+                self.apply_presentation_cues(cues);
+                self.last_paint = None;
+                self.render();
             }
-            None => false,
-        };
-        if advance_step {
-            let last = self
-                .presentation
-                .as_ref()
-                .is_some_and(|presentation| presentation.index + 1 >= presentation.steps.len());
-            if last {
-                self.finish_presentation(false);
-            } else {
-                if let Some(presentation) = self.presentation.as_mut() {
-                    presentation.index += 1;
-                }
-                self.begin_presentation_step();
+            PresentationAdvance::Finished => {
+                // Playback is over: the document was always final, so only
+                // the agent's decorations and the reveal mask go away.
+                self.pulse = None;
+                self.tween = None;
+                self.last_paint = None;
+                self.render();
             }
+            PresentationAdvance::Idle | PresentationAdvance::Holding => {}
         }
-        if self.presentation.is_some() {
+        if self.page.is_presenting() {
             active = true;
         }
         active
@@ -1396,53 +1177,44 @@ impl Editor {
     /// this stages the reveal, caption and camera cues over it. Returns true
     /// when the shell should pump `advance_animation`.
     pub fn start_presentation(&mut self, json: &str) -> bool {
-        let Ok(script) = serde_json::from_str::<PresentScript>(json) else {
+        // Replacing a playback drops its decorations first; an unrelated
+        // camera tween (say, a zoom in flight) is left alone.
+        let replacing = self.page.is_presenting();
+        let Some(cues) = self.page.start_presentation(json, now_ms()) else {
             return false;
         };
-        if script.steps.is_empty() {
-            return false;
+        if replacing {
+            self.pulse = None;
+            self.tween = None;
         }
-        self.cancel_presentation();
-        let mut hidden: BTreeSet<canvas_core::ElementId> = BTreeSet::new();
-        for step in &script.steps {
-            hidden.extend(step.reveal.iter().cloned());
-        }
-        self.presentation = Some(Presentation {
-            id: script.id,
-            steps: script.steps,
-            index: 0,
-            step_started_ms: now_ms(),
-            hidden,
-            caption: None,
-            zoom_cap: script.zoom_cap,
-        });
-        self.begin_presentation_step();
+        self.apply_presentation_cues(cues);
+        self.last_paint = None;
+        self.render();
         true
     }
 
     /// Finished/cancelled playbacks the shell must acknowledge, as JSON like
     /// `[{"id":3,"cancelled":false}]`; empty string when there are none.
     pub fn presentation_outcomes(&mut self) -> String {
-        if self.present_outcomes.is_empty() {
+        let outcomes = self.page.take_presentation_outcomes();
+        if outcomes.is_empty() {
             return String::new();
         }
-        let json = serde_json::to_string(&self.present_outcomes).unwrap_or_default();
-        self.present_outcomes.clear();
-        json
+        serde_json::to_string(&outcomes).unwrap_or_default()
     }
 
     /// Introspection for the shell and tests: empty when idle, else JSON with
     /// `playing`, `hidden` and `caption`. View state only.
     pub fn presentation_state(&self) -> String {
-        match &self.presentation {
-            None => String::new(),
-            Some(presentation) => serde_json::json!({
-                "playing": true,
-                "hidden": presentation.hidden.len(),
-                "caption": presentation.caption,
-            })
-            .to_string(),
+        if !self.page.is_presenting() {
+            return String::new();
         }
+        serde_json::json!({
+            "playing": true,
+            "hidden": self.page.hidden_count(),
+            "caption": self.page.caption(),
+        })
+        .to_string()
     }
 
     /// The page's transient view state for the agent: camera, viewport and
@@ -1450,12 +1222,12 @@ impl Editor {
     /// hint (see ADR 0006).
     pub fn view_state_json(&self) -> String {
         let (w, h) = (self.css_width(), self.css_height());
-        let selection: Vec<&str> = self.core.selection.iter().map(String::as_str).collect();
+        let selection: Vec<&str> = self.core.selection().iter().map(String::as_str).collect();
         serde_json::json!({
             "camera": {
-                "x": self.core.camera.scroll.x,
-                "y": self.core.camera.scroll.y,
-                "zoom": self.core.camera.zoom,
+                "x": self.core.camera().scroll.x,
+                "y": self.core.camera().scroll.y,
+                "zoom": self.core.camera().zoom,
             },
             "viewport": { "w": w, "h": h },
             "selection": selection,
@@ -1465,14 +1237,14 @@ impl Editor {
 
     /// Screen point -> world point, through the current camera.
     pub fn screen_to_world(&self, x: f64, y: f64) -> Vec<f64> {
-        let p = self.core.camera.screen_to_world(Point::new(x, y));
+        let p = self.core.camera().screen_to_world(Point::new(x, y));
         vec![p.x, p.y]
     }
 
     /// The routed polyline currently drawn for a connector, as flat x/y
     /// world coordinates. Empty for anything that is not a connector.
     pub fn route_for(&self, id: &str) -> Vec<f64> {
-        let Some(element) = self.core.doc.element(id) else {
+        let Some(element) = self.core.document().element(id) else {
             return Vec::new();
         };
         let canvas_core::model::ElementKind::Arrow {
@@ -1490,8 +1262,8 @@ impl Editor {
             end,
             *routing,
             waypoints,
-            &self.core.doc,
-            &self.core.obstacles,
+            self.core.document(),
+            self.core.obstacles(),
         )
         .into_iter()
         .flat_map(|p| [p.x, p.y])
@@ -1509,19 +1281,23 @@ impl Editor {
     }
 
     fn remember_view(&mut self) {
-        self.last_paint = Some(ViewSnapshot {
-            scroll: self.core.camera.scroll,
-            zoom: self.core.camera.zoom,
-            width: self.scene_canvas.width(),
-            height: self.scene_canvas.height(),
-        });
+        self.last_paint = Some(ViewSnapshot::new(
+            self.core.camera(),
+            self.scene_canvas.width(),
+            self.scene_canvas.height(),
+        ));
+    }
+
+    fn paint_surface(&self) -> Surface<'static> {
+        let (width, height) = self.core.viewport_size();
+        Surface::new(self.dpr, width, height, BACKGROUND)
     }
 
     /// Snap back to a crisp full render if the canvas is showing a panned or
     /// zoomed approximation.
     fn settle_view(&mut self) {
         if let Some(from) = self.last_paint {
-            if from.scroll != self.core.camera.scroll || from.zoom != self.core.camera.zoom {
+            if !from.matches(self.core.camera()) {
                 self.render();
             }
         }
@@ -1532,13 +1308,13 @@ impl Editor {
     fn start_camera_transition(&mut self, target: Camera, animate: bool) -> bool {
         if !animate {
             self.tween = None;
-            self.core.camera = target;
+            self.core.set_camera(target);
             self.render();
             return false;
         }
         let viewport = (self.css_width(), self.css_height());
         self.tween = Some(CameraTween::between(
-            &self.core.camera,
+            &self.core.camera(),
             &target,
             viewport,
             now_ms(),
@@ -1557,15 +1333,15 @@ impl Editor {
     /// fit zoom is capped so small elements don't cause a dramatic jump.
     fn focus_plan(&self, id: Option<&str>, pad: f64, zoom_cap: f64) -> Option<Camera> {
         let bounds = match id {
-            Some(id) => self.core.doc.framing_bounds(id)?,
-            None => self.core.doc.bounds()?,
+            Some(id) => self.core.document().framing_bounds(id)?,
+            None => self.core.document().bounds()?,
         };
         let viewport = (self.css_width(), self.css_height());
         if viewport.0 <= 0.0 || viewport.1 <= 0.0 {
             return None;
         }
-        let visible = self.core.camera.viewport(viewport.0, viewport.1);
-        let margin = FOCUS_MARGIN_PX / self.core.camera.zoom;
+        let visible = self.core.camera().viewport(viewport.0, viewport.1);
+        let margin = FOCUS_MARGIN_PX / self.core.camera().zoom;
         let comfortably_visible = bounds.x >= visible.x + margin
             && bounds.y >= visible.y + margin
             && bounds.max_x() <= visible.max_x() - margin
@@ -1573,7 +1349,7 @@ impl Editor {
         if comfortably_visible {
             return None;
         }
-        let mut camera = self.core.camera;
+        let mut camera = self.core.camera();
         camera.zoom_to_fit(bounds, viewport, pad);
         Some(Camera::from_center(
             bounds.center(),
@@ -1582,29 +1358,16 @@ impl Editor {
         ))
     }
 
-    /// Apply the current presentation step: reveal its elements, move the
-    /// camera, pulse the point target and show the caption.
-    fn begin_presentation_step(&mut self) {
-        let Some(presentation) = self.presentation.as_mut() else {
-            return;
-        };
-        if presentation.index >= presentation.steps.len() {
-            return;
-        }
-        let step = presentation.steps[presentation.index].clone();
-        let zoom_cap = presentation.zoom_cap;
-        for id in &step.reveal {
-            presentation.hidden.remove(id);
-        }
-        presentation.caption = step.caption.clone();
-        presentation.step_started_ms = now_ms();
-        if let Some(id) = step.focus.as_deref() {
-            if let Some(target) = self.focus_plan(Some(id), 64.0, zoom_cap) {
+    /// Apply a presentation step's camera/highlight cues. The session owns the
+    /// timeline; the camera, pulse and repaint belong to the browser adapter.
+    fn apply_presentation_cues(&mut self, cues: PresentationCues) {
+        if let Some(id) = cues.focus.as_deref() {
+            if let Some(target) = self.focus_plan(Some(id), 64.0, cues.zoom_cap) {
                 self.start_camera_transition(target, true);
             }
         }
-        if let Some(id) = step.point.as_deref() {
-            if let Some(bounds) = self.core.doc.framing_bounds(id) {
+        if let Some(id) = cues.point.as_deref() {
+            if let Some(bounds) = self.core.document().framing_bounds(id) {
                 self.pulse = Some(Pulse {
                     bounds,
                     started_ms: now_ms(),
@@ -1612,110 +1375,59 @@ impl Editor {
                 });
             }
         }
-        self.last_paint = None;
-        self.render();
     }
 
-    /// End playback: reveal everything (the document was always final), drop
-    /// its decorations, and record the outcome for the shell to report.
-    fn finish_presentation(&mut self, cancelled: bool) {
-        let Some(presentation) = self.presentation.take() else {
-            return;
-        };
-        self.present_outcomes.push(PresentOutcome {
-            id: presentation.id,
-            cancelled,
-        });
-        self.pulse = None;
-        self.tween = None;
-        self.last_paint = None;
-        self.render();
-    }
-
-    /// Any direct user input wins over the agent's explanation.
+    /// Any direct user input wins over the agent's explanation. The session
+    /// queues the cancelled outcome; the adapter drops its decorations.
     fn cancel_presentation(&mut self) {
-        if self.presentation.is_some() {
-            self.finish_presentation(true);
+        if self.page.cancel_presentation().is_some() {
+            self.pulse = None;
+            self.tween = None;
+            self.last_paint = None;
+            self.render();
         }
-    }
-
-    /// Drain the outbox as one patch, or `None` when nothing changed. Purges
-    /// enter the ledger with the exact tombstone this patch projects, so a
-    /// later reconnect snapshot is byte-for-byte the same deletion.
-    fn take_outbound_patch(&mut self) -> Option<canvas_core::Patch> {
-        let deltas = self.core.history.drain_outbox();
-        if deltas.is_empty() {
-            return None;
-        }
-        let patch = canvas_core::Patch::from_deltas(&deltas, now_ms());
-        self.purge_ledger.record(&deltas, &patch);
-        Some(patch)
     }
 
     /// The live document with explicit purge tombstones folded in. Absence in
     /// the live document is not a deletion; only the ledger adds one.
     fn synced_document(&self) -> Document {
-        self.purge_ledger.materialize(&self.core.doc)
+        self.page.synced_document(self.core.document())
     }
 
-    /// Merge a remote snapshot now: reconcile, rebuild the scene, repaint.
-    fn reconcile_bytes_now(&mut self, bytes: &[u8]) -> Result<bool, JsValue> {
-        let (revision, remote) =
-            wire::decode_snapshot(bytes).map_err(|error| JsValue::from_str(&error.to_string()))?;
-        self.wire_revision = revision;
-        Ok(self.apply_remote_snapshot(remote))
-    }
-
-    fn apply_remote_snapshot(&mut self, remote: Document) -> bool {
-        let merged = canvas_core::reconcile(&self.core.doc, &remote);
-        if merged == self.core.doc {
-            return false;
-        }
-        self.core.doc = merged;
-        self.core
-            .selection
-            .retain(|id| self.core.doc.element(id).is_some_and(|e| !e.is_deleted));
+    /// Repaint the layers a remote patch changed. The session already applied
+    /// the elements through the editor's LWW path; this is the steady-state
+    /// cost: proportional to what changed, not to the document.
+    fn paint_remote_change(&mut self, ids: Vec<canvas_core::ElementId>) {
         self.last_paint = None;
-        self.core.refresh_scene();
-        self.render();
-        true
-    }
-
-    /// Merge a remote patch now: per-element LWW, then rebuild only the
-    /// changed layers and repaint them. This is the steady-state path — the
-    /// cost is proportional to what changed, not to the document.
-    fn merge_patch_bytes_now(&mut self, bytes: &[u8]) -> Result<bool, JsValue> {
-        let (revision, elements) =
-            wire::decode_patch(bytes).map_err(|error| JsValue::from_str(&error.to_string()))?;
-        self.wire_revision = revision;
-        Ok(self.apply_remote_elements(elements))
-    }
-
-    fn apply_remote_elements(&mut self, elements: Vec<canvas_core::Element>) -> bool {
-        let patch = canvas_core::Patch { put: elements };
-        let changed: BTreeSet<canvas_core::ElementId> =
-            patch.apply_to(&mut self.core.doc).into_iter().collect();
-        if changed.is_empty() {
-            return false;
-        }
-        self.core
-            .selection
-            .retain(|id| self.core.doc.element(id).is_some_and(|e| !e.is_deleted));
-        self.last_paint = None;
+        let changed: BTreeSet<canvas_core::ElementId> = ids.into_iter().collect();
         let dirty = self.core.rebuild_changed(&changed);
         self.paint_dirty(&dirty);
         self.draw_overlay();
-        true
     }
 
     /// Apply any frame deferred during a gesture. Called at gesture end, after
     /// the local edit has committed, so remote merges see its final state.
     fn apply_pending_remote(&mut self) {
-        if let Some(bytes) = self.pending_remote.take() {
-            let _ = self.reconcile_bytes_now(&bytes);
-        }
-        for bytes in std::mem::take(&mut self.pending_patches) {
-            let _ = self.merge_patch_bytes_now(&bytes);
+        for frame in self.page.drain_pending() {
+            match frame {
+                PendingFrame::Snapshot(frame) => {
+                    if self
+                        .page
+                        .apply_snapshot_frame(&mut self.core, frame)
+                        .changed()
+                    {
+                        self.last_paint = None;
+                        self.render();
+                    }
+                }
+                PendingFrame::Patch(frame) => {
+                    if let FrameApply::Changed { ids } =
+                        self.page.apply_patch_frame(&mut self.core, frame)
+                    {
+                        self.paint_remote_change(ids);
+                    }
+                }
+            }
         }
     }
 
@@ -1729,13 +1441,13 @@ impl Editor {
         // At overview zoom the LOD full render is cheaper than pixel-shifting
         // plus per-strip full-detail repaints (which would also mismatch the
         // LOD main image). Fall back to `render()` there.
-        if self.core.camera.zoom < LOD_ZOOM {
+        if self.core.camera().zoom < paint::LOD_ZOOM {
             return false;
         }
         let Some(from) = self.last_paint else {
             return false;
         };
-        let camera = self.core.camera;
+        let camera = self.core.camera();
         if camera.zoom != from.zoom {
             return false;
         }
@@ -1815,12 +1527,12 @@ impl Editor {
             .set_transform(camera.transform().then(Affine::scale(self.dpr)));
         // Non-LOD only (LOD pans fall back to render before reaching here):
         // deferred drift points must be flushed so strips paint new positions.
-        self.core.scene.flush_pending_ops();
+        self.core.flush_pending_ops();
         for strip in world.iter().copied() {
             self.core.ensure_area(strip);
-            self.core.scene.flush_preview_stale(strip);
+            self.core.flush_preview_stale(strip);
         }
-        for layer in self.core.scene.layers.iter() {
+        for layer in self.core.scene_layers().iter() {
             if world.iter().any(|rect| layer.bounds.intersects(rect)) {
                 self.renderer.draw_ops(&layer.ops);
             }
@@ -1901,84 +1613,20 @@ impl Editor {
     fn paint_dirty(&mut self, dirty: &[Rect]) {
         // At overview zoom a single LOD pass is cheaper and keeps the whole
         // frame on the same detail level (no full-ink island in an LOD sea).
-        if self.core.camera.zoom < LOD_ZOOM {
+        // A full frame also refreshes the overlay and the pan snapshot.
+        if self.core.camera().zoom < paint::LOD_ZOOM {
             self.render();
             return;
         }
-        if let Some(from) = self.last_paint {
-            if from.scroll != self.core.camera.scroll || from.zoom != self.core.camera.zoom {
-                // The canvas no longer corresponds to the snapshot; the next
-                // pan must fall back to a full render.
-                self.last_paint = None;
-            }
-        }
-        let (w, h) = self.core.viewport_size();
-        let viewport = self.core.camera.viewport(w, h);
-        let visible: Vec<Rect> = dirty
-            .iter()
-            .filter(|r| r.intersects(&viewport))
-            .copied()
-            .collect();
-        if visible.is_empty() {
-            return;
-        }
-        let merged = merge_rects(&visible);
-        // One bounding box culls the layer list; the merged rects then decide
-        // exactly which layers to repaint.
-        let mut union = merged[0];
-        for rect in &merged[1..] {
-            union = union.union(rect);
-        }
-        self.renderer.begin_frame();
-        let mut cleared: Vec<Rect> = Vec::with_capacity(merged.len());
-        for rect in &merged {
-            let top_left = self.core.camera.world_to_screen(Point::new(rect.x, rect.y));
-            let bottom_right = self
-                .core
-                .camera
-                .world_to_screen(Point::new(rect.max_x(), rect.max_y()));
-            let screen = Rect::from_points(top_left, bottom_right).expand(1.0);
-            let device = Rect::new(
-                screen.x * self.dpr,
-                screen.y * self.dpr,
-                screen.w * self.dpr,
-                screen.h * self.dpr,
-            );
-            self.renderer.clear_rect(device, BACKGROUND);
-            cleared.push(device);
-        }
-        // Clip the redraws to the cleared region: a layer that intersects a
-        // dirty rect repaints in full, so without the clip its parts outside
-        // the cleared rect would paint over untouched pixels — most visibly
-        // letting a lower layer cover the higher layers around it.
-        //
-        // Canvas antialiases clip edges, so a clip exactly on the cleared
-        // boundary lets the background bleed through as a hairline seam
-        // across the repainted element (a faint line under a sticky's text
-        // after each edit). Pad the clip outward; the extra ring lands on
-        // pixels whose content is already correct.
-        let clip: Vec<Rect> = cleared.iter().map(|rect| rect.expand(1.0)).collect();
-        self.renderer.clip_rects(&clip);
-        self.renderer
-            .set_transform(self.core.camera.transform().then(Affine::scale(self.dpr)));
-        // Non-LOD only (LOD edits full-render before reaching here): flush
-        // deferred drift so repainted layers draw at new positions.
-        self.core.scene.flush_pending_ops();
-        self.core.ensure_area(union);
-        self.core.scene.flush_preview_stale(union);
-        let editing = self.core.editing_text_id();
-        for layer in self.core.scene.layers.iter() {
-            if !layer.bounds.intersects(&union) {
-                continue;
-            }
-            if editing == Some(layer.element_id.as_str()) {
-                continue;
-            }
-            if merged.iter().any(|rect| layer.bounds.intersects(rect)) {
-                self.renderer.draw_ops(&layer.ops);
-            }
-        }
-        self.renderer.end_frame();
+        let surface = self.paint_surface();
+        paint::paint_dirty(
+            &mut self.core,
+            &mut self.renderer,
+            &surface,
+            dirty,
+            &mut self.last_paint,
+            self.page.hidden_elements(),
+        );
     }
 
     /// Paint the optional grid on its own canvas, under the elements. The
@@ -1991,9 +1639,9 @@ impl Editor {
         self.grid.save();
         let _ = self.grid.set_transform(1.0, 0.0, 0.0, 1.0, 0.0, 0.0);
         self.grid.clear_rect(0.0, 0.0, w, h);
-        if self.core.grid_visible && w > 0.0 && h > 0.0 {
-            let camera = self.core.camera;
-            let mut step = self.core.grid_size;
+        if self.core.grid_visible() && w > 0.0 && h > 0.0 {
+            let camera = self.core.camera();
+            let mut step = self.core.grid_size();
             while step * camera.zoom * self.dpr < GRID_MIN_SPACING_PX {
                 step *= 2.0;
             }
@@ -2031,7 +1679,7 @@ impl Editor {
         let _ = self.overlay.set_transform(1.0, 0.0, 0.0, 1.0, 0.0, 0.0);
         self.overlay.clear_rect(0.0, 0.0, w, h);
 
-        let camera = self.core.camera;
+        let camera = self.core.camera();
         if let Some(rect) = self.core.marquee_rect() {
             let a = camera.world_to_screen(Point::new(rect.x, rect.y));
             let b = camera.world_to_screen(Point::new(rect.max_x(), rect.max_y()));
@@ -2056,7 +1704,7 @@ impl Editor {
         // Bend handles on a selected connector: filled = existing waypoint,
         // hollow = drag to add one.
         for handle in self.core.arrow_path_handles() {
-            let screen = self.core.camera.world_to_screen(handle.point());
+            let screen = self.core.camera().world_to_screen(handle.point());
             let (x, y) = (screen.x * self.dpr, screen.y * self.dpr);
             let existing = matches!(handle, ArrowHandle::Waypoint { .. });
             let radius = if existing { 4.0 } else { 3.5 } * self.dpr;
@@ -2080,7 +1728,7 @@ impl Editor {
             self.overlay.set_stroke_style_str(ACCENT);
             self.overlay.set_line_width(self.dpr * 1.5);
             for &point in anchors {
-                let screen = self.core.camera.world_to_screen(point);
+                let screen = self.core.camera().world_to_screen(point);
                 let (x, y) = (screen.x * self.dpr, screen.y * self.dpr);
                 let radius = 4.0 * self.dpr;
                 self.overlay.begin_path();
@@ -2158,11 +1806,7 @@ impl Editor {
         }
 
         // The agent's caption: a bar at the bottom of the viewport.
-        if let Some(caption) = self
-            .presentation
-            .as_ref()
-            .and_then(|presentation| presentation.caption.clone())
-        {
+        if let Some(caption) = self.page.caption().map(str::to_string) {
             let font_size = 22.0 * self.dpr;
             self.overlay
                 .set_font(&format!("{font_size}px ComicShanns, sans-serif"));
@@ -2224,38 +1868,6 @@ pub async fn delete_saved_workspace(workspace: String) -> Result<(), JsValue> {
     storage::delete_workspace(&workspace)
         .await
         .map_err(|error| JsValue::from_str(&error))
-}
-
-/// Whether `outer` fully contains `inner`. Used for the renderer's
-/// contains-all fast path against the scene's cached union.
-fn viewport_contains(outer: &Rect, inner: &Rect) -> bool {
-    outer.x <= inner.x
-        && outer.y <= inner.y
-        && outer.max_x() >= inner.max_x()
-        && outer.max_y() >= inner.max_y()
-}
-
-/// Merge overlapping dirty rectangles so a repaint clears and redraws each
-/// region once instead of once per contributing element.
-fn merge_rects(rects: &[Rect]) -> Vec<Rect> {
-    let mut merged: Vec<Rect> = Vec::with_capacity(rects.len());
-    for &rect in rects {
-        let mut current = rect;
-        'merge: loop {
-            let mut i = 0;
-            while i < merged.len() {
-                if merged[i].intersects(&current) {
-                    current = merged[i].union(&current);
-                    merged.swap_remove(i);
-                    continue 'merge;
-                }
-                i += 1;
-            }
-            break;
-        }
-        merged.push(current);
-    }
-    merged
 }
 
 fn parse_modifiers(value: &JsValue) -> Modifiers {

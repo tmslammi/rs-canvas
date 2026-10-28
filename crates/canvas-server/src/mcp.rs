@@ -7,7 +7,6 @@
 //! active page is viewing (ADR-0007) — except `canvas_workspace_create`,
 //! which opens a new workspace and moves that page with it (ADR-0008).
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -471,16 +470,14 @@ async fn deliver_view(
         }
         message["zoom_cap"] = settings.zoom_cap().into();
     }
-    let pages = workspace.pages.load(Ordering::SeqCst);
+    let pages = workspace.page_count();
     if pages == 0 {
         return Ok(CallToolResult::error(vec![ContentBlock::text(
             "No canvas page is connected. Ask the user to open http://localhost:5173 \
              (the dev server must be running).",
         )]));
     }
-    let _ = workspace
-        .to_pages
-        .send(PageMessage::control(message.to_string()));
+    workspace.broadcast(PageMessage::control(message.to_string()));
     Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::json!({ "ok": true, "delivered_to_pages": pages }).to_string(),
     )]))
@@ -881,11 +878,11 @@ impl CanvasServer {
                     .into(),
             );
         }
-        let mut doc = workspace.doc.lock().await;
-        if workspace.retired.load(Ordering::SeqCst) {
+        let mut doc = workspace.doc().lock().await;
+        if workspace.is_retired() {
             return Err("This workspace was renamed or deleted. Reconnect the page.".into());
         }
-        if revision.is_some_and(|rev| rev != workspace.revision.load(Ordering::SeqCst)) {
+        if revision.is_some_and(|rev| rev != workspace.revision()) {
             return Err("stale_revision: read the affected elements before retrying".into());
         }
         let mut tx = Transaction::begin();
@@ -901,11 +898,11 @@ impl CanvasServer {
         let deltas = tx.deltas().to_vec();
         let put = Patch::from_deltas(&deltas, now_ms()).put;
         let revision = if deltas.is_empty() {
-            workspace.revision.load(Ordering::SeqCst)
+            workspace.revision()
         } else {
             workspace.record_deltas(&deltas, source).await
         };
-        let mut aliases = workspace.aliases.lock().await;
+        let mut aliases = workspace.aliases().lock().await;
         let changed: Vec<String> = put
             .iter()
             .filter(|e| !e.is_deleted)
@@ -922,19 +919,17 @@ impl CanvasServer {
             Some(format!("{}:{revision}", workspace.context()))
         };
         if let Some(id) = &transaction {
-            let mut history = workspace.transactions.lock().await;
-            history.push(crate::state::AgentTransaction {
-                id: id.clone(),
-                deltas,
-            });
-            if history.len() > 50 {
-                history.remove(0);
-            }
+            workspace
+                .push_transaction(crate::state::AgentTransaction {
+                    id: id.clone(),
+                    deltas,
+                })
+                .await;
         }
         drop(aliases);
         drop(doc);
         let receipt = serde_json::json!({
-            "workspace": workspace.name, "context": workspace.context(), "revision": revision,
+            "workspace": workspace.name(), "context": workspace.context(), "revision": revision,
             "transaction": transaction, "changed": changed, "removed": removed,
         });
         if !put.is_empty() {
@@ -946,8 +941,8 @@ impl CanvasServer {
 
     /// The agent-facing identity of one element: its handle and compact line.
     async fn describe_one(&self, workspace: &Workspace, id: &str) -> serde_json::Value {
-        let doc = workspace.doc.lock().await;
-        let mut aliases = workspace.aliases.lock().await;
+        let doc = workspace.doc().lock().await;
+        let mut aliases = workspace.aliases().lock().await;
         let handle = aliases.handle(id);
         let line = doc
             .element(id)
@@ -979,20 +974,17 @@ impl CanvasServer {
         // Read the count and drop the lock: list_workspaces locks every
         // workspace's document, including this one.
         let (elements, revision) = {
-            let doc = workspace.doc.lock().await;
-            (doc.live_count(), workspace.revision.load(Ordering::SeqCst))
+            let doc = workspace.doc().lock().await;
+            (doc.live_count(), workspace.revision())
         };
-        let hints = workspace.view_hint.lock().await.clone();
+        let hints = workspace.view_hint().await;
         let settings = self.state.current_settings().await;
         let workspaces = self.state.list_workspaces().await;
-        let discussion = workspace.discussion.lock().await.clone();
+        let discussion = workspace.discussion().await;
         let recent_edits: Vec<_> = workspace
-            .transactions
-            .lock()
+            .recent_transactions(5)
             .await
             .iter()
-            .rev()
-            .take(5)
             .map(|edit| {
                 let elements = edit
                     .deltas
@@ -1007,12 +999,12 @@ impl CanvasServer {
         let body = serde_json::json!({
             "server": "rs-canvas",
             "version": env!("CARGO_PKG_VERSION"),
-            "workspace": workspace.name,
+            "workspace": workspace.name(),
             "context": workspace.context(),
             "discussion": discussion,
-            "discussion_persisted": workspace.doc_path.is_some(),
+            "discussion_persisted": workspace.discussion_persisted(),
             "recent_edits": recent_edits,
-            "pages_connected": workspace.pages.load(Ordering::SeqCst),
+            "pages_connected": workspace.page_count(),
             "uptime_ms": self.state.started.elapsed().as_millis() as u64,
             "revision": revision,
             "document": {
@@ -1066,19 +1058,19 @@ impl CanvasServer {
                 ))]));
             }
         };
-        let watching = source.pages.load(Ordering::SeqCst);
+        let watching = source.page_count();
         let mut switched = false;
         if watching > 0 {
             let message = serde_json::json!({
                 "type": "workspace_changed",
                 "action": "switch",
-                "workspace": workspace.name,
+                "workspace": workspace.name(),
             })
             .to_string();
-            let _ = source.to_pages.send(PageMessage::control(message));
+            source.broadcast(PageMessage::control(message));
             let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
             while tokio::time::Instant::now() < deadline {
-                if workspace.pages.load(Ordering::SeqCst) > 0 {
+                if workspace.page_count() > 0 {
                     switched = true;
                     break;
                 }
@@ -1090,7 +1082,7 @@ impl CanvasServer {
                 *self.observed.lock().await = Some(workspace.context());
             }
         }
-        let elements = workspace.doc.lock().await.live_count();
+        let elements = workspace.doc().lock().await.live_count();
         let note = if switched {
             "The page is on the new workspace; later calls act there."
         } else if watching > 0 {
@@ -1099,11 +1091,11 @@ impl CanvasServer {
             "No page is connected; the workspace exists but the agent still targets the current workspace."
         };
         let body = serde_json::json!({
-            "workspace": workspace.name,
+            "workspace": workspace.name(),
             "context": workspace.context(),
             "switched": switched,
-            "pages_connected": workspace.pages.load(Ordering::SeqCst),
-            "persisted": workspace.doc_path.is_some(),
+            "pages_connected": workspace.page_count(),
+            "persisted": workspace.persisted(),
             "document": { "elements": elements },
             "note": note,
         });
@@ -1141,8 +1133,8 @@ impl CanvasServer {
         Parameters(args): Parameters<ReadArgs>,
     ) -> Result<CallToolResult, McpError> {
         let workspace = self.current().await;
-        let doc = workspace.doc.lock().await;
-        let revision = workspace.revision.load(Ordering::SeqCst);
+        let doc = workspace.doc().lock().await;
+        let revision = workspace.revision();
         let failure = |message: &str| Ok(CallToolResult::error(vec![ContentBlock::text(message)]));
         if args.attention {
             if args.ids.is_some() || args.frame.is_some() || args.query.is_some() || args.selected {
@@ -1155,9 +1147,9 @@ impl CanvasServer {
                     "attention cannot be combined with since; read the current view or the change log, not both",
                 );
             }
-            let hint = workspace.view_hint.lock().await.clone();
-            let live_page = workspace.pages.load(Ordering::SeqCst) > 0;
-            let mut aliases = workspace.aliases.lock().await;
+            let hint = workspace.view_hint().await;
+            let live_page = workspace.page_count() > 0;
+            let mut aliases = workspace.aliases().lock().await;
             let Some(text) = hint.as_ref().and_then(|hint| {
                 describe_attention(&doc, hint, live_page, revision, &mut *aliases)
             }) else {
@@ -1168,7 +1160,7 @@ impl CanvasServer {
             *self.observed.lock().await = Some(workspace.context());
             return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "{text}\nworkspace {:?} context {:?}",
-                workspace.name,
+                workspace.name(),
                 workspace.context()
             ))]));
         }
@@ -1177,7 +1169,7 @@ impl CanvasServer {
             body["revision"] = serde_json::json!(revision);
             body["context"] = serde_json::json!(workspace.context());
             let mut structured = body.clone();
-            structured["workspace"] = serde_json::json!(workspace.name);
+            structured["workspace"] = serde_json::json!(workspace.name());
             let mut result = CallToolResult::success(vec![ContentBlock::text(body.to_string())]);
             result.structured_content = Some(structured);
             return Ok(result);
@@ -1221,7 +1213,7 @@ impl CanvasServer {
                 "resync_required: cursor is newer than this document; start a full or scoped read",
             );
         }
-        let mut aliases = workspace.aliases.lock().await;
+        let mut aliases = workspace.aliases().lock().await;
         let (text, structured) = if let Some(since) = args.since {
             if !workspace.cursor_valid(since).await {
                 return failure("resync_required: change history no longer covers that cursor; start a full or scoped read");
@@ -1234,7 +1226,7 @@ impl CanvasServer {
                 text.push_str(&canvas_core::layout::render(&report, &mut *aliases));
             }
             let structured = serde_json::json!({
-                "workspace": workspace.name,
+                "workspace": workspace.name(),
                 "context": workspace.context(),
                 "revision": revision,
                 "changes": changes,
@@ -1255,7 +1247,8 @@ impl CanvasServer {
                 }
             }
             if args.selected {
-                if let Some(hint) = workspace.view_hint.lock().await.as_ref() {
+                let hint = workspace.view_hint().await;
+                if let Some(hint) = hint.as_ref() {
                     roots.extend(
                         hint.selection
                             .iter()
@@ -1376,7 +1369,7 @@ impl CanvasServer {
                 text.push_str(&canvas_core::layout::render(&report, &mut *aliases));
             }
             let structured = serde_json::json!({
-                "workspace": workspace.name,
+                "workspace": workspace.name(),
                 "context": workspace.context(),
                 "revision": revision,
                 "matched": matches.len(),
@@ -1387,7 +1380,7 @@ impl CanvasServer {
         *self.observed.lock().await = Some(workspace.context());
         let mut result = CallToolResult::success(vec![ContentBlock::text(format!(
             "{text}\nworkspace {:?} context {:?}",
-            workspace.name,
+            workspace.name(),
             workspace.context()
         ))]);
         result.structured_content = Some(structured);
@@ -1402,13 +1395,7 @@ impl CanvasServer {
         Parameters(args): Parameters<RevertArgs>,
     ) -> Result<CallToolResult, McpError> {
         let workspace = self.current().await;
-        let transaction = workspace
-            .transactions
-            .lock()
-            .await
-            .iter()
-            .find(|t| t.id == args.transaction)
-            .cloned();
+        let transaction = workspace.transaction(&args.transaction).await;
         let Some(transaction) = transaction else {
             return Ok(CallToolResult::error(vec![ContentBlock::text("unknown or expired transaction; only the last 50 agent edits in this document lifetime are reversible")]));
         };
@@ -1502,7 +1489,7 @@ impl CanvasServer {
         Parameters(args): Parameters<RememberArgs>,
     ) -> Result<CallToolResult, McpError> {
         let workspace = self.current().await;
-        let _doc = workspace.doc.lock().await;
+        let _doc = workspace.doc().lock().await;
         if workspace.context() != args.context || self.current().await.context() != args.context {
             return Ok(CallToolResult::error(vec![ContentBlock::text(
                 "stale_context: read canvas_status before saving discussion notes",
@@ -1511,12 +1498,10 @@ impl CanvasServer {
         match workspace.remember(args.notes, args.revision).await {
             Ok(record) => {
                 let body = serde_json::json!({
-                    "type": "discussion", "workspace": workspace.name, "context": workspace.context(),
-                    "discussion": record, "discussion_persisted": workspace.doc_path.is_some(),
+                    "type": "discussion", "workspace": workspace.name(), "context": workspace.context(),
+                    "discussion": record, "discussion_persisted": workspace.discussion_persisted(),
                 });
-                let _ = workspace
-                    .to_pages
-                    .send(PageMessage::control(body.to_string()));
+                workspace.broadcast(PageMessage::control(body.to_string()));
                 Ok(CallToolResult::success(vec![ContentBlock::text(
                     body.to_string(),
                 )]))
@@ -1585,7 +1570,7 @@ impl CanvasServer {
             .await;
         match created {
             Ok(id) => {
-                let elements = workspace.doc.lock().await.live_count();
+                let elements = workspace.doc().lock().await.live_count();
                 let mut body = self.describe_one(&workspace, &id).await;
                 body["elements"] = serde_json::json!(elements);
                 Ok(CallToolResult::success(vec![ContentBlock::text(
@@ -1636,7 +1621,7 @@ impl CanvasServer {
             .await;
         match result {
             Ok(id) => {
-                let elements = workspace.doc.lock().await.live_count();
+                let elements = workspace.doc().lock().await.live_count();
                 let mut body = self.describe_one(&workspace, &id).await;
                 body["elements"] = serde_json::json!(elements);
                 Ok(CallToolResult::success(vec![ContentBlock::text(
@@ -1743,7 +1728,7 @@ impl CanvasServer {
         };
 
         let created: serde_json::Map<String, serde_json::Value> = {
-            let mut aliases = workspace.aliases.lock().await;
+            let mut aliases = workspace.aliases().lock().await;
             outcome
                 .created
                 .iter()
@@ -1753,12 +1738,12 @@ impl CanvasServer {
 
         let mut played = false;
         let mut cancelled = false;
-        let pages = workspace.pages.load(Ordering::SeqCst);
+        let pages = workspace.page_count();
         if outcome.presentation && pages > 0 {
             let settings = self.state.current_settings().await;
             let hold_scale = settings.hold_scale();
             let camera_moves = settings.camera_moves();
-            let presentation_id = workspace.present_counter.fetch_add(1, Ordering::SeqCst) + 1;
+            let presentation_id = workspace.next_presentation_id();
             let holds: Vec<u64> = outcome
                 .steps
                 .iter()
@@ -1779,7 +1764,7 @@ impl CanvasServer {
                     })
                 })
                 .collect();
-            let mut acks = workspace.present_acks.subscribe();
+            let mut acks = workspace.subscribe_present_acks();
             let frame = serde_json::json!({
                 "type": "present",
                 "id": presentation_id,
@@ -1788,7 +1773,7 @@ impl CanvasServer {
             })
             .to_string();
             workspace.presentation_started();
-            let _ = workspace.to_pages.send(PageMessage::control(frame));
+            workspace.broadcast(PageMessage::control(frame));
             played = true;
             cancelled = wait_for_present_ack(&mut acks, presentation_id, total_hold).await;
             workspace.presentation_finished();
@@ -1946,16 +1931,13 @@ impl CanvasServer {
         // One lock scope: guards, build, and revision bump stay atomic, so
         // chained keys never collide with a concurrent writer.
         let (stats, put, revision, frame_id) = {
-            let mut doc = workspace.doc.lock().await;
-            if workspace.retired.load(Ordering::SeqCst) {
+            let mut doc = workspace.doc().lock().await;
+            if workspace.is_retired() {
                 return failure(
                     "This workspace was renamed or deleted. Reconnect the page.".into(),
                 );
             }
-            if args
-                .revision
-                .is_some_and(|rev| rev != workspace.revision.load(Ordering::SeqCst))
-            {
+            if args.revision.is_some_and(|rev| rev != workspace.revision()) {
                 return failure(
                     "stale_revision: read the affected elements before retrying".into(),
                 );
@@ -2028,7 +2010,7 @@ impl CanvasServer {
             (stats, put, revision, frame_id)
         };
         workspace.publish_patch(revision, put).await;
-        let mut aliases = workspace.aliases.lock().await;
+        let mut aliases = workspace.aliases().lock().await;
         let sample: Vec<String> = stats
             .shape_ids
             .iter()
@@ -2042,7 +2024,7 @@ impl CanvasServer {
         drop(aliases);
         Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::json!({
-                "workspace": workspace.name,
+                "workspace": workspace.name(),
                 "context": workspace.context(),
                 "revision": revision,
                 "transaction": serde_json::Value::Null,
@@ -2079,8 +2061,8 @@ impl CanvasServer {
             .await;
         match result {
             Ok(ids) => {
-                let elements = workspace.doc.lock().await.live_count();
-                let mut aliases = workspace.aliases.lock().await;
+                let elements = workspace.doc().lock().await.live_count();
+                let mut aliases = workspace.aliases().lock().await;
                 let handles: Vec<String> = ids.iter().map(|id| aliases.handle(id)).collect();
                 Ok(CallToolResult::success(vec![ContentBlock::text(
                     serde_json::json!({ "ids": handles, "elements": elements }).to_string(),
@@ -2108,7 +2090,7 @@ impl CanvasServer {
             .await;
         match result {
             Ok(changed) => {
-                let elements = workspace.doc.lock().await.live_count();
+                let elements = workspace.doc().lock().await.live_count();
                 Ok(CallToolResult::success(vec![ContentBlock::text(
                     serde_json::json!({ "changed": changed, "elements": elements }).to_string(),
                 )]))
@@ -2136,7 +2118,7 @@ impl CanvasServer {
             .await;
         match result {
             Ok(moved) => {
-                let elements = workspace.doc.lock().await.live_count();
+                let elements = workspace.doc().lock().await.live_count();
                 Ok(CallToolResult::success(vec![ContentBlock::text(
                     serde_json::json!({ "moved": moved, "elements": elements }).to_string(),
                 )]))
@@ -2164,7 +2146,7 @@ impl CanvasServer {
             .await;
         match result {
             Ok(cleared) => {
-                let elements = workspace.doc.lock().await.live_count();
+                let elements = workspace.doc().lock().await.live_count();
                 Ok(CallToolResult::success(vec![ContentBlock::text(
                     serde_json::json!({ "cleared": cleared, "elements": elements }).to_string(),
                 )]))
@@ -2190,10 +2172,10 @@ impl CanvasServer {
         workspace
             .wait_for_presentation(Duration::from_secs(15))
             .await;
-        let pages = workspace.pages.load(Ordering::SeqCst);
+        let pages = workspace.page_count();
         if pages > 0 {
-            let id = workspace.screenshot_counter.fetch_add(1, Ordering::SeqCst) + 1;
-            let mut replies = workspace.screenshot_replies.subscribe();
+            let id = workspace.next_screenshot_id();
+            let mut replies = workspace.subscribe_screenshot_replies();
             let scale = args.scale.unwrap_or(1.0).clamp(0.1, 4.0);
             let frame = serde_json::json!({
                 "type": "screenshot",
@@ -2201,7 +2183,7 @@ impl CanvasServer {
                 "scale": scale,
             })
             .to_string();
-            let _ = workspace.to_pages.send(PageMessage::control(frame));
+            workspace.broadcast(PageMessage::control(frame));
             if let Ok(Some(data_url)) = tokio::time::timeout(
                 Duration::from_secs(8),
                 wait_for_screenshot(&mut replies, id),
@@ -2212,7 +2194,7 @@ impl CanvasServer {
             }
             // The page did not answer (busy or gone): show the mirror instead.
         }
-        let doc = workspace.doc.lock().await;
+        let doc = workspace.doc().lock().await;
         match render::render_png(&doc, &self.state.web_dir) {
             Ok(png) => Ok(CallToolResult::success(vec![ContentBlock::image(
                 base64::engine::general_purpose::STANDARD.encode(png),
@@ -2394,8 +2376,8 @@ mod tests {
     async fn focus_delivers_a_view_command_to_open_pages() {
         let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
         let workspace = state.workspace(crate::state::DEFAULT_WORKSPACE).await;
-        let mut from_server = workspace.to_pages.subscribe();
-        workspace.pages.store(1, Ordering::SeqCst);
+        let mut from_server = workspace.subscribe();
+        workspace.set_page_count(1);
         let server = CanvasServer::new(state);
 
         let result = server
@@ -2421,8 +2403,8 @@ mod tests {
     async fn zoom_rejects_unknown_modes() {
         let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
         let workspace = state.workspace(crate::state::DEFAULT_WORKSPACE).await;
-        let mut from_server = workspace.to_pages.subscribe();
-        workspace.pages.store(1, Ordering::SeqCst);
+        let mut from_server = workspace.subscribe();
+        workspace.set_page_count(1);
         let server = CanvasServer::new(state);
 
         let result = server
@@ -2440,8 +2422,8 @@ mod tests {
     async fn point_carries_the_element_id() {
         let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
         let workspace = state.workspace(crate::state::DEFAULT_WORKSPACE).await;
-        let mut from_server = workspace.to_pages.subscribe();
-        workspace.pages.store(1, Ordering::SeqCst);
+        let mut from_server = workspace.subscribe();
+        workspace.set_page_count(1);
         let server = CanvasServer::new(state);
 
         server
@@ -2458,8 +2440,8 @@ mod tests {
     async fn canvas_draw_creates_and_broadcasts_an_element() {
         let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
         let workspace = state.workspace(crate::state::DEFAULT_WORKSPACE).await;
-        let mut from_server = workspace.to_pages.subscribe();
-        workspace.pages.store(1, Ordering::SeqCst);
+        let mut from_server = workspace.subscribe();
+        workspace.set_page_count(1);
         let server = CanvasServer::new(state.clone());
 
         let result = server
@@ -2480,7 +2462,7 @@ mod tests {
         assert_ne!(result.is_error, Some(true));
         let created: serde_json::Value = serde_json::from_str(&error_text(&result)).unwrap();
         assert_eq!(created["elements"], 2, "sticky plus its bound label");
-        let doc = workspace.doc.lock().await;
+        let doc = workspace.doc().lock().await;
         assert!(doc.live_count() == 2);
         let sticky = doc
             .ordered_live()
@@ -2510,8 +2492,8 @@ mod tests {
     async fn canvas_pen_creates_and_broadcasts_a_stroke() {
         let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
         let workspace = state.workspace(crate::state::DEFAULT_WORKSPACE).await;
-        let mut from_server = workspace.to_pages.subscribe();
-        workspace.pages.store(1, Ordering::SeqCst);
+        let mut from_server = workspace.subscribe();
+        workspace.set_page_count(1);
         let server = CanvasServer::new(state.clone());
 
         let result = server
@@ -2584,7 +2566,7 @@ mod tests {
             .unwrap();
         let created: serde_json::Value = serde_json::from_str(&error_text(&result)).unwrap();
         let id = workspace.resolve_id(created["id"].as_str().unwrap()).await;
-        let doc = workspace.doc.lock().await;
+        let doc = workspace.doc().lock().await;
         let element = doc.element(&id).expect("created stroke");
         let canvas_core::model::ElementKind::Freehand {
             pressures, style, ..
@@ -2613,7 +2595,7 @@ mod tests {
     async fn canvas_pen_strokes_show_up_in_the_scene_graph() {
         let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
         let workspace = state.workspace(crate::state::DEFAULT_WORKSPACE).await;
-        workspace.pages.store(1, Ordering::SeqCst);
+        workspace.set_page_count(1);
         let server = CanvasServer::new(state);
         let result = server
             .canvas_pen(Parameters(pen_args(vec![
@@ -2674,7 +2656,7 @@ mod tests {
         let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
         let workspace = state.workspace(crate::state::DEFAULT_WORKSPACE).await;
         let (frame_id, s1, s2, t1, t2, arrow_id, dangling_id, stack_id) = {
-            let mut doc = workspace.doc.lock().await;
+            let mut doc = workspace.doc().lock().await;
             let frame_id = doc.add_at(
                 ElementKind::Frame {
                     rect: Rect::new(0.0, 0.0, 400.0, 300.0),
@@ -2803,7 +2785,7 @@ mod tests {
                 .unwrap(),
         );
         let handles = {
-            let mut aliases = workspace.aliases.lock().await;
+            let mut aliases = workspace.aliases().lock().await;
             (
                 aliases.handle(&frame_id),
                 aliases.handle(&s1),
@@ -2910,7 +2892,7 @@ mod tests {
             stack,
             sticky,
         ) = {
-            let mut doc = workspace.doc.lock().await;
+            let mut doc = workspace.doc().lock().await;
             let frame = doc.add(
                 ElementKind::Frame {
                     rect: Rect::new(0.0, 0.0, 400.0, 300.0),
@@ -3032,7 +3014,7 @@ mod tests {
                 .unwrap(),
         );
 
-        let mut aliases = workspace.aliases.lock().await;
+        let mut aliases = workspace.aliases().lock().await;
         let h_frame = aliases.handle(&frame);
         let h_a = aliases.handle(&overlap_a);
         let h_b = aliases.handle(&overlap_b);
@@ -3139,7 +3121,7 @@ mod tests {
             .canvas_draw(Parameters(draw("ellipse")))
             .await
             .unwrap();
-        let mut doc = workspace.doc.lock().await;
+        let mut doc = workspace.doc().lock().await;
         let before = doc.clone();
         let id = doc.add(
             canvas_core::model::ElementKind::Shape {
@@ -3152,7 +3134,7 @@ mod tests {
         );
         workspace.record_change(&before, &doc, "page").await;
         drop(doc);
-        let handle = workspace.aliases.lock().await.handle(&id);
+        let handle = workspace.aliases().lock().await.handle(&id);
 
         let report = error_text(
             &server
@@ -3249,11 +3231,11 @@ mod tests {
             .canvas_draw(Parameters(draw("ellipse")))
             .await
             .unwrap();
-        let revision = workspace.revision.load(Ordering::SeqCst);
+        let revision = workspace.revision();
         assert_eq!(revision, 2);
 
         {
-            let mut doc = workspace.doc.lock().await;
+            let mut doc = workspace.doc().lock().await;
             let ids: Vec<String> = doc
                 .ordered_live()
                 .iter()
@@ -3344,7 +3326,7 @@ mod tests {
         assert!(body["bulk"]["bounds"].is_array(), "{receipt}");
         assert!(body["transaction"].is_null(), "{receipt}");
         // 3 shapes + 1 label + 2 arrows + 1 frame.
-        assert_eq!(workspace.doc.lock().await.live_count(), 7);
+        assert_eq!(workspace.doc().lock().await.live_count(), 7);
         // The frame reverts the whole batch: one clear takes shapes, the
         // label and the bound arrows with it.
         let frame = body["bulk"]["frame"].as_str().unwrap().to_string();
@@ -3356,7 +3338,7 @@ mod tests {
                 .unwrap(),
         );
         assert!(cleared.contains('7'), "{cleared}");
-        assert_eq!(workspace.doc.lock().await.live_count(), 0);
+        assert_eq!(workspace.doc().lock().await.live_count(), 0);
     }
 
     #[tokio::test]
@@ -3384,7 +3366,7 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&receipt).unwrap();
         assert_eq!(body["bulk"]["shapes"], 10, "{receipt}");
         assert_eq!(body["bulk"]["connects"], 13, "{receipt}");
-        assert_eq!(workspace.doc.lock().await.live_count(), 23);
+        assert_eq!(workspace.doc().lock().await.live_count(), 23);
     }
 
     #[tokio::test]
@@ -3458,7 +3440,7 @@ mod tests {
         );
         assert!(body["bounds"].is_array(), "{summary}");
         assert!(body["revision"].is_u64(), "{summary}");
-        assert!(workspace.doc.lock().await.live_count() > 0);
+        assert!(workspace.doc().lock().await.live_count() > 0);
     }
 
     fn attention_rect(doc: &mut Document, x: f64, y: f64, w: f64, h: f64) -> String {
@@ -3477,23 +3459,25 @@ mod tests {
     async fn canvas_read_attention_reports_the_view_and_nearby_elements() {
         let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
         let workspace = state.workspace(crate::state::DEFAULT_WORKSPACE).await;
-        workspace.pages.store(1, Ordering::SeqCst);
+        workspace.set_page_count(1);
         let (inside, nearby) = {
-            let mut doc = workspace.doc.lock().await;
+            let mut doc = workspace.doc().lock().await;
             (
                 attention_rect(&mut doc, 20.0, 20.0, 20.0, 20.0),
                 attention_rect(&mut doc, 105.0, 20.0, 10.0, 10.0),
             )
         };
         {
-            let mut doc = workspace.doc.lock().await;
+            let mut doc = workspace.doc().lock().await;
             attention_rect(&mut doc, 400.0, 400.0, 10.0, 10.0);
         }
-        *workspace.view_hint.lock().await = Some(crate::state::ViewHint {
-            camera: Some(serde_json::json!({ "x": 0.0, "y": 0.0, "zoom": 1.0 })),
-            viewport: Some(serde_json::json!({ "w": 100.0, "h": 100.0 })),
-            selection: vec![inside.clone()],
-        });
+        workspace
+            .set_view_hint(crate::state::ViewHint {
+                camera: Some(serde_json::json!({ "x": 0.0, "y": 0.0, "zoom": 1.0 })),
+                viewport: Some(serde_json::json!({ "w": 100.0, "h": 100.0 })),
+                selection: vec![inside.clone()],
+            })
+            .await;
         let server = CanvasServer::new(state);
         let text = error_text(
             &server
@@ -3505,7 +3489,7 @@ mod tests {
                 .unwrap(),
         );
         let (inside_handle, nearby_handle) = {
-            let mut aliases = workspace.aliases.lock().await;
+            let mut aliases = workspace.aliases().lock().await;
             (aliases.handle(&inside), aliases.handle(&nearby))
         };
         assert!(text.contains("view 0,0 100x100 zoom=1 page=live"), "{text}");
@@ -3535,7 +3519,7 @@ mod tests {
         let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
         let workspace = state.workspace(crate::state::DEFAULT_WORKSPACE).await;
         {
-            let mut doc = workspace.doc.lock().await;
+            let mut doc = workspace.doc().lock().await;
             for i in 0..101 {
                 attention_rect(&mut doc, (i % 10) as f64, (i / 10) as f64, 1.0, 1.0);
             }
@@ -3543,11 +3527,13 @@ mod tests {
                 attention_rect(&mut doc, 105.0, i as f64, 1.0, 1.0);
             }
         }
-        *workspace.view_hint.lock().await = Some(crate::state::ViewHint {
-            camera: Some(serde_json::json!({ "x": 0.0, "y": 0.0, "zoom": 1.0 })),
-            viewport: Some(serde_json::json!({ "w": 100.0, "h": 100.0 })),
-            selection: Vec::new(),
-        });
+        workspace
+            .set_view_hint(crate::state::ViewHint {
+                camera: Some(serde_json::json!({ "x": 0.0, "y": 0.0, "zoom": 1.0 })),
+                viewport: Some(serde_json::json!({ "w": 100.0, "h": 100.0 })),
+                selection: Vec::new(),
+            })
+            .await;
         let server = CanvasServer::new(state);
         let text = error_text(
             &server
@@ -3586,11 +3572,13 @@ mod tests {
             "no_view: no page is reporting view state; connect a page or read without attention"
         );
 
-        *workspace.view_hint.lock().await = Some(crate::state::ViewHint {
-            camera: None,
-            viewport: Some(serde_json::json!({ "w": 100.0, "h": 100.0 })),
-            selection: Vec::new(),
-        });
+        workspace
+            .set_view_hint(crate::state::ViewHint {
+                camera: None,
+                viewport: Some(serde_json::json!({ "w": 100.0, "h": 100.0 })),
+                selection: Vec::new(),
+            })
+            .await;
         let incomplete = server
             .canvas_read(Parameters(ReadArgs {
                 attention: true,
@@ -3609,11 +3597,13 @@ mod tests {
     async fn canvas_read_attention_rejects_scopes_and_since() {
         let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
         let workspace = state.workspace(crate::state::DEFAULT_WORKSPACE).await;
-        *workspace.view_hint.lock().await = Some(crate::state::ViewHint {
-            camera: Some(serde_json::json!({ "x": 0.0, "y": 0.0, "zoom": 1.0 })),
-            viewport: Some(serde_json::json!({ "w": 100.0, "h": 100.0 })),
-            selection: Vec::new(),
-        });
+        workspace
+            .set_view_hint(crate::state::ViewHint {
+                camera: Some(serde_json::json!({ "x": 0.0, "y": 0.0, "zoom": 1.0 })),
+                viewport: Some(serde_json::json!({ "w": 100.0, "h": 100.0 })),
+                selection: Vec::new(),
+            })
+            .await;
         let server = CanvasServer::new(state);
         let attention = || ReadArgs {
             attention: true,
@@ -3654,14 +3644,16 @@ mod tests {
         let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
         let workspace = state.workspace(crate::state::DEFAULT_WORKSPACE).await;
         {
-            let mut doc = workspace.doc.lock().await;
+            let mut doc = workspace.doc().lock().await;
             attention_rect(&mut doc, 0.0, 0.0, 10.0, 10.0);
         }
-        *workspace.view_hint.lock().await = Some(crate::state::ViewHint {
-            camera: Some(serde_json::json!({ "x": 0.0, "y": 0.0, "zoom": 1.0 })),
-            viewport: Some(serde_json::json!({ "w": 100.0, "h": 100.0 })),
-            selection: Vec::new(),
-        });
+        workspace
+            .set_view_hint(crate::state::ViewHint {
+                camera: Some(serde_json::json!({ "x": 0.0, "y": 0.0, "zoom": 1.0 })),
+                viewport: Some(serde_json::json!({ "w": 100.0, "h": 100.0 })),
+                selection: Vec::new(),
+            })
+            .await;
         let server = CanvasServer::new(state);
         let text = error_text(
             &server
@@ -3681,7 +3673,7 @@ mod tests {
         let workspace = state.workspace(crate::state::DEFAULT_WORKSPACE).await;
         let server = CanvasServer::new(state);
         let (frame, sticky, text, outside) = {
-            let mut doc = workspace.doc.lock().await;
+            let mut doc = workspace.doc().lock().await;
             let frame = doc.add(
                 canvas_core::ElementKind::Frame {
                     rect: canvas_core::geometry::Rect::new(0.0, 0.0, 400.0, 300.0),
@@ -3821,7 +3813,7 @@ mod tests {
         );
         let shape = elements.iter().find(|e| e["id"] == id).unwrap();
         let exact = {
-            let doc = workspace.doc.lock().await;
+            let doc = workspace.doc().lock().await;
             serde_json::to_value(doc.element(&id).unwrap()).unwrap()
         };
         assert_eq!(shape["element"], exact);
@@ -3905,7 +3897,7 @@ mod tests {
             .unwrap();
         let first: serde_json::Value = serde_json::from_str(&error_text(&first)).unwrap();
         let removed_handle = first["id"].as_str().unwrap().to_string();
-        let baseline = workspace.revision.load(Ordering::SeqCst);
+        let baseline = workspace.revision();
 
         let second = server
             .canvas_draw(Parameters(draw("ellipse")))
@@ -3931,7 +3923,7 @@ mod tests {
         let body = structured(&result);
         assert_eq!(body["workspace"], "default");
         assert_eq!(body["context"], workspace.context());
-        assert_eq!(body["revision"], workspace.revision.load(Ordering::SeqCst));
+        assert_eq!(body["revision"], workspace.revision());
         let changes = body["changes"].as_array().unwrap();
         assert_eq!(changes.len(), 2);
         assert_eq!(changes[0]["source"], "agent");
@@ -3946,11 +3938,13 @@ mod tests {
     async fn status_reports_revision_and_ephemeral_view_hints() {
         let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
         let workspace = state.workspace(crate::state::DEFAULT_WORKSPACE).await;
-        *workspace.view_hint.lock().await = Some(crate::state::ViewHint {
-            camera: Some(serde_json::json!({ "x": 10.0, "y": 20.0, "zoom": 1.5 })),
-            viewport: Some(serde_json::json!({ "w": 800.0, "h": 600.0 })),
-            selection: vec!["db".into()],
-        });
+        workspace
+            .set_view_hint(crate::state::ViewHint {
+                camera: Some(serde_json::json!({ "x": 10.0, "y": 20.0, "zoom": 1.5 })),
+                viewport: Some(serde_json::json!({ "w": 800.0, "h": 600.0 })),
+                selection: vec!["db".into()],
+            })
+            .await;
         let server = CanvasServer::new(state);
         let result = tokio::time::timeout(Duration::from_secs(1), server.canvas_status())
             .await
@@ -3976,8 +3970,8 @@ mod tests {
             .apply_settings_patch(&serde_json::json!({ "camera": "off" }))
             .await
             .unwrap();
-        let mut from_server = workspace.to_pages.subscribe();
-        workspace.pages.store(1, Ordering::SeqCst);
+        let mut from_server = workspace.subscribe();
+        workspace.set_page_count(1);
         let server = CanvasServer::new(state);
 
         let result = server
@@ -4006,8 +4000,8 @@ mod tests {
             .apply_settings_patch(&serde_json::json!({ "pacing": "fast" }))
             .await
             .unwrap();
-        let mut from_server = workspace.to_pages.subscribe();
-        workspace.pages.store(1, Ordering::SeqCst);
+        let mut from_server = workspace.subscribe();
+        workspace.set_page_count(1);
         let ack_state = workspace.clone();
         let (frame_tx, frame_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
@@ -4018,7 +4012,7 @@ mod tests {
                 let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
                 if frame["type"] == "present" {
                     let id = frame["id"].as_u64().unwrap();
-                    let _ = ack_state.present_acks.send((id, false));
+                    ack_state.acknowledge_presentation(id, false);
                     let _ = frame_tx.send(frame);
                     break;
                 }
@@ -4099,7 +4093,7 @@ mod tests {
         assert!(body["created"]["db"].is_string());
         assert_eq!(body["beats"], 3);
         assert_eq!(
-            workspace.doc.lock().await.live_count(),
+            workspace.doc().lock().await.live_count(),
             6,
             "2 stickies, 2 labels, 1 arrow, 1 arrow label"
         );
@@ -4126,15 +4120,15 @@ mod tests {
             .unwrap();
         assert_eq!(result.is_error, Some(true));
         assert!(error_text(&result).contains("beat 2"));
-        assert_eq!(workspace.doc.lock().await.live_count(), 0);
+        assert_eq!(workspace.doc().lock().await.live_count(), 0);
     }
 
     #[tokio::test]
     async fn canvas_script_waits_for_the_page_to_finish_playing() {
         let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
         let workspace = state.workspace(crate::state::DEFAULT_WORKSPACE).await;
-        let mut from_server = workspace.to_pages.subscribe();
-        workspace.pages.store(1, Ordering::SeqCst);
+        let mut from_server = workspace.subscribe();
+        workspace.set_page_count(1);
         let ack_state = workspace.clone();
         tokio::spawn(async move {
             while let Ok(message) = from_server.recv().await {
@@ -4144,7 +4138,7 @@ mod tests {
                 let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
                 if frame["type"] == "present" {
                     let id = frame["id"].as_u64().unwrap();
-                    let _ = ack_state.present_acks.send((id, false));
+                    ack_state.acknowledge_presentation(id, false);
                     break;
                 }
             }
@@ -4241,17 +4235,15 @@ mod tests {
     async fn screenshot_prefers_the_live_page() {
         let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
         let workspace = state.workspace(crate::state::DEFAULT_WORKSPACE).await;
-        let mut from_server = workspace.to_pages.subscribe();
-        workspace.pages.store(1, Ordering::SeqCst);
+        let mut from_server = workspace.subscribe();
+        workspace.set_page_count(1);
         let reply_state = workspace.clone();
         tokio::spawn(async move {
             while let Ok(message) = from_server.recv().await {
                 let frame = control_frame(message);
                 if frame["type"] == "screenshot" {
                     let id = frame["id"].as_u64().unwrap();
-                    let _ = reply_state
-                        .screenshot_replies
-                        .send((id, Some("data:image/png;base64,QUJD".into())));
+                    reply_state.reply_screenshot(id, Some("data:image/png;base64,QUJD".into()));
                     break;
                 }
             }
@@ -4272,7 +4264,7 @@ mod tests {
     async fn failed_emphasis_does_not_change_document_or_revision() {
         let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
         let workspace = state.workspace("default").await;
-        let id = workspace.doc.lock().await.add(
+        let id = workspace.doc().lock().await.add(
             canvas_core::model::ElementKind::Shape {
                 shape: canvas_core::model::ShapeKind::Rectangle,
                 rect: canvas_core::geometry::Rect::new(0.0, 0.0, 100.0, 50.0),
@@ -4281,8 +4273,8 @@ mod tests {
             },
             1,
         );
-        let before = workspace.doc.lock().await.clone();
-        let mut messages = workspace.to_pages.subscribe();
+        let before = workspace.doc().lock().await.clone();
+        let mut messages = workspace.subscribe();
         let server = CanvasServer::new(state);
         let result = server
             .canvas_emphasis(Parameters(EmphasisArgs {
@@ -4292,8 +4284,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.is_error, Some(true));
-        assert_eq!(*workspace.doc.lock().await, before);
-        assert_eq!(workspace.revision.load(Ordering::SeqCst), 0);
+        assert_eq!(*workspace.doc().lock().await, before);
+        assert_eq!(workspace.revision(), 0);
         assert!(messages.try_recv().is_err());
     }
 
@@ -4362,7 +4354,7 @@ mod tests {
         .unwrap();
         assert!(tidied["moved"].as_u64().is_some());
 
-        let before_clear = workspace.doc.lock().await.live_count();
+        let before_clear = workspace.doc().lock().await.live_count();
         let cleared = serde_json::from_str::<serde_json::Value>(&error_text(
             &server
                 .canvas_clear(Parameters(ElementIdsArgs {
@@ -4373,10 +4365,10 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(cleared["cleared"], 2, "the sticky and its label");
-        assert!(workspace.doc.lock().await.live_count() < before_clear);
+        assert!(workspace.doc().lock().await.live_count() < before_clear);
         assert!(
             workspace
-                .doc
+                .doc()
                 .lock()
                 .await
                 .element(&first_id)
@@ -4389,7 +4381,7 @@ mod tests {
     async fn tools_act_on_the_workspace_the_user_is_viewing() {
         let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
         let beta = state.workspace("beta").await;
-        beta.pages.store(1, Ordering::SeqCst);
+        beta.set_page_count(1);
         beta.note_page_activity();
         let server = CanvasServer::new(state.clone());
 
@@ -4410,12 +4402,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            beta.doc.lock().await.live_count(),
+            beta.doc().lock().await.live_count(),
             2,
             "the sticky and its label land on the current workspace"
         );
         let default = state.workspace(crate::state::DEFAULT_WORKSPACE).await;
-        assert_eq!(default.doc.lock().await.live_count(), 0);
+        assert_eq!(default.doc().lock().await.live_count(), 0);
 
         let status = server.canvas_status().await.unwrap();
         let body: serde_json::Value = serde_json::from_str(&error_text(&status)).unwrap();
@@ -4445,7 +4437,7 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&error_text(&result)).unwrap();
         assert_eq!(body["workspace"], "fresh");
         assert_eq!(body["switched"], false);
-        assert_eq!(state.current_workspace().await.name, "default");
+        assert_eq!(state.current_workspace().await.name(), "default");
 
         let status = server.canvas_status().await.unwrap();
         let body: serde_json::Value = serde_json::from_str(&error_text(&status)).unwrap();
@@ -4491,9 +4483,9 @@ mod tests {
     async fn workspace_create_opens_the_workspace_and_later_tools_land_there() {
         let state = Arc::new(AppState::new(std::path::PathBuf::from("."), None, true));
         let source = state.workspace(crate::state::DEFAULT_WORKSPACE).await;
-        source.pages.store(1, Ordering::SeqCst);
+        source.set_page_count(1);
         source.note_page_activity();
-        let mut from_server = source.to_pages.subscribe();
+        let mut from_server = source.subscribe();
         let page_state = state.clone();
         let page = tokio::spawn(async move {
             let frame = control_frame(from_server.recv().await.unwrap());
@@ -4502,7 +4494,7 @@ mod tests {
             let target = page_state
                 .workspace(frame["workspace"].as_str().unwrap())
                 .await;
-            target.pages.store(1, Ordering::SeqCst);
+            target.set_page_count(1);
             target.note_page_activity();
             target
         });
@@ -4537,12 +4529,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            target.doc.lock().await.live_count(),
+            target.doc().lock().await.live_count(),
             2,
             "the sticky and its label land where the page followed"
         );
-        assert_eq!(source.doc.lock().await.live_count(), 0);
-        assert_eq!(state.current_workspace().await.name, "fresh");
+        assert_eq!(source.doc().lock().await.live_count(), 0);
+        assert_eq!(state.current_workspace().await.name(), "fresh");
     }
 
     #[tokio::test]
@@ -4569,12 +4561,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            beta.doc.lock().await.live_count(),
+            beta.doc().lock().await.live_count(),
             0,
             "a workspace nobody is watching is never current"
         );
         let default = state.workspace(crate::state::DEFAULT_WORKSPACE).await;
-        assert_eq!(default.doc.lock().await.live_count(), 2);
+        assert_eq!(default.doc().lock().await.live_count(), 2);
     }
 }
 

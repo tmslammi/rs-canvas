@@ -784,7 +784,7 @@ fn shift_ops_points(ops: &mut [DrawOp], dx: f64, dy: f64) {
 impl Scene {
     /// Slot-based subset shift: rigid in-place shift addressed
     /// by layer positions resolved once per gesture (see
-    /// `Editor::drag_slots`). Bounds move eagerly; cached points follow
+    /// `InteractionController` drag slots). Bounds move eagerly; cached points follow
     /// lazily via [`Scene::flush_preview_stale`] (at overview zoom nothing
     /// ever reads them). No map lookups, no id clones per move.
     pub fn shift_slots(&mut self, slots: &[u32], dx: f64, dy: f64) {

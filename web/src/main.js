@@ -1,8 +1,10 @@
-import init, { Editor, load_saved_document, list_saved_workspaces, save_workspace_bytes, delete_saved_workspace } from "./wasm/canvas_wasm.js";
+import init, { Editor } from "./wasm/canvas_wasm.js";
 import { createStylePanel } from "./stylePanel.js";
 import { createAgentPanel } from "./agentPanel.js";
 import { connectAgentBridge } from "./agentBridge.js";
-import { createWorkspacePanel, validWorkspaceName, updateWorkspaceCatalogue } from "./workspacePanel.js";
+import { createWorkspacePanel } from "./workspacePanel.js";
+import { createAutosave, listSavedWorkspaces } from "./autosave.js";
+import { createWorkspaceSession, workspaceFromLocation } from "./workspaceSession.js";
 
 const TOOLS = [
   { name: "select", label: "Select", glyph: "↖", shortcut: "V" },
@@ -39,13 +41,7 @@ async function boot() {
   const overlay = document.getElementById("overlay");
   const toolbar = document.getElementById("toolbar");
   const stylePanelHost = document.getElementById("style-panel");
-  const requestedWorkspace = new URLSearchParams(location.search).get("ws") || "default";
-  const workspace = validWorkspaceName(requestedWorkspace) ? requestedWorkspace : "default";
-  if (workspace !== requestedWorkspace) {
-    const url = new URL(location.href);
-    url.searchParams.delete("ws");
-    history.replaceState(null, "", url);
-  }
+  const { requested: requestedWorkspace, workspace } = workspaceFromLocation();
   document.title = `${workspace} — rs-canvas`;
   const editor = new Editor(scene, overlay, grid);
   editor.set_workspace(workspace);
@@ -64,6 +60,13 @@ async function boot() {
     window.clearTimeout(toastTimer);
     toastTimer = window.setTimeout(() => toast.classList.remove("visible"), 3200);
   };
+
+  // The page's local persistence: debounced IndexedDB saves, the unload
+  // checkpoint and boot restore. Created before any input handler can emit
+  // document changes.
+  const autosave = createAutosave(editor, workspace, {
+    onRestored: (message) => showToast(message),
+  });
 
   // -- grid and snapping (per-browser preferences) ------------------------
 
@@ -351,7 +354,7 @@ async function boot() {
   editor.set_action_handler((json) => {
     const action = JSON.parse(json);
     if (action.type === "document_changed") {
-      scheduleAutosave();
+      autosave.schedule();
       // Deferred: the handler runs inside the wasm call that produced the
       // change, and calling back into the editor re-entrantly would panic.
       queueMicrotask(() => {
@@ -383,70 +386,6 @@ async function boot() {
     textEditor.classList.add("visible");
     textEditor.focus();
     textEditor.setSelectionRange(action.text.length, action.text.length);
-  });
-
-  // Autosave is debounced in the shell so serializing a large document never
-  // happens inside a pointer or keyboard handler.
-  let autosaveTimer = 0;
-  let autosavePaused = false;
-  const scheduleAutosave = () => {
-    if (autosavePaused) return;
-    window.clearTimeout(autosaveTimer);
-    autosaveTimer = window.setTimeout(() => {
-      autosaveTimer = 0;
-      editor.flush_save();
-    }, 700);
-  };
-  // Test hook: let frame-time measurements on huge documents skip the
-  // (deliberately) expensive serialization pass.
-  window.__rsPauseAutosave = (paused) => {
-    autosavePaused = !!paused;
-  };
-  // The debounce loses edits made in its last ~700ms if the page goes away
-  // before the timer fires.
-  const flushPendingAutosave = () => {
-    if (autosaveTimer) {
-      window.clearTimeout(autosaveTimer);
-      autosaveTimer = 0;
-      editor.flush_save();
-    }
-  };
-  // IndexedDB writes spawned during unload can be torn down before they
-  // commit, so the unload path also writes a synchronous checkpoint.
-  const checkpointKey = (name) => name === "default"
-    ? "rs-canvas-unload-checkpoint"
-    : `rs-canvas-unload-checkpoint:workspace:${name}`;
-  const UNLOAD_CHECKPOINT = checkpointKey(workspace);
-  // localStorage is string-only, so binary checkpoints carry base64 with a
-  // distinct prefix.
-  const CHECKPOINT_PREFIX = "rsc-bin1:";
-  const bytesToBase64 = (bytes) => {
-    let binary = "";
-    const chunk = 0x8000;
-    for (let i = 0; i < bytes.length; i += chunk) {
-      binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
-    }
-    return btoa(binary);
-  };
-  const checkpointValue = (bytes) => CHECKPOINT_PREFIX + bytesToBase64(bytes);
-  const checkpointBytes = (value) => value.startsWith(CHECKPOINT_PREFIX)
-    ? Uint8Array.from(atob(value.slice(CHECKPOINT_PREFIX.length)), (c) => c.charCodeAt(0))
-    : null;
-  const checkpointAutosave = () => {
-    if (!autosaveTimer) return; // nothing pending — IndexedDB is already current
-    window.clearTimeout(autosaveTimer);
-    autosaveTimer = 0;
-    try {
-      localStorage.setItem(UNLOAD_CHECKPOINT, checkpointValue(editor.save_bytes()));
-    } catch {
-      // Quota or privacy-mode refusal: the async flush below may still land.
-    }
-    editor.flush_save();
-  };
-  window.addEventListener("pagehide", checkpointAutosave);
-  window.addEventListener("beforeunload", checkpointAutosave);
-  document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "hidden") flushPendingAutosave();
   });
 
   textEditor.addEventListener("input", () => {
@@ -601,7 +540,6 @@ async function boot() {
 
   // A workspace switch ends the outgoing gesture/text edit, then waits for
   // durable local storage before changing the URL and connecting a new editor.
-  let workspaceLeaving = false;
   const prepareWorkspace = () => {
     if (editingId) commitTextEditor();
     editor.pointer_cancel();
@@ -611,103 +549,20 @@ async function boot() {
     bridge?.publishChanges();
     return editor.save_bytes();
   };
-  const pauseWorkspaceSave = () => {
-    autosavePaused = true;
-    window.clearTimeout(autosaveTimer);
-    autosaveTimer = 0;
-  };
-  const catalogue = (remove, add) => {
-    try { updateWorkspaceCatalogue(remove, add); } catch { /* IndexedDB still lists saved names. */ }
-  };
-  const checkpoint = (name, bytes) => {
-    try { localStorage.setItem(checkpointKey(name), checkpointValue(bytes)); } catch { /* The awaited IndexedDB save is durable. */ }
-  };
-  const clearCheckpoint = (name) => {
-    try { localStorage.removeItem(checkpointKey(name)); } catch { /* Storage can be unavailable. */ }
-  };
-  const workspaceUrl = (name) => {
-    const url = new URL(location.href);
-    if (name === "default") url.searchParams.delete("ws");
-    else url.searchParams.set("ws", name);
-    return url;
-  };
-  const navigateWorkspace = (name, message) => {
-    workspaceLeaving = true;
-    pauseWorkspaceSave();
-    bridge?.close();
-    catalogue(null, name);
-    if (message) {
-      try { sessionStorage.setItem("rs-canvas-workspace-message", message); } catch { /* Feedback is optional. */ }
-    }
-    location.assign(workspaceUrl(name));
-  };
-  const storeOutgoingWorkspace = async () => {
-    const bytes = prepareWorkspace();
-    await save_workspace_bytes(workspace, bytes);
-    checkpoint(workspace, bytes);
-    return bytes;
-  };
-  const managementRequest = async (path, options) => {
-    const response = await fetch(`/api/workspaces/${encodeURIComponent(workspace)}${path}`, options);
-    const body = await response.json().catch(() => ({}));
-    if (!response.ok && response.status !== 404) throw new Error(body.error || "Could not update workspace. Try again when the server is available.");
-    // A local autosave need not have a server mirror (for example after a restart).
-    if (response.status === 404 && !body.error) throw new Error("The server is unavailable. Reconnect before renaming or deleting.");
-  };
-  const removeLocalWorkspace = async () => {
-    await delete_saved_workspace(workspace);
-    clearCheckpoint(workspace);
-    catalogue(workspace, null);
-  };
-  const manageWorkspace = async (name) => {
-    const bytes = await storeOutgoingWorkspace();
-    if (name && await load_saved_document(name)) throw new Error("That workspace already has a saved drawing. Choose another name.");
-    pauseWorkspaceSave();
-    workspaceLeaving = true;
-    let serverChanged = false;
-    try {
-      if (name) await save_workspace_bytes(name, bytes);
-      await managementRequest(name ? "/rename" : "", name ? {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        // The page uploads its document over the binary wire after navigating;
-        // the management route only moves the workspace.
-        body: JSON.stringify({ name }),
-      } : { method: "DELETE" });
-      serverChanged = true;
-      bridge?.close();
-      await removeLocalWorkspace();
-      if (name) checkpoint(name, bytes);
-      navigateWorkspace(name || "default", name ? `Workspace renamed to ${name}` : `Workspace ${workspace} deleted`);
-    } catch (error) {
-      if (serverChanged) {
-        // The server's change is durable. Keep a local recovery copy if the
-        // browser refuses deletion, and take the page to its new destination.
-        navigateWorkspace(name || "default", "Workspace updated on the server. A local recovery copy could not be removed.");
-      } else {
-        if (name) await delete_saved_workspace(name).catch(() => {});
-        workspaceLeaving = false;
-        autosavePaused = false;
-        throw error;
-      }
-    }
-  };
+  const workspaceSession = createWorkspaceSession({
+    workspace,
+    autosave,
+    prepare: prepareWorkspace,
+    closeBridge: () => bridge?.close(),
+    showToast,
+  });
   const workspacePanel = createWorkspacePanel(document.getElementById("app"), {
     current: workspace,
-    localSavedNames: async () => JSON.parse(await list_saved_workspaces()),
-    onSwitch: async (name) => {
-      if (!validWorkspaceName(name)) throw new Error("Invalid workspace name.");
-      await storeOutgoingWorkspace();
-      navigateWorkspace(name);
-    },
-    onDuplicate: async (name) => {
-      if (await load_saved_document(name)) throw new Error("That workspace already has a saved drawing. Choose another name.");
-      const bytes = await storeOutgoingWorkspace();
-      await save_workspace_bytes(name, bytes);
-      checkpoint(name, bytes);
-      navigateWorkspace(name, `Duplicated ${workspace} as ${name}`);
-    },
-    onRename: manageWorkspace,
-    onDelete: () => manageWorkspace(null),
+    localSavedNames: listSavedWorkspaces,
+    onSwitch: workspaceSession.switchTo,
+    onDuplicate: workspaceSession.duplicate,
+    onRename: workspaceSession.rename,
+    onDelete: workspaceSession.remove,
   });
 
   // Wheel panning shifts existing pixels; snap to a crisp full render once
@@ -789,31 +644,7 @@ async function boot() {
 
   redraw();
 
-  try {
-    const saved = await load_saved_document(workspace);
-    if (saved) {
-      editor.load_bytes(saved);
-      showToast("Restored your last drawing");
-    }
-  } catch (error) {
-    console.warn("could not restore autosave", error);
-  }
-
-  // An unload checkpoint always post-dates whatever IndexedDB holds: apply
-  // it over the top, then hand it back to async persistence.
-  try {
-    const checkpoint = localStorage.getItem(UNLOAD_CHECKPOINT);
-    if (checkpoint) {
-      localStorage.removeItem(UNLOAD_CHECKPOINT);
-      const bytes = checkpointBytes(checkpoint);
-      if (bytes) {
-        editor.load_bytes(bytes);
-        editor.flush_save();
-      }
-    }
-  } catch (error) {
-    console.warn("could not restore unload checkpoint", error);
-  }
+  await autosave.restore();
 
   refreshToolbar();
 
@@ -822,51 +653,17 @@ async function boot() {
   bridge = connectAgentBridge(editor, {
     workspace,
     onRemoteChange: () => {
-      if (!autosavePaused) editor.flush_save();
+      autosave.flushNow();
       refreshToolbar();
       updateCursor();
     },
     onSettingsChange: (settings) => agentPanel.setSettings(settings),
     onDiscussionChange: (notes, persisted) => agentPanel.setDiscussion(notes, persisted),
-    onWorkspaceChange: async (change) => {
-      if (workspaceLeaving || !validWorkspaceName(change.workspace)) return;
-      if (change.action === "switch") {
-        // The agent created and opened another workspace. Keep this browser's
-        // autosave for the outgoing one, then follow the server's navigation.
-        workspaceLeaving = true;
-        try {
-          await storeOutgoingWorkspace();
-        } catch {
-          // The server mirror still holds the outgoing document.
-        }
-        navigateWorkspace(change.workspace, `Opened workspace ${change.workspace}`);
-        return;
-      }
-      workspaceLeaving = true;
-      pauseWorkspaceSave();
-      bridge?.close();
-      try {
-        if (change.action === "rename") {
-          const bytes = prepareWorkspace();
-          await save_workspace_bytes(change.workspace, bytes);
-          checkpoint(change.workspace, bytes);
-        }
-        await removeLocalWorkspace();
-        navigateWorkspace(change.workspace, "Workspace updated");
-      } catch {
-        navigateWorkspace(change.workspace, "Workspace updated on the server. A local recovery copy remains in this browser.");
-      }
-    },
+    onWorkspaceChange: workspaceSession.handleServerChange,
   });
 
   if (workspace !== requestedWorkspace) showToast("Invalid workspace name. Opened default instead.", true);
-  try {
-    const message = sessionStorage.getItem("rs-canvas-workspace-message");
-    if (message) {
-      sessionStorage.removeItem("rs-canvas-workspace-message");
-      showToast(message);
-    }
-  } catch { /* Optional feedback. */ }
+  workspaceSession.restoreMessage();
   window.__rsEditor = editor;
   window.__rsReady = true;
 }
