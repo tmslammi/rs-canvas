@@ -26,6 +26,7 @@ pub mod layout;
 pub mod merge;
 pub mod model;
 pub mod nav;
+pub mod page;
 pub mod patch;
 mod projection;
 pub mod relations;
@@ -68,6 +69,10 @@ pub use model::{
     StrokeDash, Style, StylePatch, TextAlign, SCHEMA_VERSION,
 };
 pub use nav::NavigationState;
+pub use page::{
+    FrameApply, PageSession, PatchFrame, PendingFrame, PresentOutcome, PresentScript, PresentStep,
+    PresentationAdvance, PresentationCues, Receive, SnapshotFrame, DEFAULT_PRESENT_ZOOM_CAP,
+};
 pub use patch::{merge_element, Patch};
 pub use scene::{Scene, SceneLayer};
 pub use shell::{Effects, ShellAction};

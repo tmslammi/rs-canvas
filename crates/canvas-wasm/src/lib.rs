@@ -10,8 +10,9 @@ use std::collections::{BTreeSet, HashMap};
 
 use canvas_core::{
     wire, Affine, ArrowHandle, Camera, CameraTween, Dash, Document, DrawOp, Editor as CoreEditor,
-    Effects, FillStyle, Modifiers, Point, PurgeLedger, Rect, Renderer, ShellAction, StrokeStyle,
-    StylePatch, TextAlign, TextMeasurer, TextOp, Tool,
+    Effects, FillStyle, FrameApply, Modifiers, PageSession, PendingFrame, Point,
+    PresentationAdvance, PresentationCues, Rect, Renderer, ShellAction, StrokeStyle, StylePatch,
+    TextAlign, TextMeasurer, TextOp, Tool, DEFAULT_PRESENT_ZOOM_CAP,
 };
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -27,9 +28,6 @@ const GRID_MIN_SPACING_PX: f64 = 6.0;
 const CAMERA_TWEEN_MS: u64 = 380;
 /// How long a `point` highlight pulses for.
 const PULSE_MS: u64 = 1100;
-/// Focus never zooms past this unless the server grants a higher cap: small
-/// elements should not cause a dramatic jump.
-const DEFAULT_FOCUS_MAX_ZOOM: f64 = 2.0;
 /// A focus target already inside the viewport by this margin is left alone.
 const FOCUS_MARGIN_PX: f64 = 32.0;
 /// Below this zoom the renderer switches to the batched overview (LOD) path:
@@ -40,10 +38,6 @@ const FOCUS_MARGIN_PX: f64 = 32.0;
 /// Interaction and hit-testing still use full geometry; zooming back in
 /// restores exact hand-drawn rendering with no invalidation lag (same frame).
 const LOD_ZOOM: f64 = 0.25;
-
-fn default_zoom_cap() -> f64 {
-    DEFAULT_FOCUS_MAX_ZOOM
-}
 
 /// Clamp a camera's zoom without moving the world point at its centre.
 fn cap_zoom(camera: Camera, viewport: (f64, f64), cap: f64) -> Camera {
@@ -297,49 +291,6 @@ struct Pulse {
     duration_ms: u64,
 }
 
-/// One step of an agent presentation timeline.
-#[derive(Clone, Debug, serde::Deserialize)]
-struct PresentStep {
-    #[serde(default)]
-    reveal: Vec<canvas_core::ElementId>,
-    #[serde(default)]
-    focus: Option<canvas_core::ElementId>,
-    #[serde(default)]
-    point: Option<canvas_core::ElementId>,
-    #[serde(default)]
-    caption: Option<String>,
-    #[serde(default)]
-    hold_ms: u64,
-}
-
-#[derive(Clone, Debug, serde::Deserialize)]
-struct PresentScript {
-    id: u64,
-    steps: Vec<PresentStep>,
-    #[serde(default = "default_zoom_cap")]
-    zoom_cap: f64,
-}
-
-/// Playback of an agent explanation: the document is already final; this is
-/// the reveal frontier, caption and camera cue over it. View state only.
-struct Presentation {
-    id: u64,
-    steps: Vec<PresentStep>,
-    index: usize,
-    step_started_ms: u64,
-    /// Elements not yet revealed.
-    hidden: BTreeSet<canvas_core::ElementId>,
-    caption: Option<String>,
-    /// The server's zoom cap for focus beats.
-    zoom_cap: f64,
-}
-
-#[derive(Clone, Debug, serde::Serialize)]
-struct PresentOutcome {
-    id: u64,
-    cancelled: bool,
-}
-
 /// The editor handle the shell talks to.
 #[wasm_bindgen]
 pub struct Editor {
@@ -363,22 +314,9 @@ pub struct Editor {
     tween: Option<CameraTween>,
     /// Agent highlight pulse in flight, if any (view state only).
     pulse: Option<Pulse>,
-    /// A server snapshot that arrived mid-gesture, applied on pointer-up.
-    pending_remote: Option<Vec<u8>>,
-    /// Server patches that arrived mid-gesture, applied on pointer-up.
-    pending_patches: Vec<Vec<u8>>,
-    /// The last server revision this page has seen (a binary frame header or
-    /// the `synced` acknowledgement). Outbound snapshot and patch frames carry
-    /// it as the page's base revision; merging never depends on it.
-    wire_revision: u64,
-    /// Explicit deletions whose element entry was purged locally (undo of a
-    /// creation). The live document has no entry left, so the ledger is folded
-    /// into snapshots and autosaves; absence alone is never a deletion.
-    purge_ledger: PurgeLedger,
-    /// Agent explanation playback in flight, if any (view state only).
-    presentation: Option<Presentation>,
-    /// Finished/cancelled playbacks the shell must acknowledge.
-    present_outcomes: Vec<PresentOutcome>,
+    /// Browser-free page state: base revision, purge ledger, deferred frames,
+    /// outbound projection and presentation playback.
+    page: PageSession,
 }
 
 fn offscreen_ctx() -> Result<CanvasRenderingContext2d, JsValue> {
@@ -442,12 +380,7 @@ impl Editor {
             last_paint: None,
             tween: None,
             pulse: None,
-            pending_remote: None,
-            pending_patches: Vec::new(),
-            wire_revision: 0,
-            purge_ledger: PurgeLedger::default(),
-            presentation: None,
-            present_outcomes: Vec::new(),
+            page: PageSession::new(),
         };
         editor
             .core
@@ -488,7 +421,7 @@ impl Editor {
         );
         let zoom_sensitivity = self.core.nav().zoom_sensitivity();
         self.core = CoreEditor::new(Document::new());
-        self.purge_ledger.clear();
+        self.page.clear_purge_ledger();
         self.core.set_grid_visible(grid_visible);
         self.core.set_snap_enabled(snap_to_grid);
         self.core.set_grid_size(grid_size);
@@ -509,7 +442,7 @@ impl Editor {
     pub fn load_benchmark_fixture(&mut self, count: usize) {
         let doc = canvas_core::benchmark_fixture(count);
         let effects = self.core.replace_document(doc);
-        self.purge_ledger.clear();
+        self.page.clear_purge_ledger();
         self.apply(effects);
     }
 
@@ -518,7 +451,7 @@ impl Editor {
     pub fn load_connected_fixture(&mut self, nodes: usize, arrows_per_node: usize) {
         let doc = canvas_core::benchmark::connected_fixture(nodes, arrows_per_node);
         let effects = self.core.replace_document(doc);
-        self.purge_ledger.clear();
+        self.page.clear_purge_ledger();
         self.apply(effects);
     }
 
@@ -559,8 +492,7 @@ impl Editor {
     /// revision is the page's base), then the versioned document envelope.
     /// No JSON pass and no string.
     pub fn snapshot_frame_bytes(&self) -> Vec<u8> {
-        let doc = self.synced_document();
-        wire::encode_snapshot(self.wire_revision, &doc).unwrap_or_default()
+        self.page.snapshot_frame(self.core.document())
     }
 
     /// Record the server revision carried by the `synced` control frame.
@@ -569,7 +501,7 @@ impl Editor {
     /// next snapshot uploads a truthful base.
     pub fn set_wire_revision(&mut self, revision: f64) {
         if revision.is_finite() && revision >= 0.0 {
-            self.wire_revision = revision as u64;
+            self.page.set_wire_revision(revision as u64);
         }
     }
 
@@ -578,11 +510,15 @@ impl Editor {
     /// A snapshot that lands mid-gesture is deferred to pointer-up: replacing
     /// the document under an in-flight drag would corrupt the gesture.
     pub fn reconcile_bytes(&mut self, bytes: &[u8]) -> Result<bool, JsValue> {
-        if self.core.is_interacting() {
-            self.pending_remote = Some(bytes.to_vec());
-            return Ok(false);
+        match self.page.apply_snapshot(&mut self.core, bytes) {
+            Ok(FrameApply::Deferred | FrameApply::Unchanged) => Ok(false),
+            Ok(FrameApply::Changed { .. }) => {
+                self.last_paint = None;
+                self.render();
+                Ok(true)
+            }
+            Err(error) => Err(JsValue::from_str(&error.to_string())),
         }
-        self.reconcile_bytes_now(bytes)
     }
 
     /// The kind of a wire frame (1 snapshot, 2 patch, 0 malformed). The shell
@@ -596,10 +532,8 @@ impl Editor {
     /// frame: header, revision, then the frozen v1 element list. No JSON pass
     /// and no string.
     pub fn take_outbound_frame_bytes(&mut self) -> Vec<u8> {
-        let Some(patch) = self.take_outbound_patch() else {
-            return Vec::new();
-        };
-        wire::encode_patch(self.wire_revision, &patch.put).unwrap_or_default()
+        let deltas = self.core.drain_outbox();
+        self.page.take_outbound_frame(&deltas, now_ms())
     }
 
     /// Drop pending deltas without projecting them; the reconnect snapshot
@@ -607,21 +541,20 @@ impl Editor {
     /// snapshot cannot forget an explicit deletion.
     pub fn discard_outbound(&mut self) {
         let deltas = self.core.drain_outbox();
-        if deltas.is_empty() {
-            return;
-        }
-        let projected = canvas_core::Patch::from_deltas(&deltas, now_ms());
-        self.purge_ledger.record(&deltas, &projected);
+        self.page.discard_outbound(&deltas, now_ms());
     }
 
     /// Merge a binary patch wire frame. Elements are merged per element with
     /// last-writer-wins. Mid-gesture patches are deferred to pointer-up.
     pub fn merge_patch_bytes(&mut self, bytes: &[u8]) -> Result<bool, JsValue> {
-        if self.core.is_interacting() {
-            self.pending_patches.push(bytes.to_vec());
-            return Ok(false);
+        match self.page.apply_patch(&mut self.core, bytes) {
+            Ok(FrameApply::Deferred | FrameApply::Unchanged) => Ok(false),
+            Ok(FrameApply::Changed { ids }) => {
+                self.paint_remote_change(ids);
+                Ok(true)
+            }
+            Err(error) => Err(JsValue::from_str(&error.to_string())),
         }
-        self.merge_patch_bytes_now(bytes)
     }
 
     /// Serialize the document and hand it to storage (the shell's debounced
@@ -717,7 +650,7 @@ impl Editor {
             .ok_or_else(|| JsValue::from_str("no 2d context"))?
             .dyn_into::<CanvasRenderingContext2d>()?;
 
-        let hidden = self.presentation.as_ref().map(|p| &p.hidden);
+        let hidden = self.page.hidden_elements();
         let editing = self.core.editing_text_id().map(str::to_string);
         let skip =
             |id: &str| editing.as_deref() == Some(id) || hidden.is_some_and(|set| set.contains(id));
@@ -742,7 +675,7 @@ impl Editor {
         let doc = canvas_core::serialization::from_json(json)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
         let effects = self.core.replace_document(doc);
-        self.purge_ledger.clear();
+        self.page.clear_purge_ledger();
         self.apply(effects);
         Ok(())
     }
@@ -752,7 +685,7 @@ impl Editor {
         let doc = canvas_core::serialization::from_bytes(bytes)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
         let effects = self.core.replace_document(doc);
-        self.purge_ledger.clear();
+        self.page.clear_purge_ledger();
         self.apply(effects);
         Ok(())
     }
@@ -876,7 +809,7 @@ impl Editor {
     pub fn seed_demo(&mut self) {
         let doc = canvas_core::demo_document();
         let effects = self.core.replace_document(doc);
-        self.purge_ledger.clear();
+        self.page.clear_purge_ledger();
         self.apply(effects);
     }
 
@@ -908,7 +841,7 @@ impl Editor {
         // document is final the whole time; this is view state only.
         // Borrowed, never cloned: the old per-frame BTreeSet clone cost
         // O(hidden) allocations on every frame even when idle.
-        let hidden = self.presentation.as_ref().map(|p| &p.hidden);
+        let hidden = self.page.hidden_elements();
         // The shell's textarea is the live copy of the text being edited;
         // painting the committed element underneath would ghost two versions.
         let editing = self.core.editing_text_id();
@@ -953,7 +886,7 @@ impl Editor {
     fn render_lod(&mut self) {
         let (w, h) = self.core.viewport_size();
         let viewport = self.core.camera().viewport(w, h);
-        let hidden = self.presentation.as_ref().map(|p| &p.hidden);
+        let hidden = self.page.hidden_elements();
         let editing = self.core.editing_text_id();
         let skip = |id: &str| editing == Some(id) || hidden.is_some_and(|set| set.contains(id));
         let transform = self.core.camera().transform().then(Affine::scale(self.dpr));
@@ -1263,7 +1196,7 @@ impl Editor {
         let zoom_cap = command
             .get("zoom_cap")
             .and_then(|value| value.as_f64())
-            .unwrap_or(DEFAULT_FOCUS_MAX_ZOOM);
+            .unwrap_or(DEFAULT_PRESENT_ZOOM_CAP);
         match action {
             "focus" => {
                 let id = command.get("id").and_then(|value| value.as_str());
@@ -1361,27 +1294,23 @@ impl Editor {
         // Presentation pacing: hold the step, then reveal the next one (or
         // finish). The pump stays alive for the whole timeline; pure holds
         // cost a rAF tick, not a repaint.
-        let advance_step = match &self.presentation {
-            Some(presentation) => {
-                now >= presentation.step_started_ms + presentation.steps[presentation.index].hold_ms
+        match self.page.advance_presentation(now) {
+            PresentationAdvance::Step(cues) => {
+                self.apply_presentation_cues(cues);
+                self.last_paint = None;
+                self.render();
             }
-            None => false,
-        };
-        if advance_step {
-            let last = self
-                .presentation
-                .as_ref()
-                .is_some_and(|presentation| presentation.index + 1 >= presentation.steps.len());
-            if last {
-                self.finish_presentation(false);
-            } else {
-                if let Some(presentation) = self.presentation.as_mut() {
-                    presentation.index += 1;
-                }
-                self.begin_presentation_step();
+            PresentationAdvance::Finished => {
+                // Playback is over: the document was always final, so only
+                // the agent's decorations and the reveal mask go away.
+                self.pulse = None;
+                self.tween = None;
+                self.last_paint = None;
+                self.render();
             }
+            PresentationAdvance::Idle | PresentationAdvance::Holding => {}
         }
-        if self.presentation.is_some() {
+        if self.page.is_presenting() {
             active = true;
         }
         active
@@ -1392,53 +1321,44 @@ impl Editor {
     /// this stages the reveal, caption and camera cues over it. Returns true
     /// when the shell should pump `advance_animation`.
     pub fn start_presentation(&mut self, json: &str) -> bool {
-        let Ok(script) = serde_json::from_str::<PresentScript>(json) else {
+        // Replacing a playback drops its decorations first; an unrelated
+        // camera tween (say, a zoom in flight) is left alone.
+        let replacing = self.page.is_presenting();
+        let Some(cues) = self.page.start_presentation(json, now_ms()) else {
             return false;
         };
-        if script.steps.is_empty() {
-            return false;
+        if replacing {
+            self.pulse = None;
+            self.tween = None;
         }
-        self.cancel_presentation();
-        let mut hidden: BTreeSet<canvas_core::ElementId> = BTreeSet::new();
-        for step in &script.steps {
-            hidden.extend(step.reveal.iter().cloned());
-        }
-        self.presentation = Some(Presentation {
-            id: script.id,
-            steps: script.steps,
-            index: 0,
-            step_started_ms: now_ms(),
-            hidden,
-            caption: None,
-            zoom_cap: script.zoom_cap,
-        });
-        self.begin_presentation_step();
+        self.apply_presentation_cues(cues);
+        self.last_paint = None;
+        self.render();
         true
     }
 
     /// Finished/cancelled playbacks the shell must acknowledge, as JSON like
     /// `[{"id":3,"cancelled":false}]`; empty string when there are none.
     pub fn presentation_outcomes(&mut self) -> String {
-        if self.present_outcomes.is_empty() {
+        let outcomes = self.page.take_presentation_outcomes();
+        if outcomes.is_empty() {
             return String::new();
         }
-        let json = serde_json::to_string(&self.present_outcomes).unwrap_or_default();
-        self.present_outcomes.clear();
-        json
+        serde_json::to_string(&outcomes).unwrap_or_default()
     }
 
     /// Introspection for the shell and tests: empty when idle, else JSON with
     /// `playing`, `hidden` and `caption`. View state only.
     pub fn presentation_state(&self) -> String {
-        match &self.presentation {
-            None => String::new(),
-            Some(presentation) => serde_json::json!({
-                "playing": true,
-                "hidden": presentation.hidden.len(),
-                "caption": presentation.caption,
-            })
-            .to_string(),
+        if !self.page.is_presenting() {
+            return String::new();
         }
+        serde_json::json!({
+            "playing": true,
+            "hidden": self.page.hidden_count(),
+            "caption": self.page.caption(),
+        })
+        .to_string()
     }
 
     /// The page's transient view state for the agent: camera, viewport and
@@ -1578,28 +1498,15 @@ impl Editor {
         ))
     }
 
-    /// Apply the current presentation step: reveal its elements, move the
-    /// camera, pulse the point target and show the caption.
-    fn begin_presentation_step(&mut self) {
-        let Some(presentation) = self.presentation.as_mut() else {
-            return;
-        };
-        if presentation.index >= presentation.steps.len() {
-            return;
-        }
-        let step = presentation.steps[presentation.index].clone();
-        let zoom_cap = presentation.zoom_cap;
-        for id in &step.reveal {
-            presentation.hidden.remove(id);
-        }
-        presentation.caption = step.caption.clone();
-        presentation.step_started_ms = now_ms();
-        if let Some(id) = step.focus.as_deref() {
-            if let Some(target) = self.focus_plan(Some(id), 64.0, zoom_cap) {
+    /// Apply a presentation step's camera/highlight cues. The session owns the
+    /// timeline; the camera, pulse and repaint belong to the browser adapter.
+    fn apply_presentation_cues(&mut self, cues: PresentationCues) {
+        if let Some(id) = cues.focus.as_deref() {
+            if let Some(target) = self.focus_plan(Some(id), 64.0, cues.zoom_cap) {
                 self.start_camera_transition(target, true);
             }
         }
-        if let Some(id) = step.point.as_deref() {
+        if let Some(id) = cues.point.as_deref() {
             if let Some(bounds) = self.core.document().framing_bounds(id) {
                 self.pulse = Some(Pulse {
                     bounds,
@@ -1608,103 +1515,59 @@ impl Editor {
                 });
             }
         }
-        self.last_paint = None;
-        self.render();
     }
 
-    /// End playback: reveal everything (the document was always final), drop
-    /// its decorations, and record the outcome for the shell to report.
-    fn finish_presentation(&mut self, cancelled: bool) {
-        let Some(presentation) = self.presentation.take() else {
-            return;
-        };
-        self.present_outcomes.push(PresentOutcome {
-            id: presentation.id,
-            cancelled,
-        });
-        self.pulse = None;
-        self.tween = None;
-        self.last_paint = None;
-        self.render();
-    }
-
-    /// Any direct user input wins over the agent's explanation.
+    /// Any direct user input wins over the agent's explanation. The session
+    /// queues the cancelled outcome; the adapter drops its decorations.
     fn cancel_presentation(&mut self) {
-        if self.presentation.is_some() {
-            self.finish_presentation(true);
+        if self.page.cancel_presentation().is_some() {
+            self.pulse = None;
+            self.tween = None;
+            self.last_paint = None;
+            self.render();
         }
-    }
-
-    /// Drain the outbox as one patch, or `None` when nothing changed. Purges
-    /// enter the ledger with the exact tombstone this patch projects, so a
-    /// later reconnect snapshot is byte-for-byte the same deletion.
-    fn take_outbound_patch(&mut self) -> Option<canvas_core::Patch> {
-        let deltas = self.core.drain_outbox();
-        if deltas.is_empty() {
-            return None;
-        }
-        let patch = canvas_core::Patch::from_deltas(&deltas, now_ms());
-        self.purge_ledger.record(&deltas, &patch);
-        Some(patch)
     }
 
     /// The live document with explicit purge tombstones folded in. Absence in
     /// the live document is not a deletion; only the ledger adds one.
     fn synced_document(&self) -> Document {
-        self.purge_ledger.materialize(self.core.document())
+        self.page.synced_document(self.core.document())
     }
 
-    /// Merge a remote snapshot now: reconcile, rebuild the scene, repaint.
-    fn reconcile_bytes_now(&mut self, bytes: &[u8]) -> Result<bool, JsValue> {
-        let (revision, remote) =
-            wire::decode_snapshot(bytes).map_err(|error| JsValue::from_str(&error.to_string()))?;
-        self.wire_revision = revision;
-        Ok(self.apply_remote_snapshot(remote))
-    }
-
-    fn apply_remote_snapshot(&mut self, remote: Document) -> bool {
-        let merged = canvas_core::reconcile(self.core.document(), &remote);
-        if merged == *self.core.document() {
-            return false;
-        }
+    /// Repaint the layers a remote patch changed. The session already applied
+    /// the elements through the editor's LWW path; this is the steady-state
+    /// cost: proportional to what changed, not to the document.
+    fn paint_remote_change(&mut self, ids: Vec<canvas_core::ElementId>) {
         self.last_paint = None;
-        self.core.merge_document(merged);
-        self.render();
-        true
-    }
-
-    /// Merge a remote patch now: per-element LWW, then rebuild only the
-    /// changed layers and repaint them. This is the steady-state path — the
-    /// cost is proportional to what changed, not to the document.
-    fn merge_patch_bytes_now(&mut self, bytes: &[u8]) -> Result<bool, JsValue> {
-        let (revision, elements) =
-            wire::decode_patch(bytes).map_err(|error| JsValue::from_str(&error.to_string()))?;
-        self.wire_revision = revision;
-        Ok(self.apply_remote_elements(elements))
-    }
-
-    fn apply_remote_elements(&mut self, elements: Vec<canvas_core::Element>) -> bool {
-        let patch = canvas_core::Patch { put: elements };
-        let changed: BTreeSet<canvas_core::ElementId> =
-            self.core.apply_patch(&patch).into_iter().collect();
-        if changed.is_empty() {
-            return false;
-        }
-        self.last_paint = None;
+        let changed: BTreeSet<canvas_core::ElementId> = ids.into_iter().collect();
         let dirty = self.core.rebuild_changed(&changed);
         self.paint_dirty(&dirty);
         self.draw_overlay();
-        true
     }
 
     /// Apply any frame deferred during a gesture. Called at gesture end, after
     /// the local edit has committed, so remote merges see its final state.
     fn apply_pending_remote(&mut self) {
-        if let Some(bytes) = self.pending_remote.take() {
-            let _ = self.reconcile_bytes_now(&bytes);
-        }
-        for bytes in std::mem::take(&mut self.pending_patches) {
-            let _ = self.merge_patch_bytes_now(&bytes);
+        for frame in self.page.drain_pending() {
+            match frame {
+                PendingFrame::Snapshot(frame) => {
+                    if self
+                        .page
+                        .apply_snapshot_frame(&mut self.core, frame)
+                        .changed()
+                    {
+                        self.last_paint = None;
+                        self.render();
+                    }
+                }
+                PendingFrame::Patch(frame) => {
+                    if let FrameApply::Changed { ids } =
+                        self.page.apply_patch_frame(&mut self.core, frame)
+                    {
+                        self.paint_remote_change(ids);
+                    }
+                }
+            }
         }
     }
 
@@ -2150,11 +2013,7 @@ impl Editor {
         }
 
         // The agent's caption: a bar at the bottom of the viewport.
-        if let Some(caption) = self
-            .presentation
-            .as_ref()
-            .and_then(|presentation| presentation.caption.clone())
-        {
+        if let Some(caption) = self.page.caption().map(str::to_string) {
             let font_size = 22.0 * self.dpr;
             self.overlay
                 .set_font(&format!("{font_size}px ComicShanns, sans-serif"));
