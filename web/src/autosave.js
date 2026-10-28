@@ -57,13 +57,7 @@ export function clearCheckpoint(name) {
   }
 }
 
-const readCheckpoint = (name) => {
-  try {
-    return localStorage.getItem(checkpointKey(name));
-  } catch {
-    return null;
-  }
-};
+const readCheckpoint = (name) => localStorage.getItem(checkpointKey(name));
 
 // IndexedDB lives in wasm (storage.rs); these are the page-side names for it.
 export const loadSavedDocument = (name) => load_saved_document(name);
