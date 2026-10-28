@@ -3,7 +3,8 @@
 //!
 //! Every command records reversible `Delta`s through a `Transaction`; undo,
 //! revert and the wire patch all project that same journal. Gesture previews
-//! stay in `Editor` — only committed semantics live here.
+//! stay in the editor's interaction controller — only committed semantics live
+//! here.
 
 use std::collections::BTreeSet;
 

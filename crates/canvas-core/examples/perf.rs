@@ -87,7 +87,7 @@ fn main() {
         || Editor::new(benchmark_fixture(10_000)),
         |editor| {
             let probe = "bench-05000".to_string();
-            let start = editor.doc.element(&probe).unwrap().bounds().center();
+            let start = editor.document().element(&probe).unwrap().bounds().center();
             let e = editor.pointer_down(start, 0, Modifiers::default(), 1);
             pump(editor, &e);
             for i in 1..=100 {
@@ -235,7 +235,7 @@ fn main() {
         // cost: hit-test, translation, connected-arrow updates and layer
         // rebuilds all happen here.
         let probe = format!("perf-{:06}", nodes / 2);
-        let start_point = editor.doc.element(&probe).unwrap().bounds().center();
+        let start_point = editor.document().element(&probe).unwrap().bounds().center();
         let effects = editor.pointer_down(start_point, 0, Modifiers::default(), 1);
         pump(&mut editor, &effects);
         let start = Instant::now();

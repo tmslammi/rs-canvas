@@ -1,8 +1,25 @@
-//! The editor: the interaction state machine over a Document.
+//! The editor: the composition root for document, gesture, view and projection.
 //!
-//! Owns the document, camera, scene cache, history, tool, style defaults and
-//! selection. Everything here is browser-free; the wasm façade only forwards
-//! input and paints the effects.
+//! Everything here is browser-free; the wasm façade only forwards input and
+//! paints the returned effects. `Editor` keeps the public entry points the
+//! shell calls and delegates state to four collaborators:
+//!
+//! - `DocumentSession` owns the committed
+//!   document, the transaction journal/history and the clipboard. It is the
+//!   only place committed content is mutated; every edit is a reversible delta
+//!   (ADR-0002, ADR-0009).
+//! - `InteractionController` owns the in-flight gesture, its open
+//!   transaction and the drag-preview caches. Previews never write the
+//!   document; release writes the contiguous preview truth back once and
+//!   commits one transaction.
+//! - `ViewState` owns camera/navigation, tool and lock, style defaults, grid
+//!   settings, viewport size, selection and the selection-bounds cache. It is
+//!   never persisted or merged (ADR-0002, ADR-0006).
+//! - `Projection` owns the derived scene cache, obstacle index and hit index.
+//!   Its caches are private; callers use the read-only queries below.
+//!
+//! Shell messages (`Effects`, `ShellAction`) live in the shell boundary so
+//! the boundary does not depend on editor internals.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -10,86 +27,25 @@ use crate::camera::Camera;
 use crate::connector;
 use crate::delta::Delta;
 use crate::geometry::{Point, Rect};
-use crate::history::{History, Transaction};
-use crate::hit::{elements_in_rect_indexed, hit_test_indexed, hit_test_raw_indexed};
+use crate::history::Transaction;
 use crate::id::{new_element_id, new_version_nonce};
+use crate::interaction::{
+    AttachedDrag, EndpointEnd, Interaction, InteractionController, WaypointDrag,
+};
 use crate::model::{
     Binding, Document, Element, ElementId, ElementKind, Endpoint, Routing, ShapeKind, Style,
     StylePatch, TextAlign,
 };
 use crate::nav::NavigationState;
-use crate::scene::Scene;
-use crate::spatial::{HitIndex, ObstacleIndex};
-use crate::text::{layout_text, ApproxMeasurer, TextMeasurer};
+use crate::projection::Projection;
+use crate::scene::SceneLayer;
+use crate::session::DocumentSession;
+use crate::spatial::ObstacleIndex;
+use crate::text::{layout_text, TextMeasurer};
 use crate::tool::Tool;
+use crate::view::ViewState;
 
-/// A message from the core to the browser shell (via the wasm façade).
-#[derive(Clone, Debug, PartialEq, serde::Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ShellAction {
-    OpenTextEditor {
-        id: ElementId,
-        /// Screen-space rectangle in CSS pixels.
-        x: f64,
-        y: f64,
-        width: f64,
-        height: f64,
-        font_size: f64,
-        text: String,
-        align: TextAlign,
-        /// The text's own ink, so the overlay reads exactly like the element
-        /// (a sticky's dark ink, not the canvas' light default).
-        color: String,
-        /// True when the canvas wraps this text to its rect width. Auto-width
-        /// point text must not wrap in the overlay either.
-        wrap: bool,
-        /// True for one-line fields (frame names): Enter commits instead of
-        /// inserting a newline.
-        single_line: bool,
-    },
-    /// The document changed: the shell should debounce and call `flush_save`.
-    DocumentChanged,
-}
-
-/// What the shell should repaint after an input.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct Effects {
-    /// Elements whose cached layers must be rebuilt.
-    pub changed: BTreeSet<ElementId>,
-    /// The whole frame changed (camera moves, history jumps).
-    pub repaint_all: bool,
-    /// Selection or in-progress decoration changed (overlay repaint).
-    pub overlay_changed: bool,
-    /// The document itself changed, as opposed to only the camera: this is
-    /// what makes an autosave due. Camera pans repaint without saving.
-    pub document_changed: bool,
-    /// Mid-gesture preview (selection drags): caches already shifted, so the
-    /// shell must repaint dirty regions WITHOUT rebuilding layers, and must
-    /// skip obstacle/hit maintenance until release. Never persisted.
-    pub preview: bool,
-    /// Shell actions to dispatch (text editor, later: dialogs).
-    pub actions: Vec<ShellAction>,
-}
-
-impl Effects {
-    fn changed(id: impl Into<ElementId>) -> Self {
-        let mut effects = Self {
-            document_changed: true,
-            ..Self::default()
-        };
-        effects.changed.insert(id.into());
-        effects
-    }
-
-    fn merge(&mut self, other: Effects) {
-        self.changed.extend(other.changed);
-        self.repaint_all |= other.repaint_all;
-        self.overlay_changed |= other.overlay_changed;
-        self.document_changed |= other.document_changed;
-        self.preview |= other.preview;
-        self.actions.extend(other.actions);
-    }
-}
+pub use crate::shell::{Effects, ShellAction};
 
 /// Modifier keys as the shell reports them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -193,13 +149,6 @@ impl Handle {
     }
 }
 
-/// Which end of a connector an `ArrowEndpoint` drag is moving.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum EndpointEnd {
-    Start,
-    End,
-}
-
 /// A draggable bend on a selected connector's route.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ArrowHandle {
@@ -223,207 +172,25 @@ impl ArrowHandle {
     }
 }
 
-/// What an `ArrowWaypoint` drag is moving.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum WaypointDrag {
-    Existing {
-        index: usize,
-    },
-    /// A segment midpoint: the first real move inserts two waypoints (a bow)
-    /// and then slides them perpendicular to the segment.
-    Bow {
-        start: Point,
-        end: Point,
-        /// Where the pointer grabbed the handle; a click with no movement
-        /// must not change the route.
-        grab: Point,
-        insert_at: usize,
-        /// Filled in after insertion: first waypoint index, and whether the
-        /// segment is horizontal.
-        inserted: Option<(usize, bool)>,
-    },
-}
-
-/// Attached (non-selected) arrow preview state, computed once when a move
-/// gesture starts. Ends bound to selected targets advance arithmetically
-/// with the drag (uniform translation never flips the anchor side); other
-/// ends freeze. The document is untouched until release.
-#[derive(Clone, Debug, PartialEq)]
-struct AttachedDrag {
-    id: ElementId,
-    a: Point,
-    b: Point,
-    a_follows: bool,
-    b_follows: bool,
-    style: Style,
-    /// Pre-gesture element for the release undo step.
-    pre: Element,
-    /// Whether this arrow's rubber band is installed (later moves refresh
-    /// the layer's points in place instead of rebuilding).
-    built: bool,
-}
-
-#[derive(Clone, Debug, Default, PartialEq)]
-enum Interaction {
-    #[default]
-    Idle,
-    Drawing {
-        id: ElementId,
-        start: Point,
-    },
-    Marquee {
-        start: Point,
-    },
-    Moving {
-        start: Point,
-        originals: Vec<Element>,
-        /// Arrows bound to moved elements but not moved themselves: stretched
-        /// by the drag, rubber-banded per move, re-routed on release.
-        arrow_ids: Vec<ElementId>,
-        /// True when the drag began on empty space inside the selection's
-        /// bounding box: a click with no movement then clears the selection
-        /// instead of moving anything.
-        started_in_selection: bool,
-    },
-    Resizing {
-        handle: Handle,
-        start: Point,
-        bounds: Rect,
-        originals: Vec<Element>,
-    },
-    Freehand {
-        id: ElementId,
-    },
-    Line {
-        id: ElementId,
-        start: Point,
-    },
-    Connecting {
-        id: ElementId,
-        start: Point,
-    },
-    /// Dragging one endpoint of a selected connector to rebind or detach it.
-    ArrowEndpoint {
-        id: ElementId,
-        end: EndpointEnd,
-    },
-    /// Dragging a bend on a selected connector's route.
-    ArrowWaypoint {
-        id: ElementId,
-        drag: WaypointDrag,
-    },
-    /// Dragging a fresh note off a sticky stack; released away from the pile
-    /// it becomes a real note, released on the pile it is discarded.
-    PullingSticky {
-        id: ElementId,
-        origin: Point,
-    },
-    Erasing {
-        erased: BTreeSet<ElementId>,
-    },
-    FrameNameEditing {
-        id: ElementId,
-    },
-    TextEditing {
-        id: ElementId,
-        original: Box<Option<Element>>,
-    },
-}
-
 /// The editable session.
 pub struct Editor {
-    pub doc: Document,
-    pub camera: Camera,
-    pub scene: Scene,
-    /// Spatial index of routing obstacles, kept in sync with `doc`.
-    pub obstacles: ObstacleIndex,
-    /// Packed hit-test index over all live elements: hover, click and marquee
-    /// must never scan the document per pointer event.
-    pub hit: HitIndex,
-    pub history: History,
-    pub nav: NavigationState,
-    pub tool: Tool,
-    pub tool_locked: bool,
-    pub style: Style,
-    /// Whether the optional grid is drawn (view state; the shell persists it).
-    pub grid_visible: bool,
-    /// Whether pointer-driven edits snap to the grid.
-    pub snap_to_grid: bool,
-    /// World-space grid spacing (the snap step when snapping is enabled).
-    pub grid_size: f64,
-    pub selection: BTreeSet<ElementId>,
-    /// Cached selection bounds: shifted (not recomputed) on preview moves,
-    /// cleared on any selection or structural change. Overlay reads this per
-    /// frame during drags; recomputing over thousands of elements per move
-    /// is what made big drags stutter the marching ants.
-    selection_bounds_cache: Option<Rect>,
-    /// Total snapped drag delta already previewed (see `Interaction::Moving`):
-    /// preview moves translate incrementally, clone-free. Reset whenever a
-    /// move gesture starts.
-    drag_applied: Point,
-    /// Scene-layer slots of the dragged selection, resolved once when the
-    /// gesture starts (no structural edits mid-drag, so they stay valid).
-    /// Lets every preview move shift caches without per-id map lookups.
-    drag_slots: Vec<u32>,
-    /// Contiguous preview truth for the in-flight drag: translated in place
-    /// every move (no clones, no map lookups), written back to the document
-    /// once on release, dropped on cancel. The document is never touched
-    /// mid-gesture, so cancel needs no restore.
-    drag_working: Vec<Element>,
-    /// Selected-arrow endpoints frozen to static anchors:
-    /// (working index, start freeze, end freeze). Ends bound to selected
-    /// targets ride the drag rigidly and need no entry.
-    drag_frozen: Vec<(usize, Option<Point>, Option<Point>)>,
-    /// Attached-arrow preview state for the in-flight drag.
-    drag_attached: Vec<AttachedDrag>,
-    interaction: Interaction,
-    tx: Option<Transaction>,
-    marquee_current: Option<Point>,
-    clipboard: Vec<Element>,
-    /// How many pastes the current clipboard has produced; each paste lands
-    /// further from the source so copies never stack invisibly.
-    paste_serial: u32,
-    last_pressure: f64,
-    measurer: Box<dyn TextMeasurer>,
-    hover_anchors: Option<(ElementId, Vec<Point>)>,
-    /// The sticky stack under the pointer, if its pull zone is hovered.
-    hover_stack: Option<ElementId>,
-    viewport_size: (f64, f64),
+    /// Committed document, transaction journal, undo history and clipboard.
+    pub(crate) session: DocumentSession,
+    /// Camera, navigation, tool, style defaults, grid, viewport and selection.
+    pub(crate) view: ViewState,
+    /// Scene cache, routing obstacles and hit index (derived state).
+    pub(crate) projection: Projection,
+    /// In-flight gesture, its transaction and drag-preview caches.
+    pub(crate) gesture: InteractionController,
 }
 
 impl Editor {
     pub fn new(doc: Document) -> Self {
         let mut editor = Self {
-            doc,
-            camera: Camera::default(),
-            scene: Scene::new(),
-            obstacles: ObstacleIndex::new(),
-            hit: HitIndex::new(),
-            history: History::new(),
-            nav: NavigationState::new(),
-            tool: Tool::default(),
-            tool_locked: false,
-            style: Style::default(),
-            grid_visible: false,
-            snap_to_grid: false,
-            grid_size: GRID_SIZE,
-            selection: BTreeSet::new(),
-            selection_bounds_cache: None,
-            drag_applied: Point::ZERO,
-            drag_slots: Vec::new(),
-            drag_working: Vec::new(),
-            drag_frozen: Vec::new(),
-            drag_attached: Vec::new(),
-            interaction: Interaction::Idle,
-            tx: None,
-            marquee_current: None,
-            clipboard: Vec::new(),
-            paste_serial: 0,
-            last_pressure: 0.5,
-            measurer: Box::new(ApproxMeasurer),
-            hover_anchors: None,
-            hover_stack: None,
-            viewport_size: (800.0, 600.0),
+            session: DocumentSession::new(doc),
+            view: ViewState::new(),
+            projection: Projection::new(),
+            gesture: InteractionController::new(),
         };
         editor.refresh_scene();
         editor
@@ -431,23 +198,141 @@ impl Editor {
 
     /// The shell reports its viewport size (used for insert-at-centre).
     pub fn set_viewport(&mut self, width: f64, height: f64) {
-        self.viewport_size = (width.max(1.0), height.max(1.0));
+        self.view.viewport_size = (width.max(1.0), height.max(1.0));
+    }
+
+    /// The committed document (read-only). Committed mutations go through the
+    /// editor's command entry points; the document is never edited in place by
+    /// the shell.
+    pub fn document(&self) -> &Document {
+        self.session.document()
+    }
+
+    /// The current camera (view state only). This returns a copy: mutate the
+    /// editor's camera through [`Editor::camera_mut`] or [`Editor::set_camera`].
+    pub fn camera(&self) -> Camera {
+        self.view.camera
+    }
+
+    pub fn camera_mut(&mut self) -> &mut Camera {
+        &mut self.view.camera
+    }
+
+    pub fn set_camera(&mut self, camera: Camera) {
+        self.view.camera = camera;
+    }
+
+    pub fn nav(&self) -> &NavigationState {
+        &self.view.nav
+    }
+
+    pub fn nav_mut(&mut self) -> &mut NavigationState {
+        &mut self.view.nav
+    }
+
+    /// Wheel input: navigation owns the pan/zoom classification and mutates
+    /// the camera it is given.
+    pub fn wheel(&mut self, screen: Point, dx: f64, dy: f64, ctrl: bool) {
+        self.view
+            .nav
+            .wheel(&mut self.view.camera, screen, dx, dy, ctrl);
+    }
+
+    pub fn tool(&self) -> Tool {
+        self.view.tool
+    }
+
+    pub fn tool_locked(&self) -> bool {
+        self.view.tool_locked
+    }
+
+    pub fn set_tool_locked(&mut self, locked: bool) {
+        self.view.tool_locked = locked;
+    }
+
+    pub fn toggle_tool_lock(&mut self) {
+        self.view.tool_locked = !self.view.tool_locked;
+    }
+
+    pub fn grid_visible(&self) -> bool {
+        self.view.grid_visible
+    }
+
+    pub fn set_grid_visible(&mut self, visible: bool) {
+        self.view.grid_visible = visible;
+    }
+
+    pub fn grid_size(&self) -> f64 {
+        self.view.grid_size
+    }
+
+    pub fn set_grid_size(&mut self, size: f64) {
+        self.view.grid_size = size;
+    }
+
+    pub fn snap_enabled(&self) -> bool {
+        self.view.snap_to_grid
+    }
+
+    pub fn set_snap_enabled(&mut self, enabled: bool) {
+        self.view.snap_to_grid = enabled;
+    }
+
+    pub fn selection(&self) -> &BTreeSet<ElementId> {
+        &self.view.selection
+    }
+
+    /// Drop selected ids that a remote merge or deletion made non-live.
+    pub fn retain_live_selection(&mut self) {
+        self.view.retain_live_selection(self.session.document());
+    }
+
+    pub fn can_undo(&self) -> bool {
+        self.session.can_undo()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        self.session.can_redo()
+    }
+
+    /// Take every delta applied since the last drain (the sync outbox).
+    pub fn drain_outbox(&mut self) -> Vec<Delta> {
+        self.session.drain_outbox()
+    }
+
+    /// Replace the committed document with a merged remote snapshot, keeping
+    /// undo history and view state. Returns whether anything changed.
+    pub fn merge_document(&mut self, merged: Document) -> bool {
+        if merged == *self.session.document() {
+            return false;
+        }
+        self.session.replace_merged(merged);
+        self.view.retain_live_selection(self.session.document());
+        self.refresh_scene();
+        true
+    }
+
+    /// Apply a remote element patch with per-element last-writer-wins rules.
+    pub fn apply_patch(&mut self, patch: &crate::patch::Patch) -> Vec<ElementId> {
+        let changed = self.session.apply_patch(patch);
+        self.view.retain_live_selection(self.session.document());
+        changed
     }
 
     /// The last viewport size the shell reported, in CSS pixels.
     pub fn viewport_size(&self) -> (f64, f64) {
-        self.viewport_size
+        self.view.viewport_size
     }
 
     /// A camera that fits an element — frames include their descendants — or
     /// the whole document when `id` is `None`, with `padding` screen px.
     pub fn focus_camera(&self, id: Option<&str>, padding: f64) -> Option<Camera> {
         let bounds = match id {
-            Some(id) => self.doc.framing_bounds(id)?,
-            None => self.doc.bounds()?,
+            Some(id) => self.session.document().framing_bounds(id)?,
+            None => self.session.document().bounds()?,
         };
-        let mut camera = self.camera;
-        camera.zoom_to_fit(bounds, self.viewport_size, padding);
+        let mut camera = self.view.camera;
+        camera.zoom_to_fit(bounds, self.view.viewport_size, padding);
         Some(camera)
     }
 
@@ -462,34 +347,29 @@ impl Editor {
         } else {
             Effects::default()
         };
-        self.tool = tool;
-        self.tool_locked = tool == Tool::Freehand;
+        self.view.tool = tool;
+        self.view.tool_locked = tool == Tool::Freehand;
         effects.overlay_changed = true;
         effects
     }
 
     /// After a finished gesture, single-shot tools hand back to Select.
     fn finish_tool_use(&mut self) {
-        if !self.tool_locked {
-            self.tool = Tool::Select;
+        if !self.view.tool_locked {
+            self.view.tool = Tool::Select;
         }
     }
 
     /// Whether a gesture is in progress (no committed save point yet).
     pub fn is_interacting(&self) -> bool {
-        self.interaction != Interaction::Idle
+        self.gesture.is_interacting()
     }
 
     /// Replace the whole document (used when opening a file or restoring).
     pub fn replace_document(&mut self, doc: Document) -> Effects {
-        self.doc = doc;
-        self.history = History::new();
-        self.selection.clear();
-        self.interaction = Interaction::Idle;
-        self.tx = None;
-        self.marquee_current = None;
-        self.hover_anchors = None;
-        self.hover_stack = None;
+        self.session.replace(doc);
+        self.view.clear_selection();
+        self.gesture.reset();
         self.refresh_scene();
         Effects {
             repaint_all: true,
@@ -501,34 +381,27 @@ impl Editor {
 
     /// Install a real text measurer (the wasm façade does this).
     pub fn set_measurer(&mut self, measurer: Box<dyn TextMeasurer>) {
-        self.measurer = measurer;
+        self.projection.set_measurer(measurer);
         self.refresh_scene();
     }
 
     /// Rebuild the whole scene cache.
     pub fn refresh_scene(&mut self) -> Vec<Rect> {
-        // Loading skips the obstacle build (tens of ms plus megabytes on huge
-        // documents); the first edit or route that needs it builds once.
-        self.obstacles.invalidate();
-        self.hit.rebuild(&self.doc);
-        self.selection_bounds_cache = None;
-        self.scene
-            .rebuild_all(&self.doc, self.measurer.as_ref(), &self.obstacles)
+        self.view.invalidate_selection_bounds();
+        self.projection.refresh(self.session.document())
     }
 
     /// Rebuild the changed elements' layers, returning dirty world rects.
     pub fn rebuild_changed(&mut self, changed: &BTreeSet<ElementId>) -> Vec<Rect> {
-        self.obstacles.apply(&self.doc, changed);
-        self.hit.apply(&self.doc, changed);
-        self.selection_bounds_cache = None;
-        self.scene
-            .update(&self.doc, changed, self.measurer.as_ref(), &self.obstacles)
+        self.view.invalidate_selection_bounds();
+        self.projection
+            .rebuild_changed(self.session.document(), changed)
     }
 
     /// Dirty regions for a preview move: caches already shifted in place, so
     /// this repaints without rebuilding layers or touching indexes.
     pub fn preview_dirty(&mut self) -> Vec<Rect> {
-        self.scene.preview_dirty()
+        self.projection.preview_dirty()
     }
 
     /// Build draw ops for unbuilt layers touching `area` (and obstacles on
@@ -536,19 +409,12 @@ impl Editor {
     /// drawing ops; the LOD overview never does, so huge boards open without
     /// ever paying the rough-geometry pass for off-screen detail.
     pub fn ensure_area(&mut self, area: Rect) {
-        if self.scene.unbuilt_count() == 0 {
-            return;
-        }
-        self.obstacles.ensure(&self.doc);
-        self.scene
-            .ensure_area(&self.doc, area, self.measurer.as_ref(), &self.obstacles);
+        self.projection.ensure_area(self.session.document(), area);
     }
 
     /// Scene-layer slots for a set of ids, resolved once per gesture.
     fn scene_slot_subset(&self, ids: &BTreeSet<ElementId>) -> Vec<u32> {
-        ids.iter()
-            .filter_map(|id| self.scene.slot_for(id))
-            .collect()
+        self.projection.slot_subset(ids)
     }
 
     /// Rigid bulk translation for the all-elements-moving benchmark: shift
@@ -562,74 +428,82 @@ impl Editor {
         if !dx.is_finite() || !dy.is_finite() || (dx == 0.0 && dy == 0.0) {
             return;
         }
-        for element in self.doc.elements.values_mut() {
-            if element.is_deleted {
-                continue;
-            }
-            translate_element(element, dx, dy);
-        }
-        self.scene.shift_all(dx, dy);
-        self.obstacles.shift_all(dx, dy);
-        self.hit.shift_all(dx, dy);
+        self.session.translate_all(dx, dy);
+        self.projection.shift_all(dx, dy);
     }
 
     /// The text measurer in use (for SVG export).
     pub fn measurer(&self) -> &dyn TextMeasurer {
-        self.measurer.as_ref()
+        self.projection.measurer()
+    }
+
+    // -- projection queries (read-only) ------------------------------------
+
+    /// Cached scene layers in z-order, for export and dirty repaint loops.
+    pub fn scene_layers(&self) -> &[SceneLayer] {
+        self.projection.layers()
+    }
+
+    pub fn visible_layers(&self, viewport: Rect) -> impl Iterator<Item = &SceneLayer> {
+        self.projection.visible_layers(viewport)
+    }
+
+    pub fn all_layers(&self) -> impl Iterator<Item = &SceneLayer> {
+        self.projection.all_layers()
+    }
+
+    pub fn scene_palette(&self) -> &[String] {
+        self.projection.palette()
+    }
+
+    pub fn cached_scene_bounds(&self) -> Option<Rect> {
+        self.projection.cached_bounds()
+    }
+
+    pub fn scene_bounds(&self) -> Option<Rect> {
+        self.projection.bounds()
+    }
+
+    /// Flush the deferred rigid-drift shift into cached draw ops.
+    pub fn flush_pending_ops(&mut self) {
+        self.projection.flush_pending_ops();
+    }
+
+    pub fn flush_preview_stale(&mut self, area: Rect) {
+        self.projection.flush_preview_stale(area);
+    }
+
+    pub fn flush_all_preview_stale(&mut self) {
+        self.projection.flush_all_preview_stale();
+    }
+
+    /// Read-only routing index for connector geometry queries.
+    pub fn obstacles(&self) -> &ObstacleIndex {
+        self.projection.obstacles()
     }
 
     /// The shell reports pointer pressure for freehand capture.
     pub fn set_pressure(&mut self, pressure: f64) {
-        self.last_pressure = pressure.clamp(0.0, 1.0);
+        self.gesture.set_pressure(pressure);
     }
 
     fn tolerance(&self) -> f64 {
-        SELECT_TOLERANCE_PX / self.camera.zoom
+        self.view.world_tolerance(SELECT_TOLERANCE_PX)
     }
 
     fn min_draw_size(&self) -> f64 {
-        MIN_DRAW_SIZE_PX / self.camera.zoom
+        self.view.world_tolerance(MIN_DRAW_SIZE_PX)
     }
 
     /// The nearest grid point when snapping is enabled.
     fn snap(&self, point: Point) -> Point {
-        if !self.snap_to_grid {
-            return point;
-        }
-        let size = self.grid_size;
-        Point::new(
-            (point.x / size).round() * size,
-            (point.y / size).round() * size,
-        )
-    }
-
-    /// A drag delta adjusted so the moving set's top-left corner lands on the
-    /// grid (relative positions inside the set stay intact).
-    fn snap_delta(&self, originals: &[Element], dx: f64, dy: f64) -> (f64, f64) {
-        if !self.snap_to_grid || originals.is_empty() {
-            return (dx, dy);
-        }
-        let Some(bounds) = originals
-            .iter()
-            .map(|element| element.bounds())
-            .reduce(|a, b| a.union(&b))
-        else {
-            return (dx, dy);
-        };
-        let target = self.snap(Point::new(bounds.x + dx, bounds.y + dy));
-        (target.x - bounds.x, target.y - bounds.y)
+        self.view.snap(point)
     }
 
     // -- selection ---------------------------------------------------------
 
     pub fn select(&mut self, ids: impl IntoIterator<Item = ElementId>) -> Effects {
-        self.selection = ids.into_iter().collect();
-        self.selection_bounds_cache = self
-            .selection
-            .iter()
-            .filter_map(|id| self.doc.element(id))
-            .map(|e| e.bounds())
-            .reduce(|a, b| a.union(&b));
+        self.view.select(ids, self.session.document());
         Effects {
             overlay_changed: true,
             ..Effects::default()
@@ -637,11 +511,10 @@ impl Editor {
     }
 
     pub fn clear_selection(&mut self) -> Effects {
-        if self.selection.is_empty() {
+        if self.view.selection.is_empty() {
             return Effects::default();
         }
-        self.selection.clear();
-        self.selection_bounds_cache = None;
+        self.view.clear_selection();
         Effects {
             overlay_changed: true,
             ..Effects::default()
@@ -649,7 +522,7 @@ impl Editor {
     }
 
     pub fn select_all(&mut self) -> Effects {
-        let live = self.doc.ordered_live();
+        let live = self.session.document().ordered_live();
         let mut ids: Vec<ElementId> = live
             .iter()
             .filter(|e| !e.is_frame())
@@ -666,32 +539,17 @@ impl Editor {
     /// live copy, and drawing the committed text underneath it ghosted two
     /// versions together whenever their wrapping or metrics differed.
     pub fn editing_text_id(&self) -> Option<&str> {
-        match &self.interaction {
-            Interaction::TextEditing { id, .. } => Some(id.as_str()),
-            _ => None,
-        }
+        self.gesture.editing_text_id()
     }
 
     /// Bounds of the current selection, in world space.
     pub fn selection_bounds(&self) -> Option<Rect> {
-        if let Some(cached) = self.selection_bounds_cache {
-            return Some(cached);
-        }
-        self.selection
-            .iter()
-            .filter_map(|id| self.doc.element(id))
-            .map(|e| e.bounds())
-            .reduce(|a, b| a.union(&b))
+        self.view.selection_bounds(self.session.document())
     }
 
     /// The in-progress marquee rectangle, if any.
     pub fn marquee_rect(&self) -> Option<Rect> {
-        match self.interaction {
-            Interaction::Marquee { start } => self
-                .marquee_current
-                .map(|end| Rect::from_points(start, end)),
-            _ => None,
-        }
+        self.gesture.marquee_rect()
     }
 
     // -- pointer -----------------------------------------------------------
@@ -703,10 +561,11 @@ impl Editor {
         mods: Modifiers,
         now: u64,
     ) -> Effects {
-        if let Interaction::TextEditing { id, .. } = &self.interaction {
+        if let Interaction::TextEditing { id, .. } = &self.gesture.interaction {
             let id = id.clone();
             let current = self
-                .doc
+                .session
+                .document()
                 .element(&id)
                 .and_then(|element| match &element.kind {
                     ElementKind::Text { text, .. } => Some(text.clone()),
@@ -715,17 +574,17 @@ impl Editor {
                 .unwrap_or_default();
             let _ = self.commit_text(&id, &current, now);
         }
-        if self.nav.pointer_down(screen, button) {
+        if self.view.nav.pointer_down(screen, button) {
             return Effects::default();
         }
         if button != 0 {
             return Effects::default();
         }
-        let world = self.camera.screen_to_world(screen);
+        let world = self.view.camera.screen_to_world(screen);
         // Geometry-creating tools snap their anchor; hit-testing tools must
         // aim at what the user actually pointed at.
         let spot = self.snap(world);
-        match self.tool {
+        match self.view.tool {
             Tool::Select => self.begin_select(screen, world, mods, now),
             Tool::Rectangle | Tool::Diamond | Tool::Ellipse => self.begin_drawing(spot, now),
             Tool::Sticky => self.begin_sticky(spot, now),
@@ -737,45 +596,63 @@ impl Editor {
             Tool::Eraser => self.begin_erase(world, now),
             Tool::Text => self.begin_text_tool(spot, now),
             Tool::Hand => {
-                self.nav.start_pan(screen);
+                self.view.nav.start_pan(screen);
                 Effects::default()
             }
         }
     }
 
     pub fn pointer_move(&mut self, screen: Point, mods: Modifiers, now: u64) -> Effects {
-        if self.nav.pointer_move(&mut self.camera, screen) {
+        if self.view.nav.pointer_move(&mut self.view.camera, screen) {
             return Effects {
                 repaint_all: true,
                 ..Effects::default()
             };
         }
+        // Selection drags mutate through `&mut self` and drive the
+        // performance-critical preview path; keep them out of the match so
+        // the controller can own the contiguous caches.
+        if matches!(self.gesture.interaction, Interaction::Moving { .. }) {
+            self.gesture.hover_anchors = None;
+            let current = self.view.camera.screen_to_world(screen);
+            if !self
+                .gesture
+                .preview_move(current, &mut self.view, &mut self.projection)
+            {
+                return Effects::default();
+            }
+            return Effects {
+                preview: true,
+                overlay_changed: true,
+                ..Effects::default()
+            };
+        }
         // The eraser mutates through `&mut self`, so handle it before the
         // read-only match below (this also keeps the match clone-free).
-        if let Interaction::Erasing { erased } = &self.interaction {
+        if let Interaction::Erasing { erased } = &self.gesture.interaction {
             let mut erased = erased.clone();
-            let world = self.camera.screen_to_world(screen);
+            let world = self.view.camera.screen_to_world(screen);
             let mut effects = Effects::default();
             self.erase_at(world, &mut erased, &mut effects, now);
-            self.interaction = Interaction::Erasing { erased };
+            self.gesture.interaction = Interaction::Erasing { erased };
             return effects;
         }
         // Waypoint drags mutate through `&mut self` too: a segment bow is
         // inserted on the first move, then dragged.
-        if let Interaction::ArrowWaypoint { id, drag } = &self.interaction {
+        if let Interaction::ArrowWaypoint { id, drag } = &self.gesture.interaction {
             let id = id.clone();
             let mut drag = *drag;
-            let current = self.snap(self.camera.screen_to_world(screen));
+            let current = self.snap(self.view.camera.screen_to_world(screen));
             let effects = Effects {
                 changed: [id.clone()].into_iter().collect(),
                 overlay_changed: true,
                 ..Effects::default()
             };
-            if let Some(tx) = self.tx.as_mut() {
+            if let Some(tx) = self.gesture.tx.as_mut() {
                 match &mut drag {
                     WaypointDrag::Existing { index } => {
                         let target = *index;
-                        let _ = tx.update(&mut self.doc, &id, now, |element| {
+                        let _ = self.session.update(tx, &id, now, |element| {
                             if let ElementKind::Arrow { waypoints, .. } = &mut element.kind {
                                 if let Some(slot) = waypoints.get_mut(target) {
                                     *slot = current;
@@ -793,8 +670,8 @@ impl Editor {
                         // A click that never moved (pointer_up replays a
                         // zero-distance move) must leave the route alone.
                         if inserted.is_none() {
-                            if current.distance(*grab) <= 2.0 / self.camera.zoom {
-                                self.interaction = Interaction::ArrowWaypoint { id, drag };
+                            if current.distance(*grab) <= 2.0 / self.view.camera.zoom {
+                                self.gesture.interaction = Interaction::ArrowWaypoint { id, drag };
                                 return effects;
                             }
                             let horizontal = (end.y - start.y).abs() <= (end.x - start.x).abs();
@@ -815,7 +692,8 @@ impl Editor {
                                 )
                             };
                             let existing = self
-                                .doc
+                                .session
+                                .document()
                                 .element(&id)
                                 .and_then(|element| match &element.kind {
                                     ElementKind::Arrow { waypoints, .. } => Some(waypoints.len()),
@@ -823,7 +701,7 @@ impl Editor {
                                 })
                                 .unwrap_or(0);
                             let at = (*insert_at).min(existing);
-                            let _ = tx.update(&mut self.doc, &id, now, |element| {
+                            let _ = self.session.update(tx, &id, now, |element| {
                                 if let ElementKind::Arrow { waypoints, .. } = &mut element.kind {
                                     let at = at.min(waypoints.len());
                                     waypoints.insert(at, first);
@@ -833,7 +711,7 @@ impl Editor {
                             *inserted = Some((at, horizontal));
                         }
                         let (first, horizontal) = inserted.unwrap_or((0, true));
-                        let _ = tx.update(&mut self.doc, &id, now, |element| {
+                        let _ = self.session.update(tx, &id, now, |element| {
                             if let ElementKind::Arrow { waypoints, .. } = &mut element.kind {
                                 for offset in 0..2 {
                                     if let Some(slot) = waypoints.get_mut(first + offset) {
@@ -849,36 +727,41 @@ impl Editor {
                     }
                 }
             }
-            self.interaction = Interaction::ArrowWaypoint { id, drag };
+            self.gesture.interaction = Interaction::ArrowWaypoint { id, drag };
             return effects;
         }
         // Hover dots belong to the Select tool alone; while any other
         // interaction is in flight the overlay is owned by that interaction.
         if !matches!(
-            self.interaction,
+            self.gesture.interaction,
             Interaction::Idle | Interaction::Connecting { .. } | Interaction::ArrowEndpoint { .. }
         ) {
-            self.hover_anchors = None;
+            self.gesture.hover_anchors = None;
         }
-        match &self.interaction {
+        match &self.gesture.interaction {
             Interaction::Idle => {
-                let world = self.camera.screen_to_world(screen);
+                let world = self.view.camera.screen_to_world(screen);
                 self.update_hover(world)
             }
             Interaction::FrameNameEditing { .. } => Effects::default(),
             Interaction::Drawing { id, start } => {
-                let current = self.snap(self.camera.screen_to_world(screen));
+                let current = self.snap(self.view.camera.screen_to_world(screen));
                 // A sticky note starts at its default size: a click keeps it,
                 // and only a real drag resizes it.
-                if self.doc.element(id).is_some_and(|e| e.is_sticky())
+                if self
+                    .session
+                    .document()
+                    .element(id)
+                    .is_some_and(|e| e.is_sticky())
                     && current.distance(*start) < self.min_draw_size()
                 {
                     return Effects::default();
                 }
                 let rect = self.drawn_rect(*start, current, mods);
-                if let Some(tx) = self.tx.as_mut() {
-                    if let Err(err) =
-                        tx.update(&mut self.doc, id, now, |element| match &mut element.kind {
+                if let Some(tx) = self.gesture.tx.as_mut() {
+                    if let Err(err) = self
+                        .session
+                        .update(tx, id, now, |element| match &mut element.kind {
                             ElementKind::Shape { rect: r, .. }
                             | ElementKind::Frame { rect: r, .. } => *r = rect,
                             _ => {}
@@ -890,108 +773,29 @@ impl Editor {
                 Effects::changed(id.clone())
             }
             Interaction::Marquee { start: _ } => {
-                self.marquee_current = Some(self.camera.screen_to_world(screen));
+                self.gesture.marquee_current = Some(self.view.camera.screen_to_world(screen));
                 let _ = mods;
                 Effects {
                     overlay_changed: true,
                     ..Effects::default()
                 }
             }
-            Interaction::Moving {
-                start, originals, ..
-            } => {
-                let current = self.camera.screen_to_world(screen);
-                let (dx, dy) = (current.x - start.x, current.y - start.y);
-                if dx.abs() < 1e-9 && dy.abs() < 1e-9 {
-                    return Effects::default();
-                }
-                let (dx, dy) = self.snap_delta(originals, dx, dy);
-                // Incremental since the last preview: the document already
-                // holds everything up to `applied`, so this move shifts by
-                // the difference only — no per-move clones, no rebuilds.
-                let (inc_x, inc_y) = (dx - self.drag_applied.x, dy - self.drag_applied.y);
-                if inc_x.abs() < 1e-9 && inc_y.abs() < 1e-9 {
-                    return Effects::default();
-                }
-                self.drag_applied = Point::new(dx, dy);
-                // Preview truth lives in `drag_working` (contiguous,
-                // cache-hot): translate it in place, snap frozen ends back
-                // to their static anchors. No clones, no map lookups, and
-                // no doc writes until release.
-                for element in self.drag_working.iter_mut() {
-                    translate_element(element, inc_x, inc_y);
-                }
-                for (idx, freeze_start, freeze_end) in self.drag_frozen.iter() {
-                    let Some(element) = self.drag_working.get_mut(*idx) else {
-                        continue;
-                    };
-                    let ElementKind::Arrow { start, end, .. } = &mut element.kind else {
-                        continue;
-                    };
-                    if let Some(point) = freeze_start {
-                        start.x = point.x;
-                        start.y = point.y;
-                    }
-                    if let Some(point) = freeze_end {
-                        end.x = point.x;
-                        end.y = point.y;
-                    }
-                }
-                // Attached arrows: following ends advance arithmetically
-                // (uniform translation never flips the anchor side), frozen
-                // ends stay. The first rubber band per arrow installs fresh
-                // ops; later moves refresh the layer's points in place: one
-                // small head-polygon allocation per arrow, nothing else.
-                for meta in self.drag_attached.iter_mut() {
-                    if meta.a_follows {
-                        meta.a.x += inc_x;
-                        meta.a.y += inc_y;
-                    }
-                    if meta.b_follows {
-                        meta.b.x += inc_x;
-                        meta.b.y += inc_y;
-                    }
-                    let width = meta.style.stroke_width;
-                    let bounds = crate::rough::rubber_band_bounds(meta.a, meta.b, width);
-                    if meta.built {
-                        self.scene
-                            .refresh_preview_ops(&meta.id, meta.a, meta.b, width, bounds);
-                    } else {
-                        let style = meta.style.clone();
-                        let (ops, _) = crate::rough::rubber_band_ops(meta.a, meta.b, &style);
-                        self.scene.set_preview_ops(&meta.id, ops, bounds);
-                        meta.built = true;
-                    }
-                }
-                // Scene: rigid-shift the selection by gesture-stable slots.
-                // The changed set stays empty: preview paints from the drained
-                // dirty rects, and release recomputes the full set for settle.
-                self.scene.shift_slots(&self.drag_slots, inc_x, inc_y);
-                if let Some(cached) = self.selection_bounds_cache.as_mut() {
-                    cached.x += inc_x;
-                    cached.y += inc_y;
-                }
-                Effects {
-                    preview: true,
-                    overlay_changed: true,
-                    ..Effects::default()
-                }
-            }
+            Interaction::Moving { .. } => unreachable!("handled above"),
             Interaction::Resizing {
                 handle,
                 start,
                 bounds,
                 originals,
             } => {
-                let current = self.snap(self.camera.screen_to_world(screen));
+                let current = self.snap(self.view.camera.screen_to_world(screen));
                 let target = resized_bounds(*bounds, *handle, *start, current, mods.shift);
                 let mut effects = Effects::default();
                 for original in originals {
                     let mut scaled = original.clone();
                     scale_element(&mut scaled, *bounds, target);
                     let kind = scaled.kind;
-                    if let Some(tx) = self.tx.as_mut() {
-                        if let Err(err) = tx.update(&mut self.doc, &original.id, now, |element| {
+                    if let Some(tx) = self.gesture.tx.as_mut() {
+                        if let Err(err) = self.session.update(tx, &original.id, now, |element| {
                             element.kind = kind;
                         }) {
                             debug_assert!(false, "resize update failed: {err}");
@@ -1005,19 +809,23 @@ impl Editor {
             Interaction::ArrowWaypoint { .. } => unreachable!("handled above"),
             Interaction::TextEditing { .. } => Effects::default(),
             Interaction::Freehand { id } => {
-                let current = self.camera.screen_to_world(screen);
-                let last = self.doc.element(id).and_then(|e| match &e.kind {
-                    ElementKind::Freehand { points, .. } => points.last().copied(),
-                    _ => None,
-                });
+                let current = self.view.camera.screen_to_world(screen);
+                let last = self
+                    .session
+                    .document()
+                    .element(id)
+                    .and_then(|e| match &e.kind {
+                        ElementKind::Freehand { points, .. } => points.last().copied(),
+                        _ => None,
+                    });
                 let mut effects = Effects::default();
                 let far_enough = last
-                    .map(|last| last.distance(current) >= 1.5 / self.camera.zoom)
+                    .map(|last| last.distance(current) >= 1.5 / self.view.camera.zoom)
                     .unwrap_or(false);
                 if far_enough {
-                    let pressure = self.last_pressure;
-                    if let Some(tx) = self.tx.as_mut() {
-                        let _ = tx.update(&mut self.doc, id, now, |element| {
+                    let pressure = self.gesture.last_pressure;
+                    if let Some(tx) = self.gesture.tx.as_mut() {
+                        let _ = self.session.update(tx, id, now, |element| {
                             if let ElementKind::Freehand {
                                 points, pressures, ..
                             } = &mut element.kind
@@ -1032,13 +840,13 @@ impl Editor {
                 effects
             }
             Interaction::Line { id, start } => {
-                let current = self.camera.screen_to_world(screen);
+                let current = self.view.camera.screen_to_world(screen);
                 let end = constrain_angle(*start, current, mods.shift);
                 // An angle-constrained end is already intentional; snapping it
                 // would shear the angle.
                 let end = if mods.shift { end } else { self.snap(end) };
-                if let Some(tx) = self.tx.as_mut() {
-                    let _ = tx.update(&mut self.doc, id, now, |element| {
+                if let Some(tx) = self.gesture.tx.as_mut() {
+                    let _ = self.session.update(tx, id, now, |element| {
                         if let ElementKind::Arrow { end: e, .. } = &mut element.kind {
                             e.x = end.x;
                             e.y = end.y;
@@ -1048,20 +856,21 @@ impl Editor {
                 Effects::changed(id.clone())
             }
             Interaction::Connecting { id, start } => {
-                let current = self.camera.screen_to_world(screen);
+                let current = self.view.camera.screen_to_world(screen);
                 let tolerance = self.tolerance().max(4.0);
-                let approach = self
-                    .doc
-                    .element(id)
-                    .and_then(|element| match &element.kind {
-                        ElementKind::Arrow { start, .. } => Some(start.point()),
-                        _ => None,
-                    });
+                let approach =
+                    self.session
+                        .document()
+                        .element(id)
+                        .and_then(|element| match &element.kind {
+                            ElementKind::Arrow { start, .. } => Some(start.point()),
+                            _ => None,
+                        });
                 let node = self.node_hit(current, Some(id.as_str()));
                 let explicit = node.is_some();
                 let candidate = node.or_else(|| {
                     connector::binding_candidate(
-                        &self.doc,
+                        self.session.document(),
                         current,
                         tolerance,
                         approach,
@@ -1071,7 +880,8 @@ impl Editor {
                 let (end, binding, hover) = match candidate {
                     Some((target_id, side, point)) => {
                         let anchors = self
-                            .doc
+                            .session
+                            .document()
                             .element(&target_id)
                             .map(|element| self.node_points_for(element))
                             .unwrap_or_default();
@@ -1090,19 +900,18 @@ impl Editor {
                     }
                     None => (self.snap(current), None, None),
                 };
-                self.hover_anchors = hover;
+                self.gesture.hover_anchors = hover;
                 let _ = start;
                 // Store the resolved anchor, not the heuristic one: endpoint
                 // coordinates must describe the drawn geometry so bounds(),
                 // endpoint handles and selection math stay honest.
                 let stored_end = {
-                    let other = self
-                        .doc
-                        .element(id)
-                        .and_then(|element| match &element.kind {
+                    let other = self.session.document().element(id).and_then(|element| {
+                        match &element.kind {
                             ElementKind::Arrow { start, .. } => Some(start.point()),
                             _ => None,
-                        });
+                        }
+                    });
                     match (&binding, other) {
                         (Some(binding), Some(other)) => {
                             let ep = crate::model::Endpoint {
@@ -1110,7 +919,7 @@ impl Editor {
                                 y: end.y,
                                 binding: Some(binding.clone()),
                             };
-                            connector::resolve_endpoint(&ep, other, &self.doc).0
+                            connector::resolve_endpoint(&ep, other, self.session.document()).0
                         }
                         _ => end,
                     }
@@ -1119,17 +928,23 @@ impl Editor {
                 // stored point re-resolves against it — the anchor it picked
                 // while the pointer still stood inside the source element is
                 // not the side that faces the destination.
-                let stored_start = self
-                    .doc
-                    .element(id)
-                    .and_then(|element| match &element.kind {
-                        ElementKind::Arrow { start, .. } if start.binding.is_some() => {
-                            Some(connector::resolve_endpoint(start, stored_end, &self.doc).0)
-                        }
-                        _ => None,
-                    });
-                if let Some(tx) = self.tx.as_mut() {
-                    let _ = tx.update(&mut self.doc, id, now, |element| {
+                let stored_start =
+                    self.session
+                        .document()
+                        .element(id)
+                        .and_then(|element| match &element.kind {
+                            ElementKind::Arrow { start, .. } if start.binding.is_some() => Some(
+                                connector::resolve_endpoint(
+                                    start,
+                                    stored_end,
+                                    self.session.document(),
+                                )
+                                .0,
+                            ),
+                            _ => None,
+                        });
+                if let Some(tx) = self.gesture.tx.as_mut() {
+                    let _ = self.session.update(tx, id, now, |element| {
                         if let ElementKind::Arrow { start, end: e, .. } = &mut element.kind {
                             e.x = stored_end.x;
                             e.y = stored_end.y;
@@ -1148,31 +963,39 @@ impl Editor {
                 }
             }
             Interaction::ArrowEndpoint { id, end } => {
-                let current = self.camera.screen_to_world(screen);
+                let current = self.view.camera.screen_to_world(screen);
                 let tolerance = self.tolerance().max(4.0);
                 let id = id.clone();
                 let end = *end;
-                let approach = self
-                    .doc
-                    .element(&id)
-                    .and_then(|element| match &element.kind {
-                        ElementKind::Arrow {
-                            start, end: tail, ..
-                        } => Some(match end {
-                            EndpointEnd::Start => tail.point(),
-                            EndpointEnd::End => start.point(),
-                        }),
-                        _ => None,
-                    });
+                let approach =
+                    self.session
+                        .document()
+                        .element(&id)
+                        .and_then(|element| match &element.kind {
+                            ElementKind::Arrow {
+                                start, end: tail, ..
+                            } => Some(match end {
+                                EndpointEnd::Start => tail.point(),
+                                EndpointEnd::End => start.point(),
+                            }),
+                            _ => None,
+                        });
                 let node = self.node_hit(current, Some(&id));
                 let explicit = node.is_some();
                 let candidate = node.or_else(|| {
-                    connector::binding_candidate(&self.doc, current, tolerance, approach, Some(&id))
+                    connector::binding_candidate(
+                        self.session.document(),
+                        current,
+                        tolerance,
+                        approach,
+                        Some(&id),
+                    )
                 });
                 let (point, binding, hover) = match candidate {
                     Some((target_id, side, point)) => {
                         let anchors = self
-                            .doc
+                            .session
+                            .document()
                             .element(&target_id)
                             .map(|element| self.node_points_for(element))
                             .unwrap_or_default();
@@ -1187,7 +1010,7 @@ impl Editor {
                     }
                     None => (self.snap(current), None, None),
                 };
-                self.hover_anchors = hover;
+                self.gesture.hover_anchors = hover;
                 // Store the resolved anchor so endpoint coordinates describe
                 // the drawn geometry (see the Connecting arm).
                 let stored_point = match (&binding, approach) {
@@ -1197,31 +1020,37 @@ impl Editor {
                             y: point.y,
                             binding: Some(binding.clone()),
                         };
-                        connector::resolve_endpoint(&ep, other, &self.doc).0
+                        connector::resolve_endpoint(&ep, other, self.session.document()).0
                     }
                     _ => point,
                 };
                 // A rebind can re-anchor the untouched bound end too — its
                 // stored point must track the new opposite anchor.
-                let stored_other = self
-                    .doc
-                    .element(&id)
-                    .and_then(|element| match &element.kind {
-                        ElementKind::Arrow {
-                            start, end: tail, ..
-                        } => {
-                            let other_ep = match end {
-                                EndpointEnd::Start => tail,
-                                EndpointEnd::End => start,
-                            };
-                            other_ep.binding.as_ref().map(|_| {
-                                connector::resolve_endpoint(other_ep, stored_point, &self.doc).0
-                            })
-                        }
-                        _ => None,
-                    });
-                if let Some(tx) = self.tx.as_mut() {
-                    let _ = tx.update(&mut self.doc, &id, now, |element| {
+                let stored_other =
+                    self.session
+                        .document()
+                        .element(&id)
+                        .and_then(|element| match &element.kind {
+                            ElementKind::Arrow {
+                                start, end: tail, ..
+                            } => {
+                                let other_ep = match end {
+                                    EndpointEnd::Start => tail,
+                                    EndpointEnd::End => start,
+                                };
+                                other_ep.binding.as_ref().map(|_| {
+                                    connector::resolve_endpoint(
+                                        other_ep,
+                                        stored_point,
+                                        self.session.document(),
+                                    )
+                                    .0
+                                })
+                            }
+                            _ => None,
+                        });
+                if let Some(tx) = self.gesture.tx.as_mut() {
+                    let _ = self.session.update(tx, &id, now, |element| {
                         if let ElementKind::Arrow {
                             start, end: tail, ..
                         } = &mut element.kind
@@ -1247,15 +1076,16 @@ impl Editor {
                 }
             }
             Interaction::PullingSticky { id, .. } => {
-                let current = self.snap(self.camera.screen_to_world(screen));
+                let current = self.snap(self.view.camera.screen_to_world(screen));
                 let size = self
-                    .doc
+                    .session
+                    .document()
                     .element(id)
                     .map(|element| element.bounds())
                     .map(|bounds| (bounds.w, bounds.h))
                     .unwrap_or((STICKY_SIZE, STICKY_SIZE));
-                if let Some(tx) = self.tx.as_mut() {
-                    let _ = tx.update(&mut self.doc, id, now, |element| {
+                if let Some(tx) = self.gesture.tx.as_mut() {
+                    let _ = self.session.update(tx, id, now, |element| {
                         if let ElementKind::Shape { rect, .. } = &mut element.kind {
                             *rect = Rect::new(
                                 current.x - size.0 / 2.0,
@@ -1272,12 +1102,12 @@ impl Editor {
     }
 
     pub fn pointer_up(&mut self, screen: Point, mods: Modifiers, now: u64) -> Effects {
-        if self.nav.pointer_up(0) || self.nav.pointer_up(1) {
+        if self.view.nav.pointer_up(0) || self.view.nav.pointer_up(1) {
             return Effects::default();
         }
         // Take the interaction out rather than cloning it: `Moving`/`Resizing`
         // carry the original elements, which must not be copied per event.
-        let interaction = std::mem::replace(&mut self.interaction, Interaction::Idle);
+        let interaction = self.gesture.take_interaction();
         let mut effects = match interaction {
             Interaction::Drawing { .. }
             | Interaction::Moving { .. }
@@ -1287,37 +1117,35 @@ impl Editor {
             | Interaction::ArrowWaypoint { .. }
             | Interaction::PullingSticky { .. }
             | Interaction::Line { .. } => {
-                self.interaction = interaction;
+                self.gesture.interaction = interaction;
                 self.pointer_move(screen, mods, now)
             }
             other => {
-                self.interaction = other;
+                self.gesture.interaction = other;
                 Effects::default()
             }
         };
-        let interaction = std::mem::replace(&mut self.interaction, Interaction::Idle);
+        let interaction = self.gesture.take_interaction();
         match interaction {
             Interaction::Idle => {}
             Interaction::FrameNameEditing { id } => {
                 // The shell owns the frame-name editor; stay in the state.
-                self.interaction = Interaction::FrameNameEditing { id };
+                self.gesture.interaction = Interaction::FrameNameEditing { id };
             }
             Interaction::Drawing { id, .. } => {
                 let tiny = self
-                    .doc
+                    .session
+                    .document()
                     .element(&id)
                     .map(|e| {
                         let b = e.bounds();
                         b.w < self.min_draw_size() || b.h < self.min_draw_size()
                     })
                     .unwrap_or(true);
-                self.marquee_current = None;
+                self.gesture.marquee_current = None;
                 if tiny {
-                    self.tx = None;
-                    let purged = self.doc.element(&id).cloned();
-                    if let Some(element) = purged {
-                        let _ = self.doc.apply(&Delta::Purge { element });
-                    }
+                    self.gesture.tx = None;
+                    let _ = self.session.purge(&id);
                     effects.merge(Effects {
                         changed: [id].into_iter().collect(),
                         overlay_changed: true,
@@ -1325,8 +1153,8 @@ impl Editor {
                     });
                 } else {
                     self.sync_frame_membership(now);
-                    if let Some(tx) = self.tx.take() {
-                        tx.commit(&mut self.history);
+                    if let Some(tx) = self.gesture.tx.take() {
+                        self.session.commit(tx);
                     }
                     self.finish_tool_use();
                     let selection_effects = self.select([id.clone()]);
@@ -1335,22 +1163,24 @@ impl Editor {
                 }
             }
             Interaction::Marquee { start } => {
-                let end = self.camera.screen_to_world(screen);
+                let end = self.view.camera.screen_to_world(screen);
                 let rect = Rect::from_points(start, end);
-                self.marquee_current = None;
+                self.gesture.marquee_current = None;
                 // Dropping the marquee is an overlay change even when the
                 // selection outcome is a no-op (empty rect, or only frames
                 // that the marquee failed to enclose). Without this the
                 // orange rectangle stays painted until some later event
                 // happens to invalidate the overlay.
                 effects.overlay_changed = true;
-                let hits: Vec<ElementId> = elements_in_rect_indexed(&self.doc, &self.hit, rect)
+                let hits: Vec<ElementId> = self
+                    .projection
+                    .elements_in_rect(self.session.document(), rect)
                     .into_iter()
-                    .map(|id| crate::hit::resolve_container(&self.doc, &id))
+                    .map(|id| crate::hit::resolve_container(self.session.document(), &id))
                     // A marquee inside a frame selects its contents; enclosing
                     // the whole frame selects the container too.
                     .filter(|id| {
-                        self.doc.element(id).is_none_or(|element| {
+                        self.session.document().element(id).is_none_or(|element| {
                             if !element.is_frame() {
                                 return true;
                             }
@@ -1364,8 +1194,8 @@ impl Editor {
                 hits.sort();
                 hits.dedup();
                 if mods.shift {
-                    hits.retain(|id| !self.selection.contains(id));
-                    self.selection.extend(hits);
+                    hits.retain(|id| !self.view.selection.contains(id));
+                    self.view.selection.extend(hits);
                     effects.merge(Effects {
                         overlay_changed: true,
                         ..Effects::default()
@@ -1384,24 +1214,23 @@ impl Editor {
                 started_in_selection,
                 ..
             } => {
-                let end = self.camera.screen_to_world(screen);
-                let moved = end.distance(start) > 0.5 / self.camera.zoom;
+                let end = self.view.camera.screen_to_world(screen);
+                let moved = end.distance(start) > 0.5 / self.view.camera.zoom;
                 // Preview ran iff the pointer actually moved the drag total.
-                let previewed =
-                    self.drag_applied.x.abs() > 1e-9 || self.drag_applied.y.abs() > 1e-9;
+                let previewed = self.gesture.previewed();
                 // Commit the preview truth: write working + attached endpoints
                 // back (single pass each), unless this was a click.
                 let mut attached_pres: Vec<(ElementId, Element)> = Vec::new();
                 if previewed {
-                    for element in std::mem::take(&mut self.drag_working) {
-                        if let Some(slot) = self.doc.element_mut(&element.id) {
+                    for element in self.gesture.take_working() {
+                        if let Some(slot) = self.session.element_mut(&element.id) {
                             *slot = element;
                             slot.touch(now);
                         }
                     }
-                    for meta in std::mem::take(&mut self.drag_attached) {
+                    for meta in self.gesture.take_attached() {
                         attached_pres.push((meta.id.clone(), meta.pre.clone()));
-                        if let Some(element) = self.doc.element_mut(&meta.id) {
+                        if let Some(element) = self.session.element_mut(&meta.id) {
                             if let ElementKind::Arrow { start, end, .. } = &mut element.kind {
                                 start.x = meta.a.x;
                                 start.y = meta.a.y;
@@ -1426,9 +1255,9 @@ impl Editor {
                 let attached: BTreeSet<ElementId> = arrow_ids.iter().cloned().collect();
                 if previewed && !attached.is_empty() {
                     let reflows = self.bound_text_reflows(&attached);
-                    if let Some(tx) = self.tx.as_mut() {
+                    if let Some(tx) = self.gesture.tx.as_mut() {
                         for (text_id, rect) in &reflows {
-                            let _ = tx.update(&mut self.doc, text_id, now, |element| {
+                            let _ = self.session.update(tx, text_id, now, |element| {
                                 if let ElementKind::Text { rect: r, .. } = &mut element.kind {
                                     *r = *rect;
                                 }
@@ -1438,10 +1267,10 @@ impl Editor {
                     // Reflowed labels changed geometry after the rigid shift:
                     // rebuild them exactly instead of skipping as previewed.
                     for (text_id, _) in &reflows {
-                        self.scene.unmark_preview(text_id);
+                        self.projection.unmark_preview(text_id);
                     }
                 }
-                if let Some(mut tx) = self.tx.take() {
+                if let Some(mut tx) = self.gesture.tx.take() {
                     // Stage the whole gesture as one undo step: pre-gesture
                     // befores plus afters from the just-written document.
                     // (Preview moves bypass per-move staging.)
@@ -1452,7 +1281,9 @@ impl Editor {
                         // the local document, so a later undo could tie with
                         // it and lose the merge to its own move.
                         for original in &originals {
-                            if let Some(current) = self.doc.element(&original.id).cloned() {
+                            if let Some(current) =
+                                self.session.document().element(&original.id).cloned()
+                            {
                                 tx.push(Delta::Update {
                                     before: original.clone(),
                                     after: current,
@@ -1460,7 +1291,7 @@ impl Editor {
                             }
                         }
                         for (id, pre) in attached_pres {
-                            if let Some(current) = self.doc.element(&id).cloned() {
+                            if let Some(current) = self.session.document().element(&id).cloned() {
                                 tx.push(Delta::Update {
                                     before: pre,
                                     after: current,
@@ -1474,7 +1305,7 @@ impl Editor {
                     for delta in tx.deltas().iter() {
                         changed.insert(delta.element_id().clone());
                     }
-                    tx.commit(&mut self.history);
+                    self.session.commit(tx);
                     effects.merge(Effects {
                         changed,
                         overlay_changed: true,
@@ -1486,12 +1317,11 @@ impl Editor {
                 if started_in_selection && !moved {
                     effects.merge(self.clear_selection());
                 }
-                self.drag_applied = Point::ZERO;
-                self.drag_slots.clear();
-                self.drag_frozen.clear();
+                self.gesture.settle_move();
             }
             Interaction::Resizing { .. } => {
                 let changed: BTreeSet<ElementId> = self
+                    .gesture
                     .tx
                     .as_ref()
                     .map(|tx| tx.deltas().iter().map(|d| d.element_id().clone()).collect())
@@ -1501,10 +1331,10 @@ impl Editor {
                 // their labels reflow only after the new geometry is in place.
                 let arrow_updates = self.connected_arrow_updates(&changed);
                 let mut reflow_targets = changed.clone();
-                if let Some(tx) = self.tx.as_mut() {
+                if let Some(tx) = self.gesture.tx.as_mut() {
                     for (arrow_id, start_point, end_point) in arrow_updates {
                         reflow_targets.insert(arrow_id.clone());
-                        let _ = tx.update(&mut self.doc, &arrow_id, now, |element| {
+                        let _ = self.session.update(tx, &arrow_id, now, |element| {
                             if let ElementKind::Arrow { start, end, .. } = &mut element.kind {
                                 start.x = start_point.x;
                                 start.y = start_point.y;
@@ -1515,20 +1345,20 @@ impl Editor {
                     }
                 }
                 let reflows = self.bound_text_reflows(&reflow_targets);
-                if let Some(tx) = self.tx.as_mut() {
+                if let Some(tx) = self.gesture.tx.as_mut() {
                     for (text_id, rect) in &reflows {
-                        let _ = tx.update(&mut self.doc, text_id, now, |element| {
+                        let _ = self.session.update(tx, text_id, now, |element| {
                             if let ElementKind::Text { rect: r, .. } = &mut element.kind {
                                 *r = *rect;
                             }
                         });
                     }
                 }
-                if let Some(tx) = self.tx.take() {
+                if let Some(tx) = self.gesture.tx.take() {
                     let mut changed_now: BTreeSet<ElementId> =
                         tx.deltas().iter().map(|d| d.element_id().clone()).collect();
                     changed_now.extend(changed);
-                    tx.commit(&mut self.history);
+                    self.session.commit(tx);
                     effects.merge(Effects {
                         changed: changed_now,
                         overlay_changed: true,
@@ -1537,19 +1367,19 @@ impl Editor {
                 }
             }
             Interaction::Erasing { erased } => {
-                if let Some(tx) = self.tx.take() {
-                    tx.commit(&mut self.history);
+                if let Some(tx) = self.gesture.tx.take() {
+                    self.session.commit(tx);
                 }
                 effects.changed.extend(erased);
                 effects.overlay_changed = true;
             }
             Interaction::TextEditing { id, original } => {
                 // The shell owns the text editor; stay in the state.
-                self.interaction = Interaction::TextEditing { id, original };
+                self.gesture.interaction = Interaction::TextEditing { id, original };
             }
             Interaction::Freehand { id } => {
-                if let Some(tx) = self.tx.as_mut() {
-                    let _ = tx.update(&mut self.doc, &id, now, |element| {
+                if let Some(tx) = self.gesture.tx.as_mut() {
+                    let _ = self.session.update(tx, &id, now, |element| {
                         if let ElementKind::Freehand {
                             points, pressures, ..
                         } = &mut element.kind
@@ -1565,7 +1395,8 @@ impl Editor {
                     });
                 }
                 let tiny = self
-                    .doc
+                    .session
+                    .document()
                     .element(&id)
                     .and_then(|e| match &e.kind {
                         ElementKind::Freehand { points, .. } => Some(points.len() < 2),
@@ -1573,11 +1404,8 @@ impl Editor {
                     })
                     .unwrap_or(true);
                 if tiny {
-                    self.tx = None;
-                    let purged = self.doc.element(&id).cloned();
-                    if let Some(element) = purged {
-                        let _ = self.doc.apply(&Delta::Purge { element });
-                    }
+                    self.gesture.tx = None;
+                    let _ = self.session.purge(&id);
                     effects.merge(Effects {
                         changed: [id].into_iter().collect(),
                         overlay_changed: true,
@@ -1585,8 +1413,8 @@ impl Editor {
                     });
                 } else {
                     self.sync_frame_membership(now);
-                    if let Some(tx) = self.tx.take() {
-                        tx.commit(&mut self.history);
+                    if let Some(tx) = self.gesture.tx.take() {
+                        self.session.commit(tx);
                     }
                     self.finish_tool_use();
                     let selection_effects = self.select([id.clone()]);
@@ -1596,7 +1424,8 @@ impl Editor {
             }
             Interaction::Line { id, .. } => {
                 let tiny = self
-                    .doc
+                    .session
+                    .document()
                     .element(&id)
                     .map(|e| {
                         let b = e.bounds();
@@ -1604,11 +1433,8 @@ impl Editor {
                     })
                     .unwrap_or(true);
                 if tiny {
-                    self.tx = None;
-                    let purged = self.doc.element(&id).cloned();
-                    if let Some(element) = purged {
-                        let _ = self.doc.apply(&Delta::Purge { element });
-                    }
+                    self.gesture.tx = None;
+                    let _ = self.session.purge(&id);
                     effects.merge(Effects {
                         changed: [id].into_iter().collect(),
                         overlay_changed: true,
@@ -1616,8 +1442,8 @@ impl Editor {
                     });
                 } else {
                     self.sync_frame_membership(now);
-                    if let Some(tx) = self.tx.take() {
-                        tx.commit(&mut self.history);
+                    if let Some(tx) = self.gesture.tx.take() {
+                        self.session.commit(tx);
                     }
                     self.finish_tool_use();
                     let selection_effects = self.select([id.clone()]);
@@ -1626,12 +1452,12 @@ impl Editor {
                 }
             }
             Interaction::PullingSticky { id, origin } => {
-                let end = self.camera.screen_to_world(screen);
-                let pulled = end.distance(origin) > 3.0 / self.camera.zoom;
+                let end = self.view.camera.screen_to_world(screen);
+                let pulled = end.distance(origin) > 3.0 / self.view.camera.zoom;
                 if pulled {
                     self.sync_frame_membership(now);
-                    if let Some(tx) = self.tx.take() {
-                        tx.commit(&mut self.history);
+                    if let Some(tx) = self.gesture.tx.take() {
+                        self.session.commit(tx);
                     }
                     self.finish_tool_use();
                     let selection_effects = self.select([id.clone()]);
@@ -1639,11 +1465,8 @@ impl Editor {
                     effects.merge(selection_effects);
                 } else {
                     // A click on the pile leaves it as it was.
-                    self.tx = None;
-                    let purged = self.doc.element(&id).cloned();
-                    if let Some(element) = purged {
-                        let _ = self.doc.apply(&Delta::Purge { element });
-                    }
+                    self.gesture.tx = None;
+                    let _ = self.session.purge(&id);
                     self.finish_tool_use();
                     effects.merge(Effects {
                         changed: [id].into_iter().collect(),
@@ -1653,9 +1476,10 @@ impl Editor {
                 }
             }
             Interaction::Connecting { id, .. } => {
-                self.hover_anchors = None;
+                self.gesture.hover_anchors = None;
                 let tiny = self
-                    .doc
+                    .session
+                    .document()
                     .element(&id)
                     .map(|e| {
                         let b = e.bounds();
@@ -1663,11 +1487,8 @@ impl Editor {
                     })
                     .unwrap_or(true);
                 if tiny {
-                    self.tx = None;
-                    let purged = self.doc.element(&id).cloned();
-                    if let Some(element) = purged {
-                        let _ = self.doc.apply(&Delta::Purge { element });
-                    }
+                    self.gesture.tx = None;
+                    let _ = self.session.purge(&id);
                     effects.merge(Effects {
                         changed: [id].into_iter().collect(),
                         overlay_changed: true,
@@ -1675,8 +1496,8 @@ impl Editor {
                     });
                 } else {
                     self.sync_frame_membership(now);
-                    if let Some(tx) = self.tx.take() {
-                        tx.commit(&mut self.history);
+                    if let Some(tx) = self.gesture.tx.take() {
+                        self.session.commit(tx);
                     }
                     self.finish_tool_use();
                     let selection_effects = self.select([id.clone()]);
@@ -1685,12 +1506,12 @@ impl Editor {
                 }
             }
             Interaction::ArrowEndpoint { id, .. } | Interaction::ArrowWaypoint { id, .. } => {
-                self.hover_anchors = None;
+                self.gesture.hover_anchors = None;
                 // The connector's label rides along its new geometry.
                 let reflows = self.bound_text_reflows(&[id.clone()].into_iter().collect());
-                if let Some(tx) = self.tx.as_mut() {
+                if let Some(tx) = self.gesture.tx.as_mut() {
                     for (text_id, rect) in &reflows {
-                        let _ = tx.update(&mut self.doc, text_id, now, |element| {
+                        let _ = self.session.update(tx, text_id, now, |element| {
                             if let ElementKind::Text { rect: r, .. } = &mut element.kind {
                                 *r = *rect;
                             }
@@ -1698,10 +1519,10 @@ impl Editor {
                     }
                 }
                 self.sync_frame_membership(now);
-                if let Some(tx) = self.tx.take() {
+                if let Some(tx) = self.gesture.tx.take() {
                     let changed: BTreeSet<ElementId> =
                         tx.deltas().iter().map(|d| d.element_id().clone()).collect();
-                    tx.commit(&mut self.history);
+                    self.session.commit(tx);
                     effects.merge(Effects {
                         changed,
                         overlay_changed: true,
@@ -1718,14 +1539,14 @@ impl Editor {
 
     /// Double-click: edit text, or create bound text inside a shape/glyph.
     pub fn double_click(&mut self, screen: Point, now: u64) -> Effects {
-        if self.interaction != Interaction::Idle {
+        if self.gesture.interaction != Interaction::Idle {
             return Effects::default();
         }
-        let world = self.camera.screen_to_world(screen);
+        let world = self.view.camera.screen_to_world(screen);
         // Double-clicking a bend removes it.
         if let Some((id, ArrowHandle::Waypoint { index, .. })) = self.arrow_handle_at(world) {
             let mut tx = Transaction::begin();
-            if let Err(err) = tx.update(&mut self.doc, &id, now, |element| {
+            if let Err(err) = self.session.update(&mut tx, &id, now, |element| {
                 if let ElementKind::Arrow { waypoints, .. } = &mut element.kind {
                     if index < waypoints.len() {
                         waypoints.remove(index);
@@ -1736,14 +1557,14 @@ impl Editor {
             }
             let mut changed: BTreeSet<ElementId> = [id.clone()].into_iter().collect();
             for (text_id, rect) in self.bound_text_reflows(&changed) {
-                let _ = tx.update(&mut self.doc, &text_id, now, |element| {
+                let _ = self.session.update(&mut tx, &text_id, now, |element| {
                     if let ElementKind::Text { rect: r, .. } = &mut element.kind {
                         *r = rect;
                     }
                 });
                 changed.insert(text_id);
             }
-            tx.commit(&mut self.history);
+            self.session.commit(tx);
             return Effects {
                 changed,
                 overlay_changed: true,
@@ -1751,7 +1572,10 @@ impl Editor {
             };
         }
         let tolerance = self.tolerance();
-        let Some(id) = hit_test_raw_indexed(&self.doc, &self.hit, world, tolerance) else {
+        let Some(id) = self
+            .projection
+            .hit_test_raw(self.session.document(), world, tolerance)
+        else {
             return Effects::default();
         };
         enum Target {
@@ -1768,11 +1592,12 @@ impl Editor {
             },
         }
         let arrow_bounds = self
-            .doc
+            .session
+            .document()
             .element(&id)
             .map(|e| e.bounds())
             .unwrap_or(Rect::ZERO);
-        let target = match self.doc.element(&id).map(|e| &e.kind) {
+        let target = match self.session.document().element(&id).map(|e| &e.kind) {
             Some(ElementKind::Text { .. }) => Target::Existing(id.clone()),
             Some(ElementKind::Shape {
                 bound_text_id,
@@ -1803,7 +1628,9 @@ impl Editor {
             _ => return Effects::default(),
         };
         match target {
-            Target::Existing(id) => self.begin_text_edit(self.doc.element(&id).cloned(), now),
+            Target::Existing(id) => {
+                self.begin_text_edit(self.session.document().element(&id).cloned(), now)
+            }
             Target::Bound {
                 container,
                 rect,
@@ -1811,25 +1638,32 @@ impl Editor {
             } => {
                 // A dangling link (corrupted document, abandoned draft) heals
                 // by creating a fresh bound text instead of editing nothing.
-                match existing
-                    .and_then(|id| self.doc.element(&id).filter(|e| !e.is_deleted).map(|_| id))
-                {
-                    Some(id) => self.begin_text_edit(self.doc.element(&id).cloned(), now),
+                match existing.and_then(|id| {
+                    self.session
+                        .document()
+                        .element(&id)
+                        .filter(|e| !e.is_deleted)
+                        .map(|_| id)
+                }) {
+                    Some(id) => {
+                        self.begin_text_edit(self.session.document().element(&id).cloned(), now)
+                    }
                     None => self.create_bound_text(container, rect, now),
                 }
             }
             Target::Frame { id, rect, name } => {
-                self.interaction = Interaction::FrameNameEditing { id: id.clone() };
+                self.gesture.interaction = Interaction::FrameNameEditing { id: id.clone() };
                 let top_left = self
+                    .view
                     .camera
                     .world_to_screen(Point::new(rect.x, rect.y - 18.0));
                 let action = ShellAction::OpenTextEditor {
                     id,
                     x: top_left.x,
                     y: top_left.y,
-                    width: (rect.w * self.camera.zoom).max(120.0),
-                    height: 20.0 * self.camera.zoom.max(0.5),
-                    font_size: 14.0 * self.camera.zoom,
+                    width: (rect.w * self.view.camera.zoom).max(120.0),
+                    height: 20.0 * self.view.camera.zoom.max(0.5),
+                    font_size: 14.0 * self.view.camera.zoom,
                     text: name,
                     align: TextAlign::Left,
                     color: "#868e96".into(),
@@ -1849,10 +1683,14 @@ impl Editor {
     /// starts a new point-text element.
     fn begin_text_tool(&mut self, world: Point, now: u64) -> Effects {
         let tolerance = self.tolerance();
-        if let Some(id) = hit_test_raw_indexed(&self.doc, &self.hit, world, tolerance) {
-            match self.doc.element(&id).map(|e| &e.kind) {
+        if let Some(id) = self
+            .projection
+            .hit_test_raw(self.session.document(), world, tolerance)
+        {
+            match self.session.document().element(&id).map(|e| &e.kind) {
                 Some(ElementKind::Text { .. }) => {
-                    return self.begin_text_edit(self.doc.element(&id).cloned(), now);
+                    return self
+                        .begin_text_edit(self.session.document().element(&id).cloned(), now);
                 }
                 // Clicking a container with the text tool labels it: the text
                 // is bound and centred, so it lands in the middle of the
@@ -1870,7 +1708,7 @@ impl Editor {
 
     /// Edit (or create) the text bound to a container, centred in it.
     fn begin_bound_text(&mut self, container_id: ElementId, now: u64) -> Effects {
-        let Some(element) = self.doc.element(&container_id).cloned() else {
+        let Some(element) = self.session.document().element(&container_id).cloned() else {
             return Effects::default();
         };
         let (rect, existing) = match &element.kind {
@@ -1890,7 +1728,8 @@ impl Editor {
                 // A dangling link (corrupted document, abandoned draft) heals
                 // here: treat it like no link and create a fresh bound text.
                 match self
-                    .doc
+                    .session
+                    .document()
                     .element(&text_id)
                     .filter(|element| !element.is_deleted)
                     .cloned()
@@ -1905,11 +1744,14 @@ impl Editor {
 
     /// Create a point-text element and open the editor.
     pub fn start_text(&mut self, world: Point, now: u64) -> Effects {
-        if self.interaction != Interaction::Idle {
+        if self.gesture.interaction != Interaction::Idle {
             return Effects::default();
         }
         let mut tx = Transaction::begin();
-        let line_height = self.measurer.line_height(self.style.font_size);
+        let line_height = self
+            .projection
+            .measurer()
+            .line_height(self.view.style.font_size);
         let element = Element::new(
             ElementKind::Text {
                 rect: Rect::new(
@@ -1924,17 +1766,17 @@ impl Editor {
                 align: TextAlign::Left,
                 fixed_width: false,
                 container_id: None,
-                style: self.style.clone(),
+                style: self.view.style.clone(),
             },
             self.next_index(),
             now,
         );
         let id = element.id.clone();
-        if let Err(err) = tx.add(&mut self.doc, element) {
+        if let Err(err) = self.session.add(&mut tx, element) {
             debug_assert!(false, "text add failed: {err}");
         }
-        self.tx = Some(tx);
-        self.interaction = Interaction::TextEditing {
+        self.gesture.tx = Some(tx);
+        self.gesture.interaction = Interaction::TextEditing {
             id: id.clone(),
             original: Box::new(None),
         };
@@ -1957,8 +1799,8 @@ impl Editor {
             ElementKind::Text { text, .. } => text.clone(),
             _ => return Effects::default(),
         };
-        self.tx = Some(Transaction::begin());
-        self.interaction = Interaction::TextEditing {
+        self.gesture.tx = Some(Transaction::begin());
+        self.gesture.interaction = Interaction::TextEditing {
             id: id.clone(),
             original: Box::new(Some(element)),
         };
@@ -1978,26 +1820,35 @@ impl Editor {
         now: u64,
     ) -> Effects {
         let is_glyph = matches!(
-            self.doc.element(&container_id).map(|e| &e.kind),
+            self.session
+                .document()
+                .element(&container_id)
+                .map(|e| &e.kind),
             Some(ElementKind::Glyph { .. })
         );
         let is_sticky = matches!(
-            self.doc.element(&container_id).map(|e| &e.kind),
+            self.session
+                .document()
+                .element(&container_id)
+                .map(|e| &e.kind),
             Some(ElementKind::Shape {
                 shape: ShapeKind::Sticky,
                 ..
             })
         );
         let mut tx = Transaction::begin();
-        let font_size = self.style.font_size;
-        let line_height = self.measurer.line_height(font_size);
+        let font_size = self.view.style.font_size;
+        let line_height = self.projection.measurer().line_height(font_size);
         // Sticky text sits inside the note, inked in the note's own (dark)
         // outline colour so it reads on the pastel fill.
         let padding = if is_sticky { 14.0 } else { 10.0 };
-        let mut text_style = self.style.clone();
+        let mut text_style = self.view.style.clone();
         if is_sticky {
-            if let Some(ElementKind::Shape { style, .. }) =
-                self.doc.element(&container_id).map(|e| &e.kind)
+            if let Some(ElementKind::Shape { style, .. }) = self
+                .session
+                .document()
+                .element(&container_id)
+                .map(|e| &e.kind)
             {
                 text_style.stroke_color = style.stroke_color.clone();
             }
@@ -2026,25 +1877,22 @@ impl Editor {
             now,
         );
         let text_id = element.id.clone();
-        if let Err(err) = tx.add(&mut self.doc, element) {
+        if let Err(err) = self.session.add(&mut tx, element) {
             debug_assert!(false, "bound text add failed: {err}");
         }
         let link_id = text_id.clone();
-        if let Err(err) = tx.update(
-            &mut self.doc,
-            &container_id,
-            now,
-            |element| match &mut element.kind {
+        if let Err(err) = self.session.update(&mut tx, &container_id, now, |element| {
+            match &mut element.kind {
                 ElementKind::Shape { bound_text_id, .. } => *bound_text_id = Some(link_id),
                 ElementKind::Glyph { caption_id, .. } => *caption_id = Some(link_id),
                 ElementKind::Arrow { label_id, .. } => *label_id = Some(link_id),
                 _ => {}
-            },
-        ) {
+            }
+        }) {
             debug_assert!(false, "container link failed: {err}");
         }
-        self.tx = Some(tx);
-        self.interaction = Interaction::TextEditing {
+        self.gesture.tx = Some(tx);
+        self.gesture.interaction = Interaction::TextEditing {
             id: text_id.clone(),
             original: Box::new(None),
         };
@@ -2058,7 +1906,7 @@ impl Editor {
     }
 
     fn text_editor_action(&self, id: &str, content: String) -> Option<ShellAction> {
-        let element = self.doc.element(id)?;
+        let element = self.session.document().element(id)?;
         let (rect, font_size, align, color, wrap) = match &element.kind {
             ElementKind::Text {
                 rect,
@@ -2080,8 +1928,9 @@ impl Editor {
             ),
             _ => return None,
         };
-        let top_left = self.camera.world_to_screen(Point::new(rect.x, rect.y));
+        let top_left = self.view.camera.world_to_screen(Point::new(rect.x, rect.y));
         let bottom_right = self
+            .view
             .camera
             .world_to_screen(Point::new(rect.max_x(), rect.max_y()));
         let screen = Rect::from_points(top_left, bottom_right);
@@ -2090,8 +1939,8 @@ impl Editor {
             x: screen.x,
             y: screen.y,
             width: screen.w.max(60.0),
-            height: screen.h.max(font_size * self.camera.zoom * 1.6),
-            font_size: font_size * self.camera.zoom,
+            height: screen.h.max(font_size * self.view.camera.zoom * 1.6),
+            font_size: font_size * self.view.camera.zoom,
             text: content,
             align,
             color,
@@ -2102,11 +1951,11 @@ impl Editor {
 
     /// Commit the open text edit with the shell's textarea contents.
     pub fn commit_text(&mut self, id: &str, text: &str, now: u64) -> Effects {
-        if let Interaction::FrameNameEditing { id: editing_id } = &self.interaction {
+        if let Interaction::FrameNameEditing { id: editing_id } = &self.gesture.interaction {
             if editing_id != id {
                 return Effects::default();
             }
-            self.interaction = Interaction::Idle;
+            self.gesture.interaction = Interaction::Idle;
             let effects = Effects {
                 changed: [id.to_string()].into_iter().collect(),
                 overlay_changed: true,
@@ -2115,19 +1964,19 @@ impl Editor {
             if !text.trim().is_empty() {
                 let mut tx = Transaction::begin();
                 let name = text.to_string();
-                let _ = tx.update(&mut self.doc, id, now, |element| {
+                let _ = self.session.update(&mut tx, id, now, |element| {
                     if let ElementKind::Frame { name: current, .. } = &mut element.kind {
                         *current = name.clone();
                     }
                 });
-                tx.commit(&mut self.history);
+                self.session.commit(tx);
             }
             return effects;
         }
-        if !matches!(self.interaction, Interaction::TextEditing { .. }) {
+        if !matches!(self.gesture.interaction, Interaction::TextEditing { .. }) {
             return Effects::default();
         }
-        let interaction = std::mem::replace(&mut self.interaction, Interaction::Idle);
+        let interaction = self.gesture.take_interaction();
         let Interaction::TextEditing {
             id: editing_id,
             original,
@@ -2139,8 +1988,8 @@ impl Editor {
         if editing_id != id {
             return Effects::default();
         }
-        let tx = self.tx.take();
-        self.interaction = Interaction::Idle;
+        let tx = self.gesture.tx.take();
+        self.gesture.interaction = Interaction::Idle;
         let mut effects = Effects {
             changed: [id.to_string()].into_iter().collect(),
             overlay_changed: true,
@@ -2151,7 +2000,7 @@ impl Editor {
             match original {
                 Some(orig) => {
                     if let Some(mut tx) = tx {
-                        let _ = tx.update(&mut self.doc, id, now, |element| {
+                        let _ = self.session.update(&mut tx, id, now, |element| {
                             if let (
                                 ElementKind::Text {
                                     text: current,
@@ -2169,7 +2018,7 @@ impl Editor {
                                 *rect = *orig_rect;
                             }
                         });
-                        tx.commit(&mut self.history);
+                        self.session.commit(tx);
                     }
                 }
                 None => {
@@ -2180,13 +2029,13 @@ impl Editor {
                     match tx {
                         Some(tx) => effects.changed.extend(self.revert_transaction(&tx)),
                         None => {
-                            if let Some(element) = self.doc.element(id).cloned() {
-                                let _ = self.doc.apply(&Delta::Purge { element });
+                            if let Some(element) = self.session.document().element(id).cloned() {
+                                let _ = self.session.apply(&Delta::Purge { element });
                             }
                             self.unlink_dead_reference(id);
                         }
                     }
-                    self.selection.remove(id);
+                    self.view.selection.remove(id);
                 }
             }
             return effects;
@@ -2196,7 +2045,7 @@ impl Editor {
         let was_new_text = original.is_none();
         if let (Some(mut tx), Some(new_rect)) = (tx, new_rect) {
             let content = text.to_string();
-            let _ = tx.update(&mut self.doc, id, now, |element| {
+            let _ = self.session.update(&mut tx, id, now, |element| {
                 if let ElementKind::Text { text, rect, .. } = &mut element.kind {
                     *text = content.clone();
                     *rect = new_rect;
@@ -2204,12 +2053,10 @@ impl Editor {
             });
             // Text committed inside a frame becomes its child, like any other
             // element, so the frame carries it when it moves.
-            self.tx = Some(tx);
+            self.gesture.tx = Some(tx);
             self.sync_frame_membership(now);
-            if let Some(tx) = self.tx.take() {
-                tx.commit(&mut self.history);
-            }
-            self.selection = [id.to_string()].into_iter().collect();
+            self.session.commit_opt(self.gesture.tx.take());
+            self.view.selection = [id.to_string()].into_iter().collect();
             effects.changed.insert(id.to_string());
             if was_new_text {
                 self.finish_tool_use();
@@ -2219,7 +2066,7 @@ impl Editor {
     }
 
     fn text_rect_for(&self, id: &str, text: &str) -> Option<Rect> {
-        let element = self.doc.element(id)?;
+        let element = self.session.document().element(id)?;
         let (rect, fixed_width, container_id, font_size) = match &element.kind {
             ElementKind::Text {
                 rect,
@@ -2230,7 +2077,7 @@ impl Editor {
             } => (*rect, *fixed_width, container_id.clone(), style.font_size),
             _ => return None,
         };
-        let measurer = self.measurer.as_ref();
+        let measurer = self.projection.measurer();
         let Some(container_id) = container_id else {
             let layout = if fixed_width {
                 layout_text(text, font_size, Some(rect.w), measurer)
@@ -2244,7 +2091,7 @@ impl Editor {
             };
             return Some(Rect::new(rect.x, rect.y, width, layout.height));
         };
-        let container = self.doc.element(&container_id)?;
+        let container = self.session.document().element(&container_id)?;
         let container_rect = container.bounds();
         let padding = 10.0;
         let wrap = (container_rect.w - padding * 2.0).max(20.0);
@@ -2268,8 +2115,8 @@ impl Editor {
                     end,
                     *routing,
                     waypoints,
-                    &self.doc,
-                    &self.obstacles,
+                    self.session.document(),
+                    self.projection.obstacles(),
                 );
                 let mid = connector::point_at(&points, 0.5);
                 let width = if rect.w > 1.0 { rect.w } else { 100.0 };
@@ -2293,15 +2140,7 @@ impl Editor {
     /// the ids it touched. Drafts are thrown away this way so every element
     /// they created or modified is restored together.
     fn revert_transaction(&mut self, tx: &Transaction) -> BTreeSet<ElementId> {
-        let changed: BTreeSet<ElementId> = tx
-            .deltas()
-            .iter()
-            .map(|delta| delta.element_id().clone())
-            .collect();
-        for delta in tx.deltas().iter().rev() {
-            let _ = self.doc.apply(&delta.invert());
-        }
-        changed
+        self.session.revert(tx)
     }
 
     /// Clear any container's bound-text link that points at `id`. The
@@ -2309,7 +2148,8 @@ impl Editor {
     /// fallback for edits that bypass history.
     fn unlink_dead_reference(&mut self, id: &str) {
         let owners: Vec<ElementId> = self
-            .doc
+            .session
+            .document()
             .elements
             .values()
             .filter(|element| match &element.kind {
@@ -2321,7 +2161,7 @@ impl Editor {
             .map(|element| element.id.clone())
             .collect();
         for owner_id in owners {
-            let Some(before) = self.doc.element(&owner_id).cloned() else {
+            let Some(before) = self.session.document().element(&owner_id).cloned() else {
                 continue;
             };
             let mut after = before.clone();
@@ -2331,7 +2171,7 @@ impl Editor {
                 ElementKind::Arrow { label_id, .. } => *label_id = None,
                 _ => {}
             }
-            let _ = self.doc.apply(&Delta::Update { before, after });
+            let _ = self.session.apply(&Delta::Update { before, after });
         }
     }
 
@@ -2355,7 +2195,7 @@ impl Editor {
             "]" | "}" if mods.command() => self.reorder(1, now),
             "[" | "{" if mods.command() => self.reorder(-1, now),
             " " => {
-                self.nav.set_space(true);
+                self.view.nav.set_space(true);
                 Effects::default()
             }
             _ => {
@@ -2363,8 +2203,8 @@ impl Editor {
                     return Effects::default();
                 }
                 if let Some(tool) = Tool::from_shortcut(key) {
-                    if tool == self.tool {
-                        self.tool_locked = !self.tool_locked;
+                    if tool == self.view.tool {
+                        self.view.tool_locked = !self.view.tool_locked;
                         return Effects {
                             overlay_changed: true,
                             ..Effects::default()
@@ -2378,35 +2218,32 @@ impl Editor {
     }
 
     fn nudge_step(&self, mods: Modifiers) -> f64 {
-        if self.snap_to_grid {
-            return self.grid_size;
+        if self.view.snap_to_grid {
+            return self.view.grid_size;
         }
         if mods.shift {
-            10.0 / self.camera.zoom
+            10.0 / self.view.camera.zoom
         } else {
-            1.0 / self.camera.zoom
+            1.0 / self.view.camera.zoom
         }
     }
 
     pub fn key_up(&mut self, key: &str) -> Effects {
         if key == " " {
-            self.nav.set_space(false);
+            self.view.nav.set_space(false);
         }
         Effects::default()
     }
 
     pub fn cancel(&mut self) -> Effects {
-        let interaction = std::mem::take(&mut self.interaction);
-        let current = self.marquee_current.take();
+        let interaction = std::mem::take(&mut self.gesture.interaction);
+        let current = self.gesture.marquee_current.take();
         let _ = current;
         match interaction {
             Interaction::Idle => self.clear_selection(),
             Interaction::Drawing { id, .. } | Interaction::PullingSticky { id, .. } => {
-                self.tx = None;
-                let purged = self.doc.element(&id).cloned();
-                if let Some(element) = purged {
-                    let _ = self.doc.apply(&Delta::Purge { element });
-                }
+                self.gesture.tx = None;
+                let _ = self.session.purge(&id);
                 Effects {
                     changed: [id].into_iter().collect(),
                     overlay_changed: true,
@@ -2418,28 +2255,10 @@ impl Editor {
                 ..Effects::default()
             },
             Interaction::Moving { .. } => {
-                self.hover_anchors = None;
+                self.gesture.hover_anchors = None;
                 // Preview never touched the document: unshift the rigid scene
-                // preview and rebuild the rubber-banded arrows exactly. The
-                // unshift restores bounds; ops points were deferred all
-                // along, so nothing else needs restoring.
-                let total = self.drag_applied;
-                let attached: BTreeSet<ElementId> = self
-                    .drag_attached
-                    .iter()
-                    .map(|meta| meta.id.clone())
-                    .collect();
-                self.drag_working.clear();
-                self.drag_frozen.clear();
-                self.drag_attached.clear();
-                let _ = self.tx.take();
-                self.drag_applied = Point::ZERO;
-                if total.x.abs() > 1e-9 || total.y.abs() > 1e-9 {
-                    let slots = std::mem::take(&mut self.drag_slots);
-                    self.scene.shift_slots(&slots, -total.x, -total.y);
-                } else {
-                    self.drag_slots.clear();
-                }
+                // preview and rebuild the rubber-banded arrows exactly.
+                let attached = self.gesture.cancel_move(&mut self.projection);
                 Effects {
                     changed: attached,
                     overlay_changed: true,
@@ -2449,13 +2268,13 @@ impl Editor {
             Interaction::Resizing { .. }
             | Interaction::ArrowEndpoint { .. }
             | Interaction::ArrowWaypoint { .. } => {
-                self.hover_anchors = None;
+                self.gesture.hover_anchors = None;
                 // Drop gesture-preview caches (rigid shifts, rubber bands):
                 // the changed set below rebuilds everything exactly.
-                self.scene.discard_preview();
-                if let Some(tx) = self.tx.take() {
+                self.projection.discard_preview();
+                if let Some(tx) = self.gesture.tx.take() {
                     for delta in tx.deltas().iter().rev() {
-                        let _ = self.doc.apply(&delta.invert());
+                        let _ = self.session.apply(&delta.invert());
                     }
                     let changed: BTreeSet<ElementId> =
                         tx.deltas().iter().map(|d| d.element_id().clone()).collect();
@@ -2471,9 +2290,9 @@ impl Editor {
                 }
             }
             Interaction::Erasing { erased } => {
-                if let Some(tx) = self.tx.take() {
+                if let Some(tx) = self.gesture.tx.take() {
                     for delta in tx.deltas().iter().rev() {
-                        let _ = self.doc.apply(&delta.invert());
+                        let _ = self.session.apply(&delta.invert());
                     }
                 }
                 Effects {
@@ -2483,11 +2302,8 @@ impl Editor {
                 }
             }
             Interaction::Freehand { id } | Interaction::Line { id, .. } => {
-                self.tx = None;
-                let purged = self.doc.element(&id).cloned();
-                if let Some(element) = purged {
-                    let _ = self.doc.apply(&Delta::Purge { element });
-                }
+                self.gesture.tx = None;
+                let _ = self.session.purge(&id);
                 Effects {
                     changed: [id].into_iter().collect(),
                     overlay_changed: true,
@@ -2495,12 +2311,9 @@ impl Editor {
                 }
             }
             Interaction::Connecting { id, .. } => {
-                self.tx = None;
-                self.hover_anchors = None;
-                let purged = self.doc.element(&id).cloned();
-                if let Some(element) = purged {
-                    let _ = self.doc.apply(&Delta::Purge { element });
-                }
+                self.gesture.tx = None;
+                self.gesture.hover_anchors = None;
+                let _ = self.session.purge(&id);
                 Effects {
                     changed: [id].into_iter().collect(),
                     overlay_changed: true,
@@ -2511,19 +2324,19 @@ impl Editor {
                 let mut changed: BTreeSet<ElementId> = [id.clone()].into_iter().collect();
                 match *original {
                     Some(orig) => {
-                        self.tx = None;
-                        if let Some(current) = self.doc.element(&id).cloned() {
-                            let _ = self.doc.apply(&Delta::Update {
+                        self.gesture.tx = None;
+                        if let Some(current) = self.session.document().element(&id).cloned() {
+                            let _ = self.session.apply(&Delta::Update {
                                 before: current,
                                 after: orig,
                             });
                         }
                     }
-                    None => match self.tx.take() {
+                    None => match self.gesture.tx.take() {
                         Some(tx) => changed.extend(self.revert_transaction(&tx)),
                         None => {
-                            if let Some(element) = self.doc.element(&id).cloned() {
-                                let _ = self.doc.apply(&Delta::Purge { element });
+                            if let Some(element) = self.session.document().element(&id).cloned() {
+                                let _ = self.session.apply(&Delta::Purge { element });
                             }
                             self.unlink_dead_reference(&id);
                         }
@@ -2536,7 +2349,7 @@ impl Editor {
                 }
             }
             Interaction::FrameNameEditing { id } => {
-                self.interaction = Interaction::Idle;
+                self.gesture.interaction = Interaction::Idle;
                 Effects {
                     changed: [id].into_iter().collect(),
                     overlay_changed: true,
@@ -2549,10 +2362,10 @@ impl Editor {
     // -- commands ----------------------------------------------------------
 
     pub fn delete_selection(&mut self, now: u64) -> Effects {
-        if self.interaction != Interaction::Idle {
+        if self.gesture.interaction != Interaction::Idle {
             return self.cancel();
         }
-        if self.selection.is_empty() {
+        if self.view.selection.is_empty() {
             return Effects::default();
         }
         let mut tx = Transaction::begin();
@@ -2561,12 +2374,12 @@ impl Editor {
             .into_iter()
             .collect();
         for id in &ids {
-            if let Err(err) = tx.remove(&mut self.doc, id, now) {
+            if let Err(err) = self.session.remove(&mut tx, id, now) {
                 debug_assert!(false, "delete failed: {err}");
             }
         }
-        tx.commit(&mut self.history);
-        self.selection.clear();
+        self.session.commit(tx);
+        self.view.selection.clear();
         Effects {
             changed: ids.into_iter().collect(),
             overlay_changed: true,
@@ -2575,14 +2388,8 @@ impl Editor {
     }
 
     pub fn undo(&mut self, now: u64) -> Effects {
-        let changed: BTreeSet<ElementId> = match self.history.undo(&mut self.doc, now) {
-            Ok(ids) => ids.into_iter().collect(),
-            Err(err) => {
-                debug_assert!(false, "undo failed: {err}");
-                BTreeSet::new()
-            }
-        };
-        self.selection.clear();
+        let changed = self.session.undo(now);
+        self.view.selection.clear();
         Effects {
             changed,
             overlay_changed: true,
@@ -2592,14 +2399,8 @@ impl Editor {
     }
 
     pub fn redo(&mut self, now: u64) -> Effects {
-        let changed: BTreeSet<ElementId> = match self.history.redo(&mut self.doc, now) {
-            Ok(ids) => ids.into_iter().collect(),
-            Err(err) => {
-                debug_assert!(false, "redo failed: {err}");
-                BTreeSet::new()
-            }
-        };
-        self.selection.clear();
+        let changed = self.session.redo(now);
+        self.view.selection.clear();
         Effects {
             changed,
             overlay_changed: true,
@@ -2631,7 +2432,8 @@ impl Editor {
             let freeze = |endpoint: &Endpoint, other: Point| -> Option<Point> {
                 match &endpoint.binding {
                     Some(binding) if !moved.contains(binding.element_id.as_str()) => {
-                        let (point, _) = connector::resolve_endpoint(endpoint, other, &self.doc);
+                        let (point, _) =
+                            connector::resolve_endpoint(endpoint, other, self.session.document());
                         Some(point)
                     }
                     _ => None,
@@ -2647,7 +2449,7 @@ impl Editor {
         // Attached arrows: snapshot ends, style and pre-gesture element.
         let mut attached: Vec<AttachedDrag> = Vec::new();
         for arrow_id in &arrow_ids {
-            let Some(element) = self.doc.element(arrow_id) else {
+            let Some(element) = self.session.document().element(arrow_id) else {
                 continue;
             };
             let ElementKind::Arrow {
@@ -2673,24 +2475,21 @@ impl Editor {
                 built: false,
             });
         }
-        let working = originals.clone();
-        self.tx = Some(Transaction::begin());
-        self.drag_applied = Point::ZERO;
-        self.drag_slots = self.scene_slot_subset(
+        let slots = self.scene_slot_subset(
             &originals
                 .iter()
                 .map(|e| e.id.clone())
                 .collect::<BTreeSet<ElementId>>(),
         );
-        self.drag_working = working;
-        self.drag_frozen = frozen;
-        self.drag_attached = attached;
-        self.interaction = Interaction::Moving {
-            start: world,
+        self.gesture.begin_move(
+            world,
             originals,
             arrow_ids,
             started_in_selection,
-        };
+            slots,
+            frozen,
+            attached,
+        );
         Effects {
             overlay_changed: true,
             ..Effects::default()
@@ -2705,8 +2504,8 @@ impl Editor {
         // radius matches the resize handles so the affordance is the same.
         if !mods.shift {
             if let Some((id, end)) = self.arrow_endpoint_at(world) {
-                self.tx = Some(Transaction::begin());
-                self.interaction = Interaction::ArrowEndpoint { id, end };
+                self.gesture.tx = Some(Transaction::begin());
+                self.gesture.interaction = Interaction::ArrowEndpoint { id, end };
                 return Effects {
                     overlay_changed: true,
                     ..Effects::default()
@@ -2714,7 +2513,7 @@ impl Editor {
             }
             // A bend on a selected connector: drag it to reshape the path.
             if let Some((id, handle)) = self.arrow_handle_at(world) {
-                self.tx = Some(Transaction::begin());
+                self.gesture.tx = Some(Transaction::begin());
                 let drag = match handle {
                     ArrowHandle::Waypoint { index, .. } => WaypointDrag::Existing { index },
                     ArrowHandle::Insert {
@@ -2730,7 +2529,7 @@ impl Editor {
                         inserted: None,
                     },
                 };
-                self.interaction = Interaction::ArrowWaypoint { id, drag };
+                self.gesture.interaction = Interaction::ArrowWaypoint { id, drag };
                 return Effects {
                     overlay_changed: true,
                     ..Effects::default()
@@ -2751,12 +2550,13 @@ impl Editor {
         if let Some(bounds) = self.selection_bounds() {
             if let Some(handle) = self.handle_at(screen, bounds) {
                 let originals: Vec<Element> = self
+                    .view
                     .selection
                     .iter()
-                    .filter_map(|sid| self.doc.element(sid).cloned())
+                    .filter_map(|sid| self.session.document().element(sid).cloned())
                     .collect();
-                self.tx = Some(Transaction::begin());
-                self.interaction = Interaction::Resizing {
+                self.gesture.tx = Some(Transaction::begin());
+                self.gesture.interaction = Interaction::Resizing {
                     handle,
                     start: world,
                     bounds,
@@ -2781,23 +2581,26 @@ impl Editor {
             }
         }
         let tolerance = self.tolerance();
-        match hit_test_indexed(&self.doc, &self.hit, world, tolerance) {
+        match self
+            .projection
+            .hit_test(self.session.document(), world, tolerance)
+        {
             Some(id) => {
                 if mods.shift {
-                    if self.selection.contains(&id) {
-                        self.selection.remove(&id);
+                    if self.view.selection.contains(&id) {
+                        self.view.selection.remove(&id);
                     } else {
-                        self.selection.insert(id);
+                        self.view.selection.insert(id);
                     }
-                    self.selection_bounds_cache = None;
+                    self.view.invalidate_selection_bounds();
                     return Effects {
                         overlay_changed: true,
                         ..Effects::default()
                     };
                 }
-                if !self.selection.contains(&id) {
-                    self.selection = [id].into_iter().collect();
-                    self.selection_bounds_cache = None;
+                if !self.view.selection.contains(&id) {
+                    self.view.selection = [id].into_iter().collect();
+                    self.view.invalidate_selection_bounds();
                 }
                 let originals: Vec<Element> = self.selection_with_followers();
                 let moved: BTreeSet<ElementId> = originals.iter().map(|e| e.id.clone()).collect();
@@ -2807,7 +2610,7 @@ impl Editor {
             None => {
                 // Dragging from empty space inside the selection's bounding
                 // box moves the whole selection; only a click clears it.
-                if !mods.shift && !self.selection.is_empty() {
+                if !mods.shift && !self.view.selection.is_empty() {
                     if let Some(bounds) = self.selection_bounds() {
                         if bounds.contains(world) {
                             let originals = self.selection_with_followers();
@@ -2818,8 +2621,8 @@ impl Editor {
                         }
                     }
                 }
-                self.marquee_current = Some(world);
-                self.interaction = Interaction::Marquee { start: world };
+                self.gesture.marquee_current = Some(world);
+                self.gesture.interaction = Interaction::Marquee { start: world };
                 Effects {
                     overlay_changed: true,
                     ..Effects::default()
@@ -2830,7 +2633,7 @@ impl Editor {
 
     fn begin_drawing(&mut self, world: Point, now: u64) -> Effects {
         let mut tx = Transaction::begin();
-        let kind = match self.tool {
+        let kind = match self.view.tool {
             Tool::Rectangle => ShapeKind::Rectangle,
             Tool::Diamond => ShapeKind::Diamond,
             _ => ShapeKind::Ellipse,
@@ -2839,18 +2642,18 @@ impl Editor {
             ElementKind::Shape {
                 shape: kind,
                 rect: Rect::new(world.x, world.y, 0.0, 0.0),
-                style: self.style.clone(),
+                style: self.view.style.clone(),
                 bound_text_id: None,
             },
             self.next_index(),
             now,
         );
         let id = element.id.clone();
-        if let Err(err) = tx.add(&mut self.doc, element) {
+        if let Err(err) = self.session.add(&mut tx, element) {
             debug_assert!(false, "drawing add failed: {err}");
         }
-        self.tx = Some(tx);
-        self.interaction = Interaction::Drawing {
+        self.gesture.tx = Some(tx);
+        self.gesture.interaction = Interaction::Drawing {
             id: id.clone(),
             start: world,
         };
@@ -2862,7 +2665,7 @@ impl Editor {
     }
 
     fn next_index(&self) -> String {
-        match self.doc.top_index() {
+        match self.session.document().top_index() {
             Some(top) => crate::index::key_between(Some(&top), None).expect("index space"),
             None => crate::index::key_between(None, None).expect("first index"),
         }
@@ -2871,7 +2674,7 @@ impl Editor {
     /// Resize handle positions in screen space, if something is selected.
     pub fn resize_handles(&self) -> Option<[(Handle, Point); 8]> {
         self.selection_bounds()
-            .map(|r| Handle::ALL.map(|h| (h, self.camera.world_to_screen(h.position(r)))))
+            .map(|r| Handle::ALL.map(|h| (h, self.view.camera.world_to_screen(h.position(r)))))
     }
 
     fn handle_at(&self, screen: Point, _bounds: Rect) -> Option<Handle> {
@@ -2886,13 +2689,16 @@ impl Editor {
     // -- connection nodes --------------------------------------------------
 
     fn node_grab(&self) -> f64 {
-        HANDLE_HIT_PX / self.camera.zoom
+        HANDLE_HIT_PX / self.view.camera.zoom
     }
 
     /// Where a side's connection node floats: just outside the edge, in
     /// screen-constant distance, so it never fights the resize handles.
     fn node_position(&self, side: connector::AnchorSide, anchor: Point) -> Point {
-        anchor + side.focus().scale(CONNECTION_NODE_PX / self.camera.zoom)
+        anchor
+            + side
+                .focus()
+                .scale(CONNECTION_NODE_PX / self.view.camera.zoom)
     }
 
     fn node_points_for(&self, element: &Element) -> Vec<Point> {
@@ -2916,20 +2722,25 @@ impl Editor {
         world: Point,
         exclude: Option<&str>,
     ) -> Option<(ElementId, connector::AnchorSide, Point)> {
-        let reach = (CONNECTION_NODE_PX + HANDLE_HIT_PX) / self.camera.zoom;
+        let reach = (CONNECTION_NODE_PX + HANDLE_HIT_PX) / self.view.camera.zoom;
         let grab = self.node_grab();
         // Grid candidates instead of a full scan: same model-bounds reject.
         let pad = reach + crate::spatial::hit_pad();
         let area = crate::geometry::Rect::new(world.x - pad, world.y - pad, pad * 2.0, pad * 2.0);
         let mut best: Option<ElementId> = None;
-        for row in self.hit.query(area) {
-            let Some((id, _, _)) = self.hit.row(row) else {
+        for row in self.projection.hit_query(area) {
+            let Some((id, _, _)) = self.projection.hit_row(row) else {
                 continue;
             };
             if exclude == Some(id) {
                 continue;
             }
-            let Some(element) = self.doc.element(id).filter(|e| !e.is_deleted) else {
+            let Some(element) = self
+                .session
+                .document()
+                .element(id)
+                .filter(|e| !e.is_deleted)
+            else {
                 continue;
             };
             // Bound text is not a node source, but it still occludes the
@@ -2951,7 +2762,11 @@ impl Editor {
             let topmost = best.as_ref().is_none_or(|b| {
                 let (ka, kb) = (
                     element.index.as_str(),
-                    self.doc.element(b).map(|e| e.index.as_str()).unwrap_or(""),
+                    self.session
+                        .document()
+                        .element(b)
+                        .map(|e| e.index.as_str())
+                        .unwrap_or(""),
                 );
                 (ka, element.id.as_str()) > (kb, b.as_str())
             });
@@ -2959,7 +2774,7 @@ impl Editor {
                 best = Some(element.id.clone());
             }
         }
-        let element = self.doc.element(best.as_deref()?)?;
+        let element = self.session.document().element(best.as_deref()?)?;
         if !Self::is_connectable(element) {
             return None;
         }
@@ -2976,25 +2791,27 @@ impl Editor {
 
     /// Refresh the hovered element's connection nodes for the Select tool.
     fn update_hover(&mut self, world: Point) -> Effects {
-        if self.tool != Tool::Select {
+        if self.view.tool != Tool::Select {
             return self.clear_hover();
         }
         let mut effects = Effects::default();
         // Hovering a sticky stack's pull zone offers to drag a note off it.
         let next_stack = self.stack_pull_at(world);
-        if self.hover_stack != next_stack {
-            self.hover_stack = next_stack;
+        if self.gesture.hover_stack != next_stack {
+            self.gesture.hover_stack = next_stack;
             effects.overlay_changed = true;
         }
         // Keep the current nodes while the pointer is out on one of them:
         // they float outside the element, so a fresh hit test would miss.
-        if let Some((_, nodes)) = &self.hover_anchors {
+        if let Some((_, nodes)) = &self.gesture.hover_anchors {
             if nodes.iter().any(|p| p.distance(world) <= self.node_grab()) {
                 return effects;
             }
         }
-        let next = hit_test_indexed(&self.doc, &self.hit, world, self.tolerance())
-            .and_then(|id| self.doc.element(&id).cloned())
+        let next = self
+            .projection
+            .hit_test(self.session.document(), world, self.tolerance())
+            .and_then(|id| self.session.document().element(&id).cloned())
             .filter(Self::is_connectable)
             .map(|element| {
                 let nodes = self.node_points_for(&element);
@@ -3002,12 +2819,12 @@ impl Editor {
             })
             .or_else(|| {
                 self.node_hit(world, None).and_then(|(id, _, _)| {
-                    let element = self.doc.element(&id)?;
+                    let element = self.session.document().element(&id)?;
                     Some((id, self.node_points_for(element)))
                 })
             });
-        if self.hover_anchors != next {
-            self.hover_anchors = next;
+        if self.gesture.hover_anchors != next {
+            self.gesture.hover_anchors = next;
             effects.overlay_changed = true;
         }
         effects
@@ -3015,7 +2832,8 @@ impl Editor {
 
     /// Drop the hover state (pointer left the canvas, tool changed, …).
     pub fn clear_hover(&mut self) -> Effects {
-        let changed = self.hover_anchors.take().is_some() | self.hover_stack.take().is_some();
+        let changed =
+            self.gesture.hover_anchors.take().is_some() | self.gesture.hover_stack.take().is_some();
         if changed {
             Effects {
                 overlay_changed: true,
@@ -3029,13 +2847,15 @@ impl Editor {
     /// The sticky stack whose pull zone (everything but the border ring) is
     /// under `world`, if any.
     fn stack_pull_at(&self, world: Point) -> Option<ElementId> {
-        let id = hit_test_indexed(&self.doc, &self.hit, world, self.tolerance())?;
-        let element = self.doc.element(&id)?;
+        let id = self
+            .projection
+            .hit_test(self.session.document(), world, self.tolerance())?;
+        let element = self.session.document().element(&id)?;
         if !element.is_sticky_stack() {
             return None;
         }
         let rect = element.bounds();
-        let inset = STACK_EDGE_PX / self.camera.zoom;
+        let inset = STACK_EDGE_PX / self.view.camera.zoom;
         let inner = Rect::new(
             rect.x + inset,
             rect.y + inset,
@@ -3047,7 +2867,7 @@ impl Editor {
 
     /// Whether the pointer is offering to pull a note off a stack.
     pub fn stack_pull_hover(&self) -> bool {
-        self.hover_stack.is_some()
+        self.gesture.hover_stack.is_some()
     }
 
     /// Draggable bends on the selected lone connector: one handle per
@@ -3067,8 +2887,14 @@ impl Editor {
         else {
             return Vec::new();
         };
-        let route =
-            connector::route_avoiding(start, end, *routing, waypoints, &self.doc, &self.obstacles);
+        let route = connector::route_avoiding(
+            start,
+            end,
+            *routing,
+            waypoints,
+            self.session.document(),
+            self.projection.obstacles(),
+        );
         let mut handles: Vec<ArrowHandle> = waypoints
             .iter()
             .enumerate()
@@ -3077,7 +2903,7 @@ impl Editor {
                 point: *point,
             })
             .collect();
-        let min_segment = 24.0 / self.camera.zoom;
+        let min_segment = 24.0 / self.view.camera.zoom;
         // On a multi-segment elbow the first and last segments leave the
         // anchors themselves; bowing them can only double the route back on
         // itself. Only interior runs offer insert handles.
@@ -3101,16 +2927,19 @@ impl Editor {
     }
 
     fn lone_arrow(&self) -> Option<&Element> {
-        if self.selection.len() != 1 {
+        if self.view.selection.len() != 1 {
             return None;
         }
-        let element = self.doc.element(self.selection.iter().next()?)?;
+        let element = self
+            .session
+            .document()
+            .element(self.view.selection.iter().next()?)?;
         matches!(element.kind, ElementKind::Arrow { .. }).then_some(element)
     }
 
     fn arrow_handle_at(&self, world: Point) -> Option<(ElementId, ArrowHandle)> {
         let element = self.lone_arrow()?;
-        let grab = HANDLE_HIT_PX / self.camera.zoom;
+        let grab = HANDLE_HIT_PX / self.view.camera.zoom;
         let handle = self
             .arrow_path_handles()
             .into_iter()
@@ -3121,20 +2950,20 @@ impl Editor {
     /// When the selection is a lone connector, which endpoint `world` grabs.
     /// Returns the element id and the grabbed end.
     fn arrow_endpoint_at(&self, world: Point) -> Option<(ElementId, EndpointEnd)> {
-        if self.selection.len() != 1 {
+        if self.view.selection.len() != 1 {
             return None;
         }
-        let id = self.selection.iter().next()?;
-        let element = self.doc.element(id)?;
+        let id = self.view.selection.iter().next()?;
+        let element = self.session.document().element(id)?;
         let ElementKind::Arrow { start, end, .. } = &element.kind else {
             return None;
         };
-        let grab = HANDLE_HIT_PX / self.camera.zoom;
-        let start_point = connector::endpoint_point(start, end.point(), &self.doc);
+        let grab = HANDLE_HIT_PX / self.view.camera.zoom;
+        let start_point = connector::endpoint_point(start, end.point(), self.session.document());
         if world.distance(start_point) <= grab {
             return Some((id.clone(), EndpointEnd::Start));
         }
-        let end_point = connector::endpoint_point(end, start.point(), &self.doc);
+        let end_point = connector::endpoint_point(end, start.point(), self.session.document());
         if world.distance(end_point) <= grab {
             return Some((id.clone(), EndpointEnd::End));
         }
@@ -3145,15 +2974,20 @@ impl Editor {
     /// shaft (but not an endpoint — `arrow_endpoint_at` covers those), the
     /// originals for a body drag: the connector plus its followers.
     fn lone_arrow_shaft_hit(&self, world: Point) -> Option<Vec<Element>> {
-        if self.selection.len() != 1 {
+        if self.view.selection.len() != 1 {
             return None;
         }
-        let id = self.selection.iter().next()?;
-        let element = self.doc.element(id)?;
+        let id = self.view.selection.iter().next()?;
+        let element = self.session.document().element(id)?;
         if !matches!(element.kind, ElementKind::Arrow { .. }) {
             return None;
         }
-        if !crate::hit::hits(&self.doc, element, world, self.tolerance().max(4.0)) {
+        if !crate::hit::hits(
+            self.session.document(),
+            element,
+            world,
+            self.tolerance().max(4.0),
+        ) {
             return None;
         }
         Some(self.selection_with_followers())
@@ -3165,16 +2999,16 @@ impl Editor {
         if patch.is_empty() {
             return Effects::default();
         }
-        patch.apply_to(&mut self.style);
-        if self.selection.is_empty() || self.interaction != Interaction::Idle {
+        patch.apply_to(&mut self.view.style);
+        if self.view.selection.is_empty() || self.gesture.interaction != Interaction::Idle {
             return Effects::default();
         }
-        let ids: Vec<ElementId> = self.selection.iter().cloned().collect();
+        let ids: Vec<ElementId> = self.view.selection.iter().cloned().collect();
         let mut tx = Transaction::begin();
         let mut effects = Effects::default();
         for id in &ids {
             let patched = patch.clone();
-            if let Err(err) = tx.update(&mut self.doc, id, now, |element| {
+            if let Err(err) = self.session.update(&mut tx, id, now, |element| {
                 if let Some(style) = element_style_mut(element) {
                     patched.apply_to(style);
                 }
@@ -3183,16 +3017,17 @@ impl Editor {
             }
             effects.changed.insert(id.clone());
             // Text reflows when its font size changes.
-            if let Some(content) = self
-                .doc
-                .element(id)
-                .and_then(|element| match &element.kind {
-                    ElementKind::Text { text, .. } => Some(text.clone()),
-                    _ => None,
-                })
+            if let Some(content) =
+                self.session
+                    .document()
+                    .element(id)
+                    .and_then(|element| match &element.kind {
+                        ElementKind::Text { text, .. } => Some(text.clone()),
+                        _ => None,
+                    })
             {
                 if let Some(rect) = self.text_rect_for(id, &content) {
-                    let _ = tx.update(&mut self.doc, id, now, |element| {
+                    let _ = self.session.update(&mut tx, id, now, |element| {
                         if let ElementKind::Text { rect: r, .. } = &mut element.kind {
                             *r = rect;
                         }
@@ -3200,20 +3035,21 @@ impl Editor {
                 }
             }
         }
-        tx.commit(&mut self.history);
+        self.session.commit(tx);
         effects.overlay_changed = true;
         effects
     }
 
     /// The style shown in the panel: the selection's style, else defaults.
     pub fn current_style(&self) -> Style {
-        self.selection
+        self.view
+            .selection
             .iter()
             .next()
-            .and_then(|id| self.doc.element(id))
+            .and_then(|id| self.session.document().element(id))
             .and_then(|element| element_style(element))
             .cloned()
-            .unwrap_or_else(|| self.style.clone())
+            .unwrap_or_else(|| self.view.style.clone())
     }
 
     /// Insert a library glyph at the viewport centre with a caption beneath.
@@ -3221,12 +3057,12 @@ impl Editor {
         let Some(definition) = crate::glyphs::lookup(glyph) else {
             return Effects::default();
         };
-        if self.interaction != Interaction::Idle {
+        if self.gesture.interaction != Interaction::Idle {
             return Effects::default();
         }
-        let center = self.camera.screen_to_world(Point::new(
-            self.viewport_size.0 / 2.0,
-            self.viewport_size.1 / 2.0,
+        let center = self.view.camera.screen_to_world(Point::new(
+            self.view.viewport_size.0 / 2.0,
+            self.view.viewport_size.1 / 2.0,
         ));
         let size = 96.0;
         let rect = Rect::new(center.x - size / 2.0, center.y - size / 2.0, size, size);
@@ -3236,23 +3072,23 @@ impl Editor {
             ElementKind::Glyph {
                 glyph: glyph.to_string(),
                 rect,
-                style: self.style.clone(),
+                style: self.view.style.clone(),
                 caption_id: None,
             },
             self.next_index(),
             now,
         );
         let glyph_id = glyph_element.id.clone();
-        if let Err(err) = tx.add(&mut self.doc, glyph_element) {
+        if let Err(err) = self.session.add(&mut tx, glyph_element) {
             debug_assert!(false, "glyph insert failed: {err}");
         }
 
         let wrap = rect.w * 2.0;
         let layout = layout_text(
             definition.name,
-            self.style.font_size,
+            self.view.style.font_size,
             Some(wrap),
-            self.measurer.as_ref(),
+            self.projection.measurer(),
         );
         let caption_rect = Rect::new(
             center.x - wrap / 2.0,
@@ -3267,25 +3103,25 @@ impl Editor {
                 align: TextAlign::Center,
                 fixed_width: true,
                 container_id: Some(glyph_id.clone()),
-                style: self.style.clone(),
+                style: self.view.style.clone(),
             },
             self.next_index(),
             now,
         );
         let caption_id = caption.id.clone();
-        if let Err(err) = tx.add(&mut self.doc, caption) {
+        if let Err(err) = self.session.add(&mut tx, caption) {
             debug_assert!(false, "caption insert failed: {err}");
         }
         let link = caption_id.clone();
-        if let Err(err) = tx.update(&mut self.doc, &glyph_id, now, |element| {
+        if let Err(err) = self.session.update(&mut tx, &glyph_id, now, |element| {
             if let ElementKind::Glyph { caption_id, .. } = &mut element.kind {
                 *caption_id = Some(link);
             }
         }) {
             debug_assert!(false, "caption link failed: {err}");
         }
-        tx.commit(&mut self.history);
-        self.selection = [glyph_id.clone()].into_iter().collect();
+        self.session.commit(tx);
+        self.view.selection = [glyph_id.clone()].into_iter().collect();
         Effects {
             changed: [glyph_id, caption_id].into_iter().collect(),
             overlay_changed: true,
@@ -3296,15 +3132,23 @@ impl Editor {
     /// The style new sticky notes and stacks inherit: a solid pastel fill and
     /// dark ink, so text reads on the note.
     fn sticky_style(&self) -> Style {
-        crate::commands::sticky_style(self.style.clone())
+        crate::commands::sticky_style(self.view.style.clone())
     }
 
     /// The sticky tool: pull a note off a stack under the pointer, otherwise
     /// start a new note (click for the default size, drag to size it).
     fn begin_sticky(&mut self, world: Point, now: u64) -> Effects {
         let tolerance = self.tolerance();
-        if let Some(id) = hit_test_indexed(&self.doc, &self.hit, world, tolerance) {
-            if self.doc.element(&id).is_some_and(|e| e.is_sticky_stack()) {
+        if let Some(id) = self
+            .projection
+            .hit_test(self.session.document(), world, tolerance)
+        {
+            if self
+                .session
+                .document()
+                .element(&id)
+                .is_some_and(|e| e.is_sticky_stack())
+            {
                 return self.begin_pull_from_stack(&id, world, now);
             }
         }
@@ -3321,11 +3165,11 @@ impl Editor {
             now,
         );
         let id = element.id.clone();
-        if let Err(err) = tx.add(&mut self.doc, element) {
+        if let Err(err) = self.session.add(&mut tx, element) {
             debug_assert!(false, "sticky add failed: {err}");
         }
-        self.tx = Some(tx);
-        self.interaction = Interaction::Drawing {
+        self.gesture.tx = Some(tx);
+        self.gesture.interaction = Interaction::Drawing {
             id: id.clone(),
             start: world,
         };
@@ -3338,7 +3182,7 @@ impl Editor {
 
     /// Place a new infinite sticky stack.
     fn begin_sticky_stack(&mut self, world: Point, now: u64) -> Effects {
-        if self.interaction != Interaction::Idle {
+        if self.gesture.interaction != Interaction::Idle {
             return Effects::default();
         }
         let size = STICKY_SIZE;
@@ -3352,16 +3196,16 @@ impl Editor {
             now,
         );
         let id = element.id.clone();
-        if let Err(err) = tx.add(&mut self.doc, element) {
+        if let Err(err) = self.session.add(&mut tx, element) {
             debug_assert!(false, "sticky stack add failed: {err}");
         }
-        self.tx = Some(tx);
+        self.gesture.tx = Some(tx);
         // A stack placed inside a frame belongs to it like any note.
         self.sync_frame_membership(now);
-        if let Some(tx) = self.tx.take() {
-            tx.commit(&mut self.history);
+        if let Some(tx) = self.gesture.tx.take() {
+            self.session.commit(tx);
         }
-        self.selection = [id.clone()].into_iter().collect();
+        self.view.selection = [id.clone()].into_iter().collect();
         self.finish_tool_use();
         Effects {
             changed: [id].into_iter().collect(),
@@ -3373,7 +3217,8 @@ impl Editor {
     /// Pull a note from the stack with the given id.
     fn begin_pull_from_stack(&mut self, stack_id: &str, world: Point, now: u64) -> Effects {
         let Some(ElementKind::StickyStack { rect, style }) = self
-            .doc
+            .session
+            .document()
             .element(stack_id)
             .map(|element| element.kind.clone())
         else {
@@ -3412,11 +3257,11 @@ impl Editor {
             now,
         );
         let id = element.id.clone();
-        if let Err(err) = tx.add(&mut self.doc, element) {
+        if let Err(err) = self.session.add(&mut tx, element) {
             debug_assert!(false, "pulled sticky add failed: {err}");
         }
-        self.tx = Some(tx);
-        self.interaction = Interaction::PullingSticky {
+        self.gesture.tx = Some(tx);
+        self.gesture.interaction = Interaction::PullingSticky {
             id: id.clone(),
             origin: world,
         };
@@ -3428,11 +3273,11 @@ impl Editor {
     }
 
     fn begin_erase(&mut self, world: Point, now: u64) -> Effects {
-        self.tx = Some(Transaction::begin());
+        self.gesture.tx = Some(Transaction::begin());
         let mut erased = BTreeSet::new();
         let mut effects = Effects::default();
         self.erase_at(world, &mut erased, &mut effects, now);
-        self.interaction = Interaction::Erasing { erased };
+        self.gesture.interaction = Interaction::Erasing { erased };
         effects.overlay_changed = true;
         effects
     }
@@ -3440,7 +3285,8 @@ impl Editor {
     fn begin_frame(&mut self, world: Point, now: u64) -> Effects {
         let mut tx = Transaction::begin();
         let count = self
-            .doc
+            .session
+            .document()
             .elements
             .values()
             .filter(|element| element.is_frame() && !element.is_deleted)
@@ -3455,11 +3301,11 @@ impl Editor {
             now,
         );
         let id = element.id.clone();
-        if let Err(err) = tx.add(&mut self.doc, element) {
+        if let Err(err) = self.session.add(&mut tx, element) {
             debug_assert!(false, "frame add failed: {err}");
         }
-        self.tx = Some(tx);
-        self.interaction = Interaction::Drawing {
+        self.gesture.tx = Some(tx);
+        self.gesture.interaction = Interaction::Drawing {
             id: id.clone(),
             start: world,
         };
@@ -3475,18 +3321,18 @@ impl Editor {
         let element = Element::new(
             ElementKind::Freehand {
                 points: vec![world],
-                pressures: vec![self.last_pressure],
-                style: self.style.clone(),
+                pressures: vec![self.gesture.last_pressure],
+                style: self.view.style.clone(),
             },
             self.next_index(),
             now,
         );
         let id = element.id.clone();
-        if let Err(err) = tx.add(&mut self.doc, element) {
+        if let Err(err) = self.session.add(&mut tx, element) {
             debug_assert!(false, "freehand add failed: {err}");
         }
-        self.tx = Some(tx);
-        self.interaction = Interaction::Freehand { id: id.clone() };
+        self.gesture.tx = Some(tx);
+        self.gesture.interaction = Interaction::Freehand { id: id.clone() };
         Effects {
             changed: [id].into_iter().collect(),
             overlay_changed: true,
@@ -3496,7 +3342,8 @@ impl Editor {
 
     /// Anchor points to highlight during a connector drag.
     pub fn hover_anchor_points(&self) -> &[Point] {
-        self.hover_anchors
+        self.gesture
+            .hover_anchors
             .as_ref()
             .map(|(_, points)| points.as_slice())
             .unwrap_or_default()
@@ -3506,8 +3353,9 @@ impl Editor {
         let tolerance = self.tolerance().max(4.0);
         let node = self.node_hit(world, None);
         let explicit = node.is_some();
-        let candidate =
-            node.or_else(|| connector::binding_candidate(&self.doc, world, tolerance, None, None));
+        let candidate = node.or_else(|| {
+            connector::binding_candidate(self.session.document(), world, tolerance, None, None)
+        });
         let (start_point, start_binding) = match candidate {
             Some((target_id, side, point)) => {
                 let binding = Binding {
@@ -3521,7 +3369,8 @@ impl Editor {
                     y: point.y,
                     binding: Some(binding.clone()),
                 };
-                let (resolved, _) = connector::resolve_endpoint(&ep, world, &self.doc);
+                let (resolved, _) =
+                    connector::resolve_endpoint(&ep, world, self.session.document());
                 (resolved, Some(binding))
             }
             None => (world, None),
@@ -3536,7 +3385,7 @@ impl Editor {
         side: connector::AnchorSide,
         now: u64,
     ) -> Effects {
-        let Some(element) = self.doc.element(&id) else {
+        let Some(element) = self.session.document().element(&id) else {
             return Effects::default();
         };
         let anchor = side.point(element.bounds());
@@ -3566,7 +3415,7 @@ impl Editor {
                 routing: Routing::Elbow,
                 start_arrowhead: false,
                 end_arrowhead: true,
-                style: self.style.clone(),
+                style: self.view.style.clone(),
                 waypoints: Vec::new(),
                 label_id: None,
             },
@@ -3574,11 +3423,11 @@ impl Editor {
             now,
         );
         let id = element.id.clone();
-        if let Err(err) = tx.add(&mut self.doc, element) {
+        if let Err(err) = self.session.add(&mut tx, element) {
             debug_assert!(false, "connector add failed: {err}");
         }
-        self.tx = Some(tx);
-        self.interaction = Interaction::Connecting {
+        self.gesture.tx = Some(tx);
+        self.gesture.interaction = Interaction::Connecting {
             id: id.clone(),
             start: world,
         };
@@ -3591,7 +3440,8 @@ impl Editor {
 
     /// Arrows bound to this element.
     pub fn bound_arrows(&self, element_id: &str) -> Vec<ElementId> {
-        self.doc
+        self.session
+            .document()
             .elements
             .values()
             .filter(|element| {
@@ -3621,7 +3471,7 @@ impl Editor {
     /// pointer move (on a large board the pass is the expensive part).
     fn arrows_touching(&self, moved: &BTreeSet<ElementId>) -> Vec<ElementId> {
         let mut arrows = Vec::new();
-        for element in self.doc.elements.values() {
+        for element in self.session.document().elements.values() {
             let ElementKind::Arrow { start, end, .. } = &element.kind else {
                 continue;
             };
@@ -3652,7 +3502,7 @@ impl Editor {
     /// and an exact re-route on release.
     fn attached_arrows(&self, moved: &BTreeSet<ElementId>) -> Vec<ElementId> {
         let mut arrows = Vec::new();
-        for element in self.doc.elements.values() {
+        for element in self.session.document().elements.values() {
             let ElementKind::Arrow { start, end, .. } = &element.kind else {
                 continue;
             };
@@ -3676,14 +3526,14 @@ impl Editor {
     fn arrow_updates_for(&self, arrow_ids: &[ElementId]) -> Vec<(ElementId, Point, Point)> {
         let mut updates = Vec::with_capacity(arrow_ids.len());
         for id in arrow_ids {
-            let Some(element) = self.doc.element(id) else {
+            let Some(element) = self.session.document().element(id) else {
                 continue;
             };
             let ElementKind::Arrow { start, end, .. } = &element.kind else {
                 continue;
             };
-            let (s, _) = connector::resolve_endpoint(start, end.point(), &self.doc);
-            let (e, _) = connector::resolve_endpoint(end, start.point(), &self.doc);
+            let (s, _) = connector::resolve_endpoint(start, end.point(), self.session.document());
+            let (e, _) = connector::resolve_endpoint(end, start.point(), self.session.document());
             updates.push((id.clone(), s, e));
         }
         updates
@@ -3703,7 +3553,8 @@ impl Editor {
         ids: &BTreeSet<ElementId>,
     ) -> Vec<(ElementId, Option<ElementId>)> {
         let frames: Vec<(&str, Rect)> = self
-            .doc
+            .session
+            .document()
             .elements
             .values()
             .filter(|e| !e.is_deleted)
@@ -3714,7 +3565,7 @@ impl Editor {
             .collect();
         let mut out = Vec::new();
         for id in ids {
-            let Some(element) = self.doc.element(id) else {
+            let Some(element) = self.session.document().element(id) else {
                 continue;
             };
             if element.is_deleted {
@@ -3743,7 +3594,7 @@ impl Editor {
 
     /// Reconcile frame membership inside the open transaction.
     fn sync_frame_membership(&mut self, now: u64) {
-        let Some(tx) = self.tx.as_ref() else {
+        let Some(tx) = self.gesture.tx.as_ref() else {
             return;
         };
         let ids: BTreeSet<ElementId> = tx.deltas().iter().map(|d| d.element_id().clone()).collect();
@@ -3754,13 +3605,13 @@ impl Editor {
     /// transaction does not yet hold the staged ids, e.g. drag release after
     /// preview moves bypassed per-move staging).
     fn sync_frame_membership_for(&mut self, ids: &BTreeSet<ElementId>, now: u64) {
-        if self.tx.is_none() {
+        if self.gesture.tx.is_none() {
             return;
         }
         let updates = self.frame_membership_updates(ids);
-        if let Some(tx) = self.tx.as_mut() {
+        if let Some(tx) = self.gesture.tx.as_mut() {
             for (id, frame_id) in updates {
-                let _ = tx.update(&mut self.doc, &id, now, |element| {
+                let _ = self.session.update(tx, &id, now, |element| {
                     element.frame_id = frame_id.clone();
                 });
             }
@@ -3769,7 +3620,7 @@ impl Editor {
 
     fn begin_line(&mut self, world: Point, now: u64) -> Effects {
         let mut tx = Transaction::begin();
-        let arrowhead = self.tool == Tool::Arrow;
+        let arrowhead = self.view.tool == Tool::Arrow;
         let element = Element::new(
             ElementKind::Arrow {
                 start: crate::model::Endpoint::free(world.x, world.y),
@@ -3777,7 +3628,7 @@ impl Editor {
                 routing: crate::model::Routing::Straight,
                 start_arrowhead: false,
                 end_arrowhead: arrowhead,
-                style: self.style.clone(),
+                style: self.view.style.clone(),
                 waypoints: Vec::new(),
                 label_id: None,
             },
@@ -3785,11 +3636,11 @@ impl Editor {
             now,
         );
         let id = element.id.clone();
-        if let Err(err) = tx.add(&mut self.doc, element) {
+        if let Err(err) = self.session.add(&mut tx, element) {
             debug_assert!(false, "line add failed: {err}");
         }
-        self.tx = Some(tx);
-        self.interaction = Interaction::Line {
+        self.gesture.tx = Some(tx);
+        self.gesture.interaction = Interaction::Line {
             id: id.clone(),
             start: world,
         };
@@ -3808,7 +3659,10 @@ impl Editor {
         now: u64,
     ) {
         let tolerance = self.tolerance();
-        if let Some(id) = hit_test_indexed(&self.doc, &self.hit, world, tolerance) {
+        if let Some(id) = self
+            .projection
+            .hit_test(self.session.document(), world, tolerance)
+        {
             let targets: Vec<ElementId> = std::iter::once(id.clone())
                 .chain(self.followers(&id))
                 .collect();
@@ -3816,8 +3670,8 @@ impl Editor {
                 if erased.contains(&target) {
                     continue;
                 }
-                if let Some(tx) = self.tx.as_mut() {
-                    if tx.remove(&mut self.doc, &target, now).is_ok() {
+                if let Some(tx) = self.gesture.tx.as_mut() {
+                    if self.session.remove(tx, &target, now).is_ok() {
                         effects.changed.insert(target.clone());
                         erased.insert(target);
                     }
@@ -3831,7 +3685,7 @@ impl Editor {
     /// Elements that always travel with this element: bound text, frame
     /// children.
     pub fn followers(&self, id: &str) -> Vec<ElementId> {
-        match self.doc.element(id).map(|e| &e.kind) {
+        match self.session.document().element(id).map(|e| &e.kind) {
             Some(ElementKind::Shape {
                 bound_text_id: Some(text_id),
                 ..
@@ -3845,7 +3699,8 @@ impl Editor {
                 ..
             }) => vec![text_id.clone()],
             Some(ElementKind::Frame { .. }) => self
-                .doc
+                .session
+                .document()
                 .elements
                 .values()
                 .filter(|element| !element.is_deleted && element.frame_id.as_deref() == Some(id))
@@ -3857,7 +3712,7 @@ impl Editor {
 
     /// The selection plus every follower, transitively.
     pub fn selection_with_followers_recursive(&self) -> BTreeSet<ElementId> {
-        let mut out = self.selection.clone();
+        let mut out = self.view.selection.clone();
         let mut frontier: Vec<ElementId> = out.iter().cloned().collect();
         while let Some(id) = frontier.pop() {
             for follower in self.followers(&id) {
@@ -3872,7 +3727,7 @@ impl Editor {
     fn selection_with_followers(&self) -> Vec<Element> {
         self.selection_with_followers_recursive()
             .iter()
-            .filter_map(|id| self.doc.element(id).cloned())
+            .filter_map(|id| self.session.document().element(id).cloned())
             .collect()
     }
 
@@ -3883,10 +3738,15 @@ impl Editor {
             let Some(text_id) = self.followers(container_id).into_iter().next() else {
                 continue;
             };
-            let Some(content) = self.doc.element(&text_id).and_then(|e| match &e.kind {
-                ElementKind::Text { text, .. } => Some(text.clone()),
-                _ => None,
-            }) else {
+            let Some(content) =
+                self.session
+                    .document()
+                    .element(&text_id)
+                    .and_then(|e| match &e.kind {
+                        ElementKind::Text { text, .. } => Some(text.clone()),
+                        _ => None,
+                    })
+            else {
                 continue;
             };
             if let Some(rect) = self.text_rect_for(&text_id, &content) {
@@ -3898,7 +3758,7 @@ impl Editor {
 
     /// Move the selection by a world-space delta, one undo step.
     pub fn nudge(&mut self, dx: f64, dy: f64, now: u64) -> Effects {
-        if self.selection.is_empty() || self.interaction != Interaction::Idle {
+        if self.view.selection.is_empty() || self.gesture.interaction != Interaction::Idle {
             return Effects::default();
         }
         let originals = self.selection_with_followers();
@@ -3906,9 +3766,9 @@ impl Editor {
         let mut effects = Effects::default();
         for original in &originals {
             let mut translated = original.clone();
-            translate_element_keeping_bindings(&self.doc, &mut translated, dx, dy);
+            translate_element_keeping_bindings(self.session.document(), &mut translated, dx, dy);
             let kind = translated.kind;
-            if let Err(err) = tx.update(&mut self.doc, &original.id, now, |element| {
+            if let Err(err) = self.session.update(&mut tx, &original.id, now, |element| {
                 element.kind = kind;
             }) {
                 debug_assert!(false, "nudge failed: {err}");
@@ -3919,7 +3779,7 @@ impl Editor {
         let mut reflow_targets: BTreeSet<ElementId> = BTreeSet::new();
         for (arrow_id, start_point, end_point) in self.connected_arrow_updates(&moved_ids) {
             reflow_targets.insert(arrow_id.clone());
-            let _ = tx.update(&mut self.doc, &arrow_id, now, |element| {
+            let _ = self.session.update(&mut tx, &arrow_id, now, |element| {
                 if let ElementKind::Arrow { start, end, .. } = &mut element.kind {
                     start.x = start_point.x;
                     start.y = start_point.y;
@@ -3933,7 +3793,8 @@ impl Editor {
         // need a midpoint reflow rather than the rigid translate they got.
         for id in &moved_ids {
             if self
-                .doc
+                .session
+                .document()
                 .element(id)
                 .is_some_and(|e| matches!(e.kind, ElementKind::Arrow { .. }))
             {
@@ -3941,20 +3802,20 @@ impl Editor {
             }
         }
         for (text_id, rect) in self.bound_text_reflows(&reflow_targets) {
-            let _ = tx.update(&mut self.doc, &text_id, now, |element| {
+            let _ = self.session.update(&mut tx, &text_id, now, |element| {
                 if let ElementKind::Text { rect: r, .. } = &mut element.kind {
                     *r = rect;
                 }
             });
             effects.changed.insert(text_id);
         }
-        tx.commit(&mut self.history);
+        self.session.commit(tx);
         effects
     }
 
     /// Duplicate the selection with a small offset.
     pub fn duplicate(&mut self, now: u64) -> Effects {
-        if self.interaction != Interaction::Idle {
+        if self.gesture.interaction != Interaction::Idle {
             return Effects::default();
         }
         let source = self.selection_with_followers();
@@ -3963,26 +3824,23 @@ impl Editor {
 
     /// Copy the selection (with its followers) into the internal clipboard.
     pub fn copy(&mut self) -> Effects {
-        self.clipboard = self.selection_with_followers();
-        self.paste_serial = 0;
+        let elements = self.selection_with_followers();
+        self.session.copy_to_clipboard(elements);
         Effects::default()
     }
 
     /// Copy and delete the selection.
     pub fn cut(&mut self, now: u64) -> Effects {
-        self.clipboard = self.selection_with_followers();
-        self.paste_serial = 0;
+        let elements = self.selection_with_followers();
+        self.session.copy_to_clipboard(elements);
         self.delete_selection(now)
     }
 
     /// Paste the clipboard with a cumulative offset.
     pub fn paste(&mut self, now: u64) -> Effects {
-        if self.clipboard.is_empty() {
+        let Some((source, offset)) = self.session.take_paste() else {
             return Effects::default();
-        }
-        self.paste_serial += 1;
-        let offset = 12.0 * self.paste_serial as f64;
-        let source = self.clipboard.clone();
+        };
         self.insert_copies(source, offset, offset, now)
     }
 
@@ -3992,7 +3850,7 @@ impl Editor {
         }
         let mut tx = Transaction::begin();
         let mut map: HashMap<ElementId, ElementId> = HashMap::new();
-        let mut last_index = self.doc.top_index();
+        let mut last_index = self.session.document().top_index();
         let mut copies = Vec::new();
         for original in &source {
             let mut copy = original.clone();
@@ -4016,29 +3874,30 @@ impl Editor {
         let mut effects = Effects::default();
         for copy in copies {
             let id = copy.id.clone();
-            if let Err(err) = tx.add(&mut self.doc, copy) {
+            if let Err(err) = self.session.add(&mut tx, copy) {
                 debug_assert!(false, "paste failed: {err}");
             }
             effects.changed.insert(id);
         }
-        tx.commit(&mut self.history);
-        self.selection = effects.changed.clone();
+        self.session.commit(tx);
+        self.view.selection = effects.changed.clone();
         effects.overlay_changed = true;
         effects
     }
 
     /// Move the selection one step forward (`1`) or backward (`-1`) in z-order.
     pub fn reorder(&mut self, direction: i32, now: u64) -> Effects {
-        if self.selection.is_empty() || self.interaction != Interaction::Idle {
+        if self.view.selection.is_empty() || self.gesture.interaction != Interaction::Idle {
             return Effects::default();
         }
         let mut seq: Vec<ElementId> = self
-            .doc
+            .session
+            .document()
             .ordered_live()
             .iter()
             .map(|e| e.id.clone())
             .collect();
-        let selected = self.selection.clone();
+        let selected = self.view.selection.clone();
         match direction {
             1 => {
                 for i in (0..seq.len().saturating_sub(1)).rev() {
@@ -4060,7 +3919,8 @@ impl Editor {
         let mut indices: Vec<String> = seq
             .iter()
             .map(|id| {
-                self.doc
+                self.session
+                    .document()
                     .element(id)
                     .map(|e| e.index.clone())
                     .unwrap_or_default()
@@ -4081,14 +3941,14 @@ impl Editor {
             let new_index = crate::index::key_between(prev, next).expect("index space");
             indices[i] = new_index.clone();
             let id = seq[i].clone();
-            if let Err(err) = tx.update(&mut self.doc, &id, now, |element| {
+            if let Err(err) = self.session.update(&mut tx, &id, now, |element| {
                 element.index = new_index.clone();
             }) {
                 debug_assert!(false, "reorder failed: {err}");
             }
             effects.changed.insert(id);
         }
-        tx.commit(&mut self.history);
+        self.session.commit(tx);
         effects
     }
 
@@ -4536,9 +4396,9 @@ mod tests {
             Point::new(300.0, 200.0),
             1,
         );
-        let id = e.doc.ordered_live()[0].id.clone();
+        let id = e.session.document().ordered_live()[0].id.clone();
         let camera = e.focus_camera(Some(&id), 40.0).expect("focus target");
-        let bounds = e.doc.framing_bounds(&id).unwrap();
+        let bounds = e.session.document().framing_bounds(&id).unwrap();
         let screen = camera.world_to_screen(bounds.center());
         assert!((screen.x - 400.0).abs() < 1e-9);
         assert!((screen.y - 300.0).abs() < 1e-9);
@@ -4552,14 +4412,14 @@ mod tests {
     fn focus_camera_of_a_frame_includes_its_children() {
         let mut e = editor();
         e.set_viewport(800.0, 600.0);
-        let frame = e.doc.add(
+        let frame = e.session.document_mut().add(
             ElementKind::Frame {
                 rect: Rect::new(0.0, 0.0, 200.0, 200.0),
                 name: "VPC".into(),
             },
             1,
         );
-        let child = e.doc.add(
+        let child = e.session.document_mut().add(
             ElementKind::Shape {
                 shape: ShapeKind::Rectangle,
                 rect: Rect::new(400.0, 100.0, 100.0, 60.0),
@@ -4568,7 +4428,11 @@ mod tests {
             },
             2,
         );
-        e.doc.element_mut(&child).unwrap().frame_id = Some(frame.clone());
+        e.session
+            .document_mut()
+            .element_mut(&child)
+            .unwrap()
+            .frame_id = Some(frame.clone());
         let camera = e.focus_camera(Some(&frame), 40.0).unwrap();
         let screen = camera.world_to_screen(Point::new(250.0, 100.0));
         assert!(
@@ -4581,21 +4445,21 @@ mod tests {
     fn dragging_with_rectangle_tool_creates_a_shape() {
         let mut e = editor();
         drag_shape(&mut e, Point::new(10.0, 10.0), Point::new(110.0, 60.0), 1);
-        assert_eq!(e.doc.ordered_live().len(), 1);
-        let shape = e.doc.ordered_live()[0];
+        assert_eq!(e.session.document().ordered_live().len(), 1);
+        let shape = e.session.document().ordered_live()[0];
         assert_eq!(shape.bounds(), Rect::new(10.0, 10.0, 100.0, 50.0));
-        assert_eq!(e.selection.len(), 1);
+        assert_eq!(e.view.selection.len(), 1);
     }
 
     #[test]
     fn snapping_rounds_creation_to_the_grid() {
         let mut e = editor();
-        assert!(!e.snap_to_grid, "snapping is off by default");
-        assert!(!e.grid_visible, "the grid is off by default");
-        e.snap_to_grid = true;
+        assert!(!e.view.snap_to_grid, "snapping is off by default");
+        assert!(!e.view.grid_visible, "the grid is off by default");
+        e.view.snap_to_grid = true;
         drag_shape(&mut e, Point::new(13.0, 27.0), Point::new(103.0, 217.0), 1);
         assert_eq!(
-            e.doc.ordered_live()[0].bounds(),
+            e.session.document().ordered_live()[0].bounds(),
             Rect::new(20.0, 20.0, 80.0, 200.0)
         );
     }
@@ -4603,11 +4467,11 @@ mod tests {
     #[test]
     fn snapping_respects_a_custom_grid_size() {
         let mut e = editor();
-        e.snap_to_grid = true;
-        e.grid_size = 40.0;
+        e.view.snap_to_grid = true;
+        e.view.grid_size = 40.0;
         drag_shape(&mut e, Point::new(13.0, 27.0), Point::new(103.0, 217.0), 1);
         assert_eq!(
-            e.doc.ordered_live()[0].bounds(),
+            e.session.document().ordered_live()[0].bounds(),
             Rect::new(0.0, 40.0, 120.0, 160.0)
         );
     }
@@ -4617,7 +4481,7 @@ mod tests {
         let mut e = editor();
         drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(100.0, 50.0), 1);
         press(&mut e, "v", Modifiers::default(), 2);
-        e.snap_to_grid = true;
+        e.view.snap_to_grid = true;
         let mods = Modifiers::default();
         {
             let fx = e.pointer_down(Point::new(50.0, 25.0), 0, mods, 3);
@@ -4631,7 +4495,7 @@ mod tests {
             let fx = e.pointer_up(Point::new(63.0, 25.0), mods, 5);
             pump(&mut e, &fx);
         }
-        assert_eq!(e.doc.ordered_live()[0].bounds().x, 20.0);
+        assert_eq!(e.session.document().ordered_live()[0].bounds().x, 20.0);
     }
 
     #[test]
@@ -4639,7 +4503,7 @@ mod tests {
         let mut e = editor();
         drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(100.0, 100.0), 1);
         press(&mut e, "v", Modifiers::default(), 2);
-        e.snap_to_grid = true;
+        e.view.snap_to_grid = true;
         let mods = Modifiers::default();
         {
             let fx = e.pointer_down(Point::new(100.0, 100.0), 0, mods, 3);
@@ -4653,7 +4517,7 @@ mod tests {
             let fx = e.pointer_up(Point::new(153.0, 147.0), mods, 5);
             pump(&mut e, &fx);
         }
-        let bounds = e.doc.ordered_live()[0].bounds();
+        let bounds = e.session.document().ordered_live()[0].bounds();
         assert_eq!(bounds.w, 160.0);
         assert_eq!(bounds.h, 140.0);
     }
@@ -4662,7 +4526,7 @@ mod tests {
     fn tiny_draws_are_discarded() {
         let mut e = editor();
         drag_shape(&mut e, Point::new(10.0, 10.0), Point::new(11.0, 11.0), 1);
-        assert!(e.doc.is_empty());
+        assert!(e.session.document().is_empty());
     }
 
     #[test]
@@ -4686,9 +4550,9 @@ mod tests {
             pump(&mut e, &fx);
         }
 
-        let moved = e.doc.ordered_live()[0];
+        let moved = e.session.document().ordered_live()[0];
         assert_eq!(moved.bounds(), Rect::new(30.0, 20.0, 100.0, 50.0));
-        assert_eq!(e.selection.len(), 1);
+        assert_eq!(e.view.selection.len(), 1);
     }
 
     #[test]
@@ -4712,16 +4576,53 @@ mod tests {
             let fx = e.pointer_up(Point::new(60.0, 25.0), mods, 20);
             pump(&mut e, &fx);
         }
-        assert_eq!(e.doc.ordered_live()[0].bounds().x, 10.0);
+        assert_eq!(e.session.document().ordered_live()[0].bounds().x, 10.0);
 
         let mods_cmd = Modifiers {
             meta: true,
             ..Modifiers::default()
         };
         press(&mut e, "z", mods_cmd, 21);
-        assert_eq!(e.doc.ordered_live()[0].bounds().x, 0.0);
+        assert_eq!(e.session.document().ordered_live()[0].bounds().x, 0.0);
         press(&mut e, "z", mods_cmd, 22);
-        assert!(e.doc.is_empty(), "second undo removes the drawn shape");
+        assert!(
+            e.session.document().is_empty(),
+            "second undo removes the drawn shape"
+        );
+    }
+
+    #[test]
+    fn preview_moves_do_not_touch_the_document() {
+        let mut e = editor();
+        drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(100.0, 50.0), 1);
+        let id = e.session.document().ordered_live()[0].id.clone();
+        let before = e.session.document().element(&id).unwrap().bounds();
+        let start = before.center();
+        e.select([id.clone()]);
+
+        let down = e.pointer_down(start, 0, Modifiers::default(), 10);
+        pump(&mut e, &down);
+        let moved = e.pointer_move(
+            Point::new(start.x + 40.0, start.y + 10.0),
+            Modifiers::default(),
+            11,
+        );
+        assert!(moved.preview, "a move previews instead of committing");
+        assert_eq!(
+            e.session.document().element(&id).unwrap().bounds(),
+            before,
+            "preview truth lives in the controller until release"
+        );
+
+        let up = e.pointer_up(
+            Point::new(start.x + 40.0, start.y + 10.0),
+            Modifiers::default(),
+            12,
+        );
+        pump(&mut e, &up);
+        let after = e.session.document().element(&id).unwrap().bounds();
+        assert_eq!(after.x, before.x + 40.0);
+        assert_eq!(after.y, before.y + 10.0);
     }
 
     #[test]
@@ -4745,7 +4646,7 @@ mod tests {
             let fx = e.pointer_up(Point::new(300.0, 100.0), mods, 6);
             pump(&mut e, &fx);
         }
-        assert_eq!(e.selection.len(), 2);
+        assert_eq!(e.view.selection.len(), 2);
     }
 
     #[test]
@@ -4779,7 +4680,7 @@ mod tests {
             );
         }
         assert!(e.marquee_rect().is_none());
-        assert!(e.selection.is_empty());
+        assert!(e.view.selection.is_empty());
 
         // Inside a frame: the frame intersects but is not enclosed, so it is
         // filtered out and the selection still stays empty.
@@ -4815,7 +4716,7 @@ mod tests {
                 "a marquee that selects nothing must still erase itself"
             );
         }
-        assert!(e.selection.is_empty(), "the frame is not enclosed");
+        assert!(e.view.selection.is_empty(), "the frame is not enclosed");
     }
 
     #[test]
@@ -4824,7 +4725,8 @@ mod tests {
         drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(100.0, 50.0), 1);
         drag_shape(&mut e, Point::new(200.0, 0.0), Point::new(300.0, 50.0), 4);
         let ids: Vec<ElementId> = e
-            .doc
+            .session
+            .document()
             .ordered_live()
             .iter()
             .map(|element| element.id.clone())
@@ -4848,14 +4750,14 @@ mod tests {
         }
 
         assert_eq!(
-            e.doc.ordered_live()[0].bounds(),
+            e.session.document().ordered_live()[0].bounds(),
             Rect::new(10.0, 20.0, 100.0, 50.0)
         );
         assert_eq!(
-            e.doc.ordered_live()[1].bounds(),
+            e.session.document().ordered_live()[1].bounds(),
             Rect::new(210.0, 20.0, 100.0, 50.0)
         );
-        assert_eq!(e.selection.len(), 2, "the whole group stays selected");
+        assert_eq!(e.view.selection.len(), 2, "the whole group stays selected");
 
         let mods_cmd = Modifiers {
             meta: true,
@@ -4863,7 +4765,7 @@ mod tests {
         };
         press(&mut e, "z", mods_cmd, 11);
         assert_eq!(
-            e.doc.ordered_live()[0].bounds(),
+            e.session.document().ordered_live()[0].bounds(),
             Rect::new(0.0, 0.0, 100.0, 50.0),
             "the group move is one undo step"
         );
@@ -4875,7 +4777,8 @@ mod tests {
         drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(100.0, 50.0), 1);
         drag_shape(&mut e, Point::new(200.0, 0.0), Point::new(300.0, 50.0), 4);
         let ids: Vec<ElementId> = e
-            .doc
+            .session
+            .document()
             .ordered_live()
             .iter()
             .map(|element| element.id.clone())
@@ -4892,9 +4795,12 @@ mod tests {
             let fx = e.pointer_up(Point::new(150.0, 25.0), mods, 9);
             pump(&mut e, &fx);
         }
-        assert!(e.selection.is_empty(), "a click inside the box deselects");
+        assert!(
+            e.view.selection.is_empty(),
+            "a click inside the box deselects"
+        );
         assert_eq!(
-            e.doc.ordered_live()[0].bounds(),
+            e.session.document().ordered_live()[0].bounds(),
             Rect::new(0.0, 0.0, 100.0, 50.0),
             "nothing moved"
         );
@@ -4904,9 +4810,9 @@ mod tests {
     fn a_drag_outbox_delta_carries_the_committed_version() {
         let mut e = editor();
         drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(100.0, 50.0), 1);
-        let id = e.doc.ordered_live()[0].id.clone();
+        let id = e.session.document().ordered_live()[0].id.clone();
         // The creation patch is irrelevant; inspect only the move.
-        e.history.drain_outbox();
+        e.drain_outbox();
 
         press(&mut e, "v", Modifiers::default(), 10);
         e.select([id.clone()]);
@@ -4918,8 +4824,8 @@ mod tests {
         let fx = e.pointer_up(Point::new(80.0, 45.0), mods, 22);
         pump(&mut e, &fx);
 
-        let patch = crate::patch::Patch::from_deltas(&e.history.drain_outbox(), 23);
-        let committed = e.doc.element(&id).unwrap();
+        let patch = crate::patch::Patch::from_deltas(&e.drain_outbox(), 23);
+        let committed = e.session.document().element(&id).unwrap();
         let wire = patch
             .put
             .iter()
@@ -4939,7 +4845,8 @@ mod tests {
         drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(100.0, 50.0), 1);
         drag_shape(&mut e, Point::new(200.0, 0.0), Point::new(300.0, 50.0), 4);
         let ids: Vec<ElementId> = e
-            .doc
+            .session
+            .document()
             .ordered_live()
             .iter()
             .map(|element| element.id.clone())
@@ -4962,11 +4869,11 @@ mod tests {
         }
 
         assert_eq!(
-            e.doc.ordered_live()[0].bounds(),
+            e.session.document().ordered_live()[0].bounds(),
             Rect::new(20.0, 10.0, 100.0, 50.0)
         );
         assert_eq!(
-            e.doc.ordered_live()[1].bounds(),
+            e.session.document().ordered_live()[1].bounds(),
             Rect::new(220.0, 10.0, 100.0, 50.0)
         );
     }
@@ -4975,19 +4882,19 @@ mod tests {
     fn delete_removes_selection_and_undo_restores_it() {
         let mut e = editor();
         drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(100.0, 50.0), 1);
-        let removed = e.doc.ordered_live()[0].id.clone();
+        let removed = e.session.document().ordered_live()[0].id.clone();
         press(&mut e, "v", Modifiers::default(), 2);
         e.select([removed.clone()]);
         press(&mut e, "Delete", Modifiers::default(), 3);
-        assert!(e.doc.ordered_live().is_empty());
-        assert!(e.doc.element(&removed).unwrap().is_deleted);
+        assert!(e.session.document().ordered_live().is_empty());
+        assert!(e.session.document().element(&removed).unwrap().is_deleted);
 
         let mods_cmd = Modifiers {
             ctrl: true,
             ..Modifiers::default()
         };
         press(&mut e, "z", mods_cmd, 4);
-        assert_eq!(e.doc.ordered_live().len(), 1);
+        assert_eq!(e.session.document().ordered_live().len(), 1);
     }
 
     #[test]
@@ -5019,7 +4926,7 @@ mod tests {
             let fx = e.pointer_up(Point::new(125.0, 25.0), shift, 7);
             pump(&mut e, &fx);
         }
-        assert_eq!(e.selection.len(), 2);
+        assert_eq!(e.view.selection.len(), 2);
 
         {
             let fx = e.pointer_down(Point::new(125.0, 25.0), 0, shift, 8);
@@ -5029,7 +4936,7 @@ mod tests {
             let fx = e.pointer_up(Point::new(125.0, 25.0), shift, 9);
             pump(&mut e, &fx);
         }
-        assert_eq!(e.selection.len(), 1);
+        assert_eq!(e.view.selection.len(), 1);
     }
 
     #[test]
@@ -5046,8 +4953,8 @@ mod tests {
             pump(&mut e, &fx);
         }
         e.key_down("Escape", mods, 4);
-        assert!(e.doc.is_empty());
-        assert_eq!(e.interaction, Interaction::Idle);
+        assert!(e.session.document().is_empty());
+        assert_eq!(e.gesture.interaction, Interaction::Idle);
     }
 
     #[test]
@@ -5055,11 +4962,11 @@ mod tests {
         let mut e = editor();
         let mods = Modifiers::default();
         press(&mut e, "d", mods, 1);
-        assert_eq!(e.tool, Tool::Diamond);
+        assert_eq!(e.view.tool, Tool::Diamond);
         press(&mut e, "o", mods, 2);
-        assert_eq!(e.tool, Tool::Ellipse);
+        assert_eq!(e.view.tool, Tool::Ellipse);
         press(&mut e, "v", mods, 3);
-        assert_eq!(e.tool, Tool::Select);
+        assert_eq!(e.view.tool, Tool::Select);
     }
 
     #[test]
@@ -5086,7 +4993,7 @@ mod tests {
             pump(&mut e, &fx);
         }
         assert_eq!(
-            e.doc.ordered_live()[0].bounds(),
+            e.session.document().ordered_live()[0].bounds(),
             Rect::new(0.0, 0.0, 150.0, 100.0)
         );
 
@@ -5096,7 +5003,7 @@ mod tests {
         };
         press(&mut e, "z", cmd, 6);
         assert_eq!(
-            e.doc.ordered_live()[0].bounds(),
+            e.session.document().ordered_live()[0].bounds(),
             Rect::new(0.0, 0.0, 100.0, 50.0)
         );
     }
@@ -5127,7 +5034,7 @@ mod tests {
             pump(&mut e, &fx);
         }
 
-        let flipped = e.doc.ordered_live()[0].bounds();
+        let flipped = e.session.document().ordered_live()[0].bounds();
         assert_eq!(
             flipped,
             Rect::new(150.0, 300.0, 50.0, 50.0),
@@ -5140,7 +5047,7 @@ mod tests {
         };
         press(&mut e, "z", cmd, 6);
         assert_eq!(
-            e.doc.ordered_live()[0].bounds(),
+            e.session.document().ordered_live()[0].bounds(),
             Rect::new(200.0, 200.0, 200.0, 100.0)
         );
     }
@@ -5165,7 +5072,7 @@ mod tests {
             let fx = e.pointer_up(Point::new(1.0, 1.0), mods, 5);
             pump(&mut e, &fx);
         }
-        let bounds = e.doc.ordered_live()[0].bounds();
+        let bounds = e.session.document().ordered_live()[0].bounds();
         assert_eq!(bounds.x, 0.0);
         assert_eq!(bounds.y, 0.0);
         assert!(
@@ -5197,7 +5104,7 @@ mod tests {
             pump(&mut e, &fx);
         }
         assert_eq!(
-            e.doc.ordered_live()[0].bounds(),
+            e.session.document().ordered_live()[0].bounds(),
             Rect::new(0.0, 0.0, 140.0, 70.0)
         );
     }
@@ -5208,37 +5115,41 @@ mod tests {
         drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(100.0, 50.0), 1);
         let mods = Modifiers::default();
         press(&mut e, "ArrowRight", mods, 2);
-        assert_eq!(e.doc.ordered_live()[0].bounds().x, 1.0);
+        assert_eq!(e.session.document().ordered_live()[0].bounds().x, 1.0);
         let shift = Modifiers {
             shift: true,
             ..Modifiers::default()
         };
         press(&mut e, "ArrowDown", shift, 3);
-        assert_eq!(e.doc.ordered_live()[0].bounds().y, 10.0);
+        assert_eq!(e.session.document().ordered_live()[0].bounds().y, 10.0);
 
         let cmd = Modifiers {
             meta: true,
             ..Modifiers::default()
         };
         press(&mut e, "z", cmd, 4);
-        assert_eq!(e.doc.ordered_live()[0].bounds().y, 0.0);
+        assert_eq!(e.session.document().ordered_live()[0].bounds().y, 0.0);
     }
 
     #[test]
     fn duplicate_offsets_and_selects_the_copies() {
         let mut e = editor();
         drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(100.0, 50.0), 1);
-        let original_id = e.doc.ordered_live()[0].id.clone();
+        let original_id = e.session.document().ordered_live()[0].id.clone();
 
         let cmd = Modifiers {
             meta: true,
             ..Modifiers::default()
         };
         press(&mut e, "d", cmd, 2);
-        assert_eq!(e.doc.ordered_live().len(), 2);
-        assert_eq!(e.selection.len(), 1);
-        assert!(!e.selection.contains(&original_id));
-        let copy = e.doc.element(e.selection.iter().next().unwrap()).unwrap();
+        assert_eq!(e.session.document().ordered_live().len(), 2);
+        assert_eq!(e.view.selection.len(), 1);
+        assert!(!e.view.selection.contains(&original_id));
+        let copy = e
+            .session
+            .document()
+            .element(e.view.selection.iter().next().unwrap())
+            .unwrap();
         assert_eq!(copy.bounds(), Rect::new(12.0, 12.0, 100.0, 50.0));
     }
 
@@ -5253,21 +5164,21 @@ mod tests {
         press(&mut e, "c", cmd, 2);
         press(&mut e, "v", cmd, 3);
         press(&mut e, "v", cmd, 4);
-        assert_eq!(e.doc.ordered_live().len(), 3);
+        assert_eq!(e.session.document().ordered_live().len(), 3);
 
         press(&mut e, "a", cmd, 5);
-        assert_eq!(e.selection.len(), 3);
+        assert_eq!(e.view.selection.len(), 3);
         press(&mut e, "x", cmd, 6);
-        assert_eq!(e.doc.ordered_live().len(), 0);
+        assert_eq!(e.session.document().ordered_live().len(), 0);
 
         press(&mut e, "z", cmd, 7);
-        assert_eq!(e.doc.ordered_live().len(), 3);
+        assert_eq!(e.session.document().ordered_live().len(), 3);
     }
 
     #[test]
     fn bring_forward_and_send_backward_change_z_order() {
         let mut e = editor();
-        let first = e.doc.add(
+        let first = e.session.document_mut().add(
             ElementKind::Shape {
                 shape: ShapeKind::Rectangle,
                 rect: Rect::new(0.0, 0.0, 50.0, 50.0),
@@ -5276,7 +5187,7 @@ mod tests {
             },
             1,
         );
-        let second = e.doc.add(
+        let second = e.session.document_mut().add(
             ElementKind::Shape {
                 shape: ShapeKind::Rectangle,
                 rect: Rect::new(0.0, 0.0, 50.0, 50.0),
@@ -5294,9 +5205,15 @@ mod tests {
             ..Modifiers::default()
         };
         press(&mut e, "]", cmd, 2);
-        assert_eq!(e.doc.ordered_ids(), vec![second.clone(), first.clone()]);
+        assert_eq!(
+            e.session.document().ordered_ids(),
+            vec![second.clone(), first.clone()]
+        );
         press(&mut e, "[", cmd, 3);
-        assert_eq!(e.doc.ordered_ids(), vec![first.clone(), second]);
+        assert_eq!(
+            e.session.document().ordered_ids(),
+            vec![first.clone(), second]
+        );
     }
 
     #[test]
@@ -5319,14 +5236,18 @@ mod tests {
             let fx = e.pointer_up(Point::new(125.0, 25.0), mods, 6);
             pump(&mut e, &fx);
         }
-        assert!(e.doc.ordered_live().is_empty());
+        assert!(e.session.document().ordered_live().is_empty());
 
         let cmd = Modifiers {
             meta: true,
             ..Modifiers::default()
         };
         press(&mut e, "z", cmd, 7);
-        assert_eq!(e.doc.ordered_live().len(), 2, "one undo restores both");
+        assert_eq!(
+            e.session.document().ordered_live().len(),
+            2,
+            "one undo restores both"
+        );
     }
 
     #[test]
@@ -5351,8 +5272,8 @@ mod tests {
             pump(&mut e, &fx);
         }
 
-        assert_eq!(e.doc.ordered_live().len(), 1);
-        let points = match &e.doc.ordered_live()[0].kind {
+        assert_eq!(e.session.document().ordered_live().len(), 1);
+        let points = match &e.session.document().ordered_live()[0].kind {
             ElementKind::Freehand {
                 points, pressures, ..
             } => {
@@ -5380,7 +5301,7 @@ mod tests {
             pump(&mut e, &fx);
         }
         e.key_down("Escape", mods, 4);
-        assert!(e.doc.is_empty());
+        assert!(e.session.document().is_empty());
     }
 
     #[test]
@@ -5388,7 +5309,7 @@ mod tests {
         let mut e = editor();
         let mods = Modifiers::default();
         press(&mut e, "p", mods, 1);
-        assert!(e.tool_locked, "the brush arms locked");
+        assert!(e.view.tool_locked, "the brush arms locked");
         {
             let fx = e.pointer_down(Point::new(0.0, 0.0), 0, mods, 2);
             pump(&mut e, &fx);
@@ -5405,8 +5326,8 @@ mod tests {
             pump(&mut e, &fx);
         }
 
-        assert_eq!(e.tool, Tool::Freehand, "the pencil stays armed");
-        assert_eq!(e.doc.ordered_live().len(), 1);
+        assert_eq!(e.view.tool, Tool::Freehand, "the pencil stays armed");
+        assert_eq!(e.session.document().ordered_live().len(), 1);
 
         // A second stroke needs no re-arming.
         {
@@ -5421,9 +5342,13 @@ mod tests {
             let fx = e.pointer_up(Point::new(140.0, 120.0), mods, 33);
             pump(&mut e, &fx);
         }
-        assert_eq!(e.doc.ordered_live().len(), 2, "the brush keeps drawing");
+        assert_eq!(
+            e.session.document().ordered_live().len(),
+            2,
+            "the brush keeps drawing"
+        );
 
-        let id = e.doc.ordered_live()[0].id.clone();
+        let id = e.session.document().ordered_live()[0].id.clone();
         e.clear_selection();
         press(&mut e, "v", mods, 34);
         {
@@ -5435,7 +5360,7 @@ mod tests {
             pump(&mut e, &fx);
         }
         assert_eq!(
-            e.selection.iter().next(),
+            e.view.selection.iter().next(),
             Some(&id),
             "the stroke is selectable once Select is armed"
         );
@@ -5446,9 +5371,12 @@ mod tests {
         let mut e = editor();
         let mods = Modifiers::default();
         press(&mut e, "p", mods, 1);
-        assert!(e.tool_locked);
+        assert!(e.view.tool_locked);
         press(&mut e, "p", mods, 2);
-        assert!(!e.tool_locked, "second press makes the brush single-shot");
+        assert!(
+            !e.view.tool_locked,
+            "second press makes the brush single-shot"
+        );
 
         {
             let fx = e.pointer_down(Point::new(0.0, 0.0), 0, mods, 3);
@@ -5463,7 +5391,7 @@ mod tests {
             pump(&mut e, &fx);
         }
         assert_eq!(
-            e.tool,
+            e.view.tool,
             Tool::Select,
             "unlocked, it hands back after one use"
         );
@@ -5487,7 +5415,7 @@ mod tests {
             pump(&mut e, &fx);
         }
 
-        let element = e.doc.ordered_live()[0];
+        let element = e.session.document().ordered_live()[0];
         match &element.kind {
             ElementKind::Arrow {
                 start,
@@ -5515,7 +5443,7 @@ mod tests {
             let fx = e.pointer_up(Point::new(300.0, 0.0), mods, 8);
             pump(&mut e, &fx);
         }
-        let arrow = e.doc.ordered_live()[1];
+        let arrow = e.session.document().ordered_live()[1];
         match &arrow.kind {
             ElementKind::Arrow { end_arrowhead, .. } => assert!(end_arrowhead),
             other => panic!("expected arrow, got {other:?}"),
@@ -5542,7 +5470,7 @@ mod tests {
             let fx = e.pointer_up(Point::new(100.0, 10.0), shift, 4);
             pump(&mut e, &fx);
         }
-        let element = e.doc.ordered_live()[0];
+        let element = e.session.document().ordered_live()[0];
         if let ElementKind::Arrow { end, .. } = &element.kind {
             assert!(end.y.abs() < 1e-6, "snapped to horizontal: {end:?}");
             assert!((end.x - 100.4).abs() < 1.0);
@@ -5560,20 +5488,20 @@ mod tests {
             let fx = e.pointer_down(Point::new(50.0, 50.0), 0, mods, 2);
             pump(&mut e, &fx);
         }
-        let id = e.doc.ordered_live()[0].id.clone();
+        let id = e.session.document().ordered_live()[0].id.clone();
         {
             let fx = e.commit_text(&id, "Hello world", 3);
             pump(&mut e, &fx);
         }
 
-        match &e.doc.element(&id).unwrap().kind {
+        match &e.session.document().element(&id).unwrap().kind {
             ElementKind::Text { text, rect, .. } => {
                 assert_eq!(text, "Hello world");
                 assert!(rect.w > 100.0, "auto width grew: {rect:?}");
             }
             other => panic!("expected text, got {other:?}"),
         }
-        assert_eq!(e.selection.len(), 1);
+        assert_eq!(e.view.selection.len(), 1);
     }
 
     #[test]
@@ -5585,20 +5513,20 @@ mod tests {
             let fx = e.pointer_down(Point::new(50.0, 50.0), 0, mods, 2);
             pump(&mut e, &fx);
         }
-        let id = e.doc.ordered_live()[0].id.clone();
+        let id = e.session.document().ordered_live()[0].id.clone();
         {
             let fx = e.commit_text(&id, "   ", 3);
             pump(&mut e, &fx);
         }
-        assert!(e.doc.is_empty());
-        assert!(!e.history.can_undo());
+        assert!(e.session.document().is_empty());
+        assert!(!e.can_undo());
     }
 
     #[test]
     fn double_click_shapes_creates_bound_text_that_follows_them() {
         let mut e = editor();
         drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(200.0, 100.0), 1);
-        let shape_id = e.doc.ordered_live()[0].id.clone();
+        let shape_id = e.session.document().ordered_live()[0].id.clone();
         press(&mut e, "v", Modifiers::default(), 2);
 
         {
@@ -5606,7 +5534,8 @@ mod tests {
             pump(&mut e, &fx);
         }
         let text_id = e
-            .doc
+            .session
+            .document()
             .ordered_live()
             .iter()
             .find(|element| element.id != shape_id)
@@ -5618,13 +5547,20 @@ mod tests {
             pump(&mut e, &fx);
         }
 
-        match e.doc.element(&shape_id).unwrap().kind.clone() {
+        match e
+            .session
+            .document()
+            .element(&shape_id)
+            .unwrap()
+            .kind
+            .clone()
+        {
             ElementKind::Shape { bound_text_id, .. } => {
                 assert_eq!(bound_text_id, Some(text_id.clone()));
             }
             other => panic!("expected shape, got {other:?}"),
         }
-        let before = e.doc.element(&text_id).unwrap().bounds();
+        let before = e.session.document().element(&text_id).unwrap().bounds();
 
         let mods = Modifiers::default();
         {
@@ -5639,7 +5575,7 @@ mod tests {
             let fx = e.pointer_up(Point::new(150.0, 70.0), mods, 7);
             pump(&mut e, &fx);
         }
-        let after = e.doc.element(&text_id).unwrap().bounds();
+        let after = e.session.document().element(&text_id).unwrap().bounds();
         assert!(
             (after.x - before.x - 50.0).abs() < 0.01,
             "bound text follows its shape: {before:?} -> {after:?}"
@@ -5650,14 +5586,15 @@ mod tests {
     fn resizing_a_shape_reflows_bound_text() {
         let mut e = editor();
         drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(200.0, 100.0), 1);
-        let shape_id = e.doc.ordered_live()[0].id.clone();
+        let shape_id = e.session.document().ordered_live()[0].id.clone();
         press(&mut e, "v", Modifiers::default(), 2);
         {
             let fx = e.double_click(Point::new(100.0, 50.0), 3);
             pump(&mut e, &fx);
         }
         let text_id = e
-            .doc
+            .session
+            .document()
             .ordered_live()
             .iter()
             .find(|element| element.id != shape_id)
@@ -5670,7 +5607,7 @@ mod tests {
             4,
         );
 
-        let height_before = e.doc.element(&text_id).unwrap().bounds().h;
+        let height_before = e.session.document().element(&text_id).unwrap().bounds().h;
         let mods = Modifiers::default();
         // Select the shape (clicking its edge; the text is selected after commit).
         {
@@ -5681,7 +5618,7 @@ mod tests {
             let fx = e.pointer_up(Point::new(5.0, 5.0), mods, 5);
             pump(&mut e, &fx);
         }
-        assert!(e.selection.contains(&shape_id));
+        assert!(e.view.selection.contains(&shape_id));
 
         // Shrink the shape by dragging its SE handle.
         {
@@ -5696,7 +5633,7 @@ mod tests {
             let fx = e.pointer_up(Point::new(70.0, 100.0), mods, 8);
             pump(&mut e, &fx);
         }
-        let height_after = e.doc.element(&text_id).unwrap().bounds().h;
+        let height_after = e.session.document().element(&text_id).unwrap().bounds().h;
         assert!(
             height_after > height_before,
             "text wrapped taller after shrinking: {height_before} -> {height_after}"
@@ -5708,7 +5645,7 @@ mod tests {
         use crate::model::{FillPattern, StylePatch};
         let mut e = editor();
         drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(100.0, 50.0), 1);
-        let id = e.doc.ordered_live()[0].id.clone();
+        let id = e.session.document().ordered_live()[0].id.clone();
 
         let patch = StylePatch {
             stroke_color: Some("#e03131".into()),
@@ -5721,7 +5658,7 @@ mod tests {
             pump(&mut e, &fx);
         }
 
-        match &e.doc.element(&id).unwrap().kind {
+        match &e.session.document().element(&id).unwrap().kind {
             ElementKind::Shape { style, .. } => {
                 assert_eq!(style.stroke_color, "#e03131");
                 assert_eq!(style.fill_style, FillPattern::Solid);
@@ -5735,7 +5672,7 @@ mod tests {
             ..Modifiers::default()
         };
         press(&mut e, "z", cmd, 3);
-        match &e.doc.element(&id).unwrap().kind {
+        match &e.session.document().element(&id).unwrap().kind {
             ElementKind::Shape { style, .. } => assert_eq!(style.stroke_color, "#ece4d6"),
             other => panic!("expected shape, got {other:?}"),
         }
@@ -5753,10 +5690,10 @@ mod tests {
             let fx = e.update_style(&patch, 1);
             pump(&mut e, &fx);
         }
-        assert_eq!(e.style.stroke_width, 4.0);
+        assert_eq!(e.view.style.stroke_width, 4.0);
 
         drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(50.0, 50.0), 2);
-        match &e.doc.ordered_live()[0].kind {
+        match &e.session.document().ordered_live()[0].kind {
             ElementKind::Shape { style, .. } => assert_eq!(style.stroke_width, 4.0),
             other => panic!("expected shape, got {other:?}"),
         }
@@ -5789,9 +5726,9 @@ mod tests {
         let mut e = editor();
         drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(100.0, 100.0), 1);
         drag_shape(&mut e, Point::new(300.0, 0.0), Point::new(400.0, 100.0), 2);
-        let a = e.doc.ordered_live()[0].id.clone();
-        let b = e.doc.ordered_live()[1].id.clone();
-        e.selection.clear();
+        let a = e.session.document().ordered_live()[0].id.clone();
+        let b = e.session.document().ordered_live()[1].id.clone();
+        e.view.selection.clear();
 
         let mods = Modifiers::default();
         press(&mut e, "a", mods, 3);
@@ -5814,9 +5751,10 @@ mod tests {
         }
 
         assert!(e.hover_anchor_points().is_empty());
-        assert_eq!(e.doc.ordered_live().len(), 3);
+        assert_eq!(e.session.document().ordered_live().len(), 3);
         let arrow = e
-            .doc
+            .session
+            .document()
             .ordered_live()
             .into_iter()
             .find(|element| matches!(element.kind, ElementKind::Arrow { .. }))
@@ -5858,7 +5796,8 @@ mod tests {
     }
 
     fn arrow_waypoints(e: &Editor) -> Vec<Point> {
-        e.doc
+        e.session
+            .document()
             .ordered_live()
             .into_iter()
             .find_map(|element| match &element.kind {
@@ -5899,7 +5838,8 @@ mod tests {
             vec![Point::new(132.0, 150.0), Point::new(268.0, 150.0)]
         );
         let element = e
-            .doc
+            .session
+            .document()
             .ordered_live()
             .into_iter()
             .find(|el| matches!(el.kind, ElementKind::Arrow { .. }))
@@ -5915,7 +5855,7 @@ mod tests {
         else {
             unreachable!()
         };
-        let route = connector::route(start, end, *routing, waypoints, &e.doc);
+        let route = connector::route(start, end, *routing, waypoints, e.session.document());
         for waypoint in waypoints {
             assert!(
                 route.contains(waypoint),
@@ -6036,7 +5976,7 @@ mod tests {
         let mut e = editor();
         drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(100.0, 100.0), 1);
         drag_shape(&mut e, Point::new(300.0, 0.0), Point::new(400.0, 100.0), 2);
-        let b = e.doc.ordered_live()[1].id.clone();
+        let b = e.session.document().ordered_live()[1].id.clone();
 
         let mods = Modifiers::default();
         press(&mut e, "a", mods, 3);
@@ -6054,14 +5994,15 @@ mod tests {
         }
 
         let arrow_id = e
-            .doc
+            .session
+            .document()
             .ordered_live()
             .iter()
             .find(|element| matches!(element.kind, ElementKind::Arrow { .. }))
             .unwrap()
             .id
             .clone();
-        let before = e.doc.element(&arrow_id).unwrap().bounds();
+        let before = e.session.document().element(&arrow_id).unwrap().bounds();
 
         press(&mut e, "v", mods, 7);
         e.select([b.clone()]);
@@ -6078,7 +6019,7 @@ mod tests {
             pump(&mut e, &fx);
         }
 
-        let after = e.doc.element(&arrow_id).unwrap().bounds();
+        let after = e.session.document().element(&arrow_id).unwrap().bounds();
         assert!(
             after != before,
             "arrow endpoints followed the moved shape: {before:?} -> {after:?}"
@@ -6090,8 +6031,8 @@ mod tests {
         let mut e = editor();
         drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(100.0, 100.0), 1);
         drag_shape(&mut e, Point::new(300.0, 0.0), Point::new(400.0, 100.0), 2);
-        let a = e.doc.ordered_live()[0].id.clone();
-        let b = e.doc.ordered_live()[1].id.clone();
+        let a = e.session.document().ordered_live()[0].id.clone();
+        let b = e.session.document().ordered_live()[1].id.clone();
 
         let mods = Modifiers::default();
         press(&mut e, "a", mods, 3);
@@ -6108,7 +6049,8 @@ mod tests {
             pump(&mut e, &fx);
         }
         let arrow_id = e
-            .doc
+            .session
+            .document()
             .ordered_live()
             .iter()
             .find(|element| matches!(element.kind, ElementKind::Arrow { .. }))
@@ -6139,7 +6081,7 @@ mod tests {
             pump(&mut e, &fx);
         }
         assert_eq!(
-            bindings(e.doc.element(&arrow_id).unwrap()),
+            bindings(e.session.document().element(&arrow_id).unwrap()),
             connected,
             "a body drag keeps both bindings"
         );
@@ -6148,7 +6090,7 @@ mod tests {
         e.select([arrow_id.clone()]);
         press(&mut e, "ArrowRight", mods, 10);
         assert_eq!(
-            bindings(e.doc.element(&arrow_id).unwrap()),
+            bindings(e.session.document().element(&arrow_id).unwrap()),
             connected,
             "nudging keeps both bindings"
         );
@@ -6168,11 +6110,12 @@ mod tests {
             pump(&mut e, &fx);
         }
 
-        let arrow = e.doc.element(&arrow_id).unwrap();
+        let arrow = e.session.document().element(&arrow_id).unwrap();
         let ElementKind::Arrow { end, .. } = &arrow.kind else {
             panic!("expected an arrow");
         };
-        let (point, side) = connector::resolve_endpoint(end, Point::new(100.0, 50.0), &e.doc);
+        let (point, side) =
+            connector::resolve_endpoint(end, Point::new(100.0, 50.0), e.session.document());
         assert_eq!(side, Some(connector::AnchorSide::W));
         assert_eq!(point, Point::new(300.0, 150.0), "the endpoint follows b");
     }
@@ -6203,7 +6146,8 @@ mod tests {
             pump(&mut e, &fx);
         }
         let text_id = e
-            .doc
+            .session
+            .document()
             .ordered_live()
             .iter()
             .find(|element| element.is_text())
@@ -6215,7 +6159,7 @@ mod tests {
             pump(&mut e, &fx);
         }
 
-        let label = e.doc.element(&text_id).unwrap();
+        let label = e.session.document().element(&text_id).unwrap();
         assert!(label.bounds().w > 50.0);
         assert!(
             (label.bounds().center().x - 200.0).abs() < 60.0,
@@ -6241,8 +6185,8 @@ mod tests {
             let fx = e.pointer_up(Point::new(400.0, 300.0), mods, 4);
             pump(&mut e, &fx);
         }
-        assert_eq!(e.doc.ordered_live().len(), 1);
-        match &e.doc.ordered_live()[0].kind {
+        assert_eq!(e.session.document().ordered_live().len(), 1);
+        match &e.session.document().ordered_live()[0].kind {
             ElementKind::Frame { rect, name } => {
                 assert_eq!(*rect, Rect::new(0.0, 0.0, 400.0, 300.0));
                 assert_eq!(name, "Frame 1");
@@ -6268,12 +6212,17 @@ mod tests {
             let fx = e.pointer_up(Point::new(400.0, 300.0), mods, 4);
             pump(&mut e, &fx);
         }
-        let frame_id = e.doc.ordered_live()[0].id.clone();
+        let frame_id = e.session.document().ordered_live()[0].id.clone();
 
         drag_shape(&mut e, Point::new(50.0, 50.0), Point::new(150.0, 150.0), 5);
-        let shape_id = e.doc.ordered_live()[1].id.clone();
+        let shape_id = e.session.document().ordered_live()[1].id.clone();
         assert_eq!(
-            e.doc.element(&shape_id).unwrap().frame_id.as_ref(),
+            e.session
+                .document()
+                .element(&shape_id)
+                .unwrap()
+                .frame_id
+                .as_ref(),
             Some(&frame_id),
             "shape drawn inside the frame is owned"
         );
@@ -6293,7 +6242,7 @@ mod tests {
             pump(&mut e, &fx);
         }
         assert_eq!(
-            e.doc.element(&shape_id).unwrap().frame_id,
+            e.session.document().element(&shape_id).unwrap().frame_id,
             None,
             "dragged out, membership released"
         );
@@ -6316,11 +6265,11 @@ mod tests {
             let fx = e.pointer_up(Point::new(400.0, 300.0), mods, 4);
             pump(&mut e, &fx);
         }
-        let frame_id = e.doc.ordered_live()[0].id.clone();
+        let frame_id = e.session.document().ordered_live()[0].id.clone();
 
         drag_shape(&mut e, Point::new(50.0, 50.0), Point::new(150.0, 150.0), 5);
-        let shape_id = e.doc.ordered_live()[1].id.clone();
-        let before = e.doc.element(&shape_id).unwrap().bounds();
+        let shape_id = e.session.document().ordered_live()[1].id.clone();
+        let before = e.session.document().element(&shape_id).unwrap().bounds();
 
         press(&mut e, "v", mods, 6);
         e.select([frame_id.clone()]);
@@ -6338,7 +6287,7 @@ mod tests {
             pump(&mut e, &fx);
         }
 
-        let after = e.doc.element(&shape_id).unwrap().bounds();
+        let after = e.session.document().element(&shape_id).unwrap().bounds();
         assert!((after.x - before.x - 40.0).abs() < 0.01);
         assert!((after.y - before.y - 30.0).abs() < 0.01);
     }
@@ -6360,7 +6309,7 @@ mod tests {
             let fx = e.pointer_up(Point::new(200.0, 150.0), mods, 4);
             pump(&mut e, &fx);
         }
-        let frame_a = e.doc.ordered_live()[0].id.clone();
+        let frame_a = e.session.document().ordered_live()[0].id.clone();
 
         press(&mut e, "f", mods, 5);
         {
@@ -6375,7 +6324,7 @@ mod tests {
             let fx = e.pointer_up(Point::new(600.0, 150.0), mods, 8);
             pump(&mut e, &fx);
         }
-        let frame_b = e.doc.ordered_live()[1].id.clone();
+        let frame_b = e.session.document().ordered_live()[1].id.clone();
 
         // Connect frame A's east border to frame B's west border.
         press(&mut e, "a", mods, 9);
@@ -6393,7 +6342,8 @@ mod tests {
         }
 
         let arrow_id = e
-            .doc
+            .session
+            .document()
             .ordered_live()
             .iter()
             .find(|element| matches!(element.kind, ElementKind::Arrow { .. }))
@@ -6408,7 +6358,7 @@ mod tests {
             other => panic!("expected an arrow, got {other:?}"),
         };
         assert_eq!(
-            bindings(e.doc.element(&arrow_id).unwrap()),
+            bindings(e.session.document().element(&arrow_id).unwrap()),
             (Some(frame_a.clone()), Some(frame_b.clone())),
             "both endpoints bind to the frames"
         );
@@ -6428,7 +6378,7 @@ mod tests {
             let fx = e.pointer_up(Point::new(50.0, 200.0), mods, 16);
             pump(&mut e, &fx);
         }
-        let (start_y, end_y) = match &e.doc.element(&arrow_id).unwrap().kind {
+        let (start_y, end_y) = match &e.session.document().element(&arrow_id).unwrap().kind {
             ElementKind::Arrow { start, end, .. } => (start.y, end.y),
             _ => unreachable!(),
         };
@@ -6456,21 +6406,28 @@ mod tests {
             let fx = e.pointer_up(Point::new(400.0, 300.0), mods, 4);
             pump(&mut e, &fx);
         }
-        let frame_id = e.doc.ordered_live()[0].id.clone();
+        let frame_id = e.session.document().ordered_live()[0].id.clone();
         drag_shape(&mut e, Point::new(50.0, 50.0), Point::new(150.0, 150.0), 5);
-        assert_eq!(e.doc.ordered_live().len(), 2);
+        assert_eq!(e.session.document().ordered_live().len(), 2);
 
         press(&mut e, "v", mods, 6);
         e.select([frame_id]);
         press(&mut e, "Delete", mods, 7);
-        assert!(e.doc.ordered_live().is_empty(), "children deleted too");
+        assert!(
+            e.session.document().ordered_live().is_empty(),
+            "children deleted too"
+        );
 
         let cmd = Modifiers {
             meta: true,
             ..Modifiers::default()
         };
         press(&mut e, "z", cmd, 8);
-        assert_eq!(e.doc.ordered_live().len(), 2, "one undo restores all");
+        assert_eq!(
+            e.session.document().ordered_live().len(),
+            2,
+            "one undo restores all"
+        );
     }
 
     #[test]
@@ -6487,8 +6444,8 @@ mod tests {
             pump(&mut e, &fx);
         }
 
-        assert_eq!(e.doc.ordered_live().len(), 1);
-        let note = e.doc.ordered_live()[0].clone();
+        assert_eq!(e.session.document().ordered_live().len(), 1);
+        let note = e.session.document().ordered_live()[0].clone();
         assert!(note.is_sticky(), "the sticky tool draws a sticky note");
         assert_eq!(note.bounds(), Rect::new(130.0, 130.0, 140.0, 140.0));
         match &note.kind {
@@ -6499,7 +6456,7 @@ mod tests {
             }
             other => panic!("expected a sticky, got {other:?}"),
         }
-        assert_eq!(e.tool, Tool::Select, "the sticky tool is single-shot");
+        assert_eq!(e.view.tool, Tool::Select, "the sticky tool is single-shot");
 
         // Double-click creates the note's bound text, inked in the note colour.
         let fx = e.double_click(Point::new(200.0, 200.0), 4);
@@ -6517,7 +6474,7 @@ mod tests {
             "the overlay types in the note's own ink, not the light canvas default"
         );
         pump(&mut e, &fx);
-        let text_id = match &e.interaction {
+        let text_id = match &e.gesture.interaction {
             Interaction::TextEditing { id, .. } => id.clone(),
             other => panic!("expected the text editor, got {other:?}"),
         };
@@ -6531,8 +6488,8 @@ mod tests {
             pump(&mut e, &fx);
         }
         assert_eq!(e.editing_text_id(), None);
-        assert_eq!(e.doc.ordered_live().len(), 2);
-        let text = e.doc.element(&text_id).unwrap();
+        assert_eq!(e.session.document().ordered_live().len(), 2);
+        let text = e.session.document().element(&text_id).unwrap();
         match &text.kind {
             ElementKind::Text {
                 text,
@@ -6561,9 +6518,9 @@ mod tests {
             let fx = e.pointer_up(Point::new(300.0, 300.0), mods, 3);
             pump(&mut e, &fx);
         }
-        let stack = e.doc.ordered_live()[0].clone();
+        let stack = e.session.document().ordered_live()[0].clone();
         assert!(stack.is_sticky_stack());
-        assert_eq!(e.tool, Tool::Select, "placing a stack is single-shot");
+        assert_eq!(e.view.tool, Tool::Select, "placing a stack is single-shot");
         assert_eq!(stack.bounds(), Rect::new(230.0, 230.0, 140.0, 140.0));
 
         // N-drag from the pile pulls a note out; the pile stays.
@@ -6580,9 +6537,10 @@ mod tests {
             let fx = e.pointer_up(Point::new(500.0, 320.0), mods, 7);
             pump(&mut e, &fx);
         }
-        assert_eq!(e.doc.ordered_live().len(), 2);
+        assert_eq!(e.session.document().ordered_live().len(), 2);
         let note = e
-            .doc
+            .session
+            .document()
             .ordered_live()
             .into_iter()
             .find(|element| element.is_sticky())
@@ -6590,11 +6548,11 @@ mod tests {
             .expect("a note was pulled");
         assert_eq!(note.bounds().center(), Point::new(500.0, 320.0));
         assert_eq!(
-            e.doc.element(&stack.id).unwrap().bounds(),
+            e.session.document().element(&stack.id).unwrap().bounds(),
             stack.bounds(),
             "the pile did not move"
         );
-        assert_eq!(e.tool, Tool::Select);
+        assert_eq!(e.view.tool, Tool::Select);
 
         // A click on the pile pulls nothing.
         press(&mut e, "n", mods, 8);
@@ -6607,7 +6565,7 @@ mod tests {
             pump(&mut e, &fx);
         }
         assert_eq!(
-            e.doc.ordered_live().len(),
+            e.session.document().ordered_live().len(),
             2,
             "clicking the pile is a no-op"
         );
@@ -6626,14 +6584,19 @@ mod tests {
             let fx = e.pointer_up(Point::new(560.0, 300.0), mods, 14);
             pump(&mut e, &fx);
         }
-        assert_eq!(e.doc.ordered_live().len(), 3, "select pulled a note");
         assert_eq!(
-            e.doc.element(&stack.id).unwrap().bounds(),
+            e.session.document().ordered_live().len(),
+            3,
+            "select pulled a note"
+        );
+        assert_eq!(
+            e.session.document().element(&stack.id).unwrap().bounds(),
             stack.bounds(),
             "the pile did not move"
         );
         let second = e
-            .doc
+            .session
+            .document()
             .ordered_live()
             .into_iter()
             .filter(|element| element.is_sticky())
@@ -6656,22 +6619,31 @@ mod tests {
             pump(&mut e, &fx);
         }
         assert_eq!(
-            e.doc.element(&stack.id).unwrap().bounds(),
+            e.session.document().element(&stack.id).unwrap().bounds(),
             Rect::new(260.0, 290.0, 140.0, 140.0)
         );
         assert_eq!(
-            e.doc.element(&note.id).unwrap().bounds().center(),
+            e.session
+                .document()
+                .element(&note.id)
+                .unwrap()
+                .bounds()
+                .center(),
             Point::new(500.0, 320.0),
             "the pulled note stayed put"
         );
-        assert_eq!(e.doc.ordered_live().len(), 3, "moving made no new note");
+        assert_eq!(
+            e.session.document().ordered_live().len(),
+            3,
+            "moving made no new note"
+        );
     }
 
     #[test]
     fn text_tool_on_a_shape_creates_a_centred_label() {
         let mut e = editor();
         drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(200.0, 100.0), 1);
-        let shape = e.doc.ordered_live()[0].id.clone();
+        let shape = e.session.document().ordered_live()[0].id.clone();
         let mods = Modifiers::default();
 
         // Click well off-centre: the label still lands in the middle.
@@ -6680,7 +6652,7 @@ mod tests {
             let fx = e.pointer_down(Point::new(60.0, 40.0), 0, mods, 3);
             pump(&mut e, &fx);
         }
-        let text_id = match &e.interaction {
+        let text_id = match &e.gesture.interaction {
             Interaction::TextEditing { id, .. } => id.clone(),
             other => panic!("expected the text editor, got {other:?}"),
         };
@@ -6689,7 +6661,7 @@ mod tests {
             pump(&mut e, &fx);
         }
 
-        let text = e.doc.element(&text_id).unwrap();
+        let text = e.session.document().element(&text_id).unwrap();
         match &text.kind {
             ElementKind::Text {
                 container_id,
@@ -6702,7 +6674,7 @@ mod tests {
             other => panic!("expected bound text, got {other:?}"),
         }
         let bounds = text.bounds();
-        let shape_bounds = e.doc.element(&shape).unwrap().bounds();
+        let shape_bounds = e.session.document().element(&shape).unwrap().bounds();
         assert!(
             (bounds.center().x - shape_bounds.center().x).abs() < 1.0,
             "the label is centred in the shape"
@@ -6730,7 +6702,7 @@ mod tests {
                 let fx = e.pointer_up(Point::new(400.0, 300.0), mods, 4);
                 pump(&mut e, &fx);
             }
-            let frame_id = e.doc.ordered_live()[0].id.clone();
+            let frame_id = e.session.document().ordered_live()[0].id.clone();
             press(&mut e, "v", mods, 5);
             e.clear_selection();
             {
@@ -6746,7 +6718,7 @@ mod tests {
                 pump(&mut e, &fx);
             }
             assert!(
-                e.selection.contains(&frame_id),
+                e.view.selection.contains(&frame_id),
                 "a selection rectangle enclosing a frame must select it"
             );
         }
@@ -6769,9 +6741,9 @@ mod tests {
             let fx = e.pointer_up(Point::new(400.0, 300.0), mods, 4);
             pump(&mut e, &fx);
         }
-        let frame_id = e.doc.ordered_live()[0].id.clone();
+        let frame_id = e.session.document().ordered_live()[0].id.clone();
         drag_shape(&mut e, Point::new(50.0, 50.0), Point::new(150.0, 150.0), 5);
-        let shape_id = e.doc.ordered_live()[1].id.clone();
+        let shape_id = e.session.document().ordered_live()[1].id.clone();
 
         press(&mut e, "v", mods, 6);
         e.clear_selection();
@@ -6788,10 +6760,10 @@ mod tests {
             pump(&mut e, &fx);
         }
 
-        assert_eq!(e.selection.len(), 1);
-        assert!(e.selection.contains(&shape_id));
+        assert_eq!(e.view.selection.len(), 1);
+        assert!(e.view.selection.contains(&shape_id));
         assert!(
-            !e.selection.contains(&frame_id),
+            !e.view.selection.contains(&frame_id),
             "a marquee inside the frame does not grab the frame"
         );
     }
@@ -6813,14 +6785,14 @@ mod tests {
             let fx = e.pointer_up(Point::new(400.0, 300.0), mods, 4);
             pump(&mut e, &fx);
         }
-        let frame_id = e.doc.ordered_live()[0].id.clone();
+        let frame_id = e.session.document().ordered_live()[0].id.clone();
 
         press(&mut e, "t", mods, 5);
         {
             let fx = e.pointer_down(Point::new(200.0, 150.0), 0, mods, 6);
             pump(&mut e, &fx);
         }
-        let text_id = match &e.interaction {
+        let text_id = match &e.gesture.interaction {
             Interaction::TextEditing { id, .. } => id.clone(),
             other => panic!("expected the text editor, got {other:?}"),
         };
@@ -6829,12 +6801,17 @@ mod tests {
             pump(&mut e, &fx);
         }
         assert_eq!(
-            e.doc.element(&text_id).unwrap().frame_id.as_ref(),
+            e.session
+                .document()
+                .element(&text_id)
+                .unwrap()
+                .frame_id
+                .as_ref(),
             Some(&frame_id),
             "text dropped inside a frame is owned by it"
         );
 
-        let before = e.doc.element(&text_id).unwrap().bounds();
+        let before = e.session.document().element(&text_id).unwrap().bounds();
         press(&mut e, "v", mods, 8);
         e.select([frame_id.clone()]);
         {
@@ -6849,7 +6826,7 @@ mod tests {
             let fx = e.pointer_up(Point::new(140.0, 340.0), mods, 11);
             pump(&mut e, &fx);
         }
-        let after = e.doc.element(&text_id).unwrap().bounds();
+        let after = e.session.document().element(&text_id).unwrap().bounds();
         assert!(
             (after.x - before.x - 40.0).abs() < 0.01,
             "the frame carried the text"
@@ -6861,8 +6838,8 @@ mod tests {
         let mut e = editor();
         drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(100.0, 50.0), 1);
         drag_shape(&mut e, Point::new(300.0, 0.0), Point::new(400.0, 50.0), 2);
-        let a = e.doc.ordered_live()[0].id.clone();
-        let b = e.doc.ordered_live()[1].id.clone();
+        let a = e.session.document().ordered_live()[0].id.clone();
+        let b = e.session.document().ordered_live()[1].id.clone();
         let mods = Modifiers::default();
         press(&mut e, "v", mods, 3);
         e.clear_selection();
@@ -6892,7 +6869,8 @@ mod tests {
         }
 
         let arrow = e
-            .doc
+            .session
+            .document()
             .ordered_live()
             .into_iter()
             .find(|element| matches!(element.kind, ElementKind::Arrow { .. }))
@@ -6907,11 +6885,11 @@ mod tests {
         };
         assert_eq!(bindings, (Some(a.clone()), Some(b.clone())));
         assert_eq!(
-            e.selection.iter().next(),
+            e.view.selection.iter().next(),
             Some(&arrow.id),
             "the new arrow is selected"
         );
-        assert_eq!(e.tool, Tool::Select);
+        assert_eq!(e.view.tool, Tool::Select);
 
         // The start followed the source shape when it moved.
         e.select([a.clone()]);
@@ -6927,7 +6905,7 @@ mod tests {
             let fx = e.pointer_up(Point::new(50.0, 75.0), mods, 10);
             pump(&mut e, &fx);
         }
-        let start_y = match &e.doc.element(&arrow.id).unwrap().kind {
+        let start_y = match &e.session.document().element(&arrow.id).unwrap().kind {
             ElementKind::Arrow { start, .. } => start.y,
             _ => unreachable!(),
         };
@@ -6951,7 +6929,7 @@ mod tests {
             let fx = e.pointer_up(Point::new(400.0, 300.0), mods, 4);
             pump(&mut e, &fx);
         }
-        let frame_id = e.doc.ordered_live()[0].id.clone();
+        let frame_id = e.session.document().ordered_live()[0].id.clone();
         drag_shape(&mut e, Point::new(50.0, 50.0), Point::new(150.0, 150.0), 5);
 
         press(&mut e, "v", mods, 6);
@@ -6961,10 +6939,15 @@ mod tests {
             ..Modifiers::default()
         };
         press(&mut e, "d", cmd, 7);
-        assert_eq!(e.doc.ordered_live().len(), 4, "frame + child duplicated");
+        assert_eq!(
+            e.session.document().ordered_live().len(),
+            4,
+            "frame + child duplicated"
+        );
 
         let copy_frame = e
-            .doc
+            .session
+            .document()
             .ordered_live()
             .into_iter()
             .filter(|element| element.is_frame())
@@ -6972,7 +6955,8 @@ mod tests {
             .find(|id| id != &frame_id)
             .expect("duplicated frame");
         let copy_child = e
-            .doc
+            .session
+            .document()
             .ordered_live()
             .into_iter()
             .find(|element| element.frame_id.as_ref() == Some(&copy_frame));
@@ -6996,7 +6980,7 @@ mod tests {
             let fx = e.pointer_up(Point::new(400.0, 300.0), mods, 4);
             pump(&mut e, &fx);
         }
-        let frame_id = e.doc.ordered_live()[0].id.clone();
+        let frame_id = e.session.document().ordered_live()[0].id.clone();
 
         press(&mut e, "v", mods, 5);
         {
@@ -7007,7 +6991,7 @@ mod tests {
             let fx = e.commit_text(&frame_id, "us-central1", 7);
             pump(&mut e, &fx);
         }
-        match &e.doc.element(&frame_id).unwrap().kind {
+        match &e.session.document().element(&frame_id).unwrap().kind {
             ElementKind::Frame { name, .. } => assert_eq!(name, "us-central1"),
             other => panic!("expected frame, got {other:?}"),
         }
@@ -7031,12 +7015,12 @@ mod tests {
                 let fx = e.pointer_up(Point::new(100.0, 60.0), mods, 4);
                 pump(&mut e, &fx);
             }
-            let live = e.doc.ordered_live();
+            let live = e.session.document().ordered_live();
             assert_eq!(live.len(), 1);
             live[0].id.clone()
         };
-        assert_eq!(e.tool, Tool::Select, "the draw tool is single-shot");
-        assert_eq!(e.selection.iter().next(), Some(&id));
+        assert_eq!(e.view.tool, Tool::Select, "the draw tool is single-shot");
+        assert_eq!(e.view.selection.iter().next(), Some(&id));
 
         // The placed shape is selectable after deselecting.
         e.clear_selection();
@@ -7048,7 +7032,11 @@ mod tests {
             let fx = e.pointer_up(Point::new(50.0, 30.0), mods, 6);
             pump(&mut e, &fx);
         }
-        assert_eq!(e.selection.len(), 1, "clicking the drawn shape selects it");
+        assert_eq!(
+            e.view.selection.len(),
+            1,
+            "clicking the drawn shape selects it"
+        );
     }
 
     #[test]
@@ -7057,8 +7045,8 @@ mod tests {
         let mods = Modifiers::default();
         press(&mut e, "r", mods, 1);
         press(&mut e, "r", mods, 2);
-        assert!(e.tool_locked, "second press locks the tool");
-        assert_eq!(e.tool, Tool::Rectangle);
+        assert!(e.view.tool_locked, "second press locks the tool");
+        assert_eq!(e.view.tool, Tool::Rectangle);
 
         for (i, start) in [0.0_f64, 200.0].iter().enumerate() {
             let now = 10 + i as u64 * 10;
@@ -7075,8 +7063,12 @@ mod tests {
                 pump(&mut e, &fx);
             }
         }
-        assert_eq!(e.doc.ordered_live().len(), 2, "locked tool keeps drawing");
-        assert_eq!(e.tool, Tool::Rectangle);
+        assert_eq!(
+            e.session.document().ordered_live().len(),
+            2,
+            "locked tool keeps drawing"
+        );
+        assert_eq!(e.view.tool, Tool::Rectangle);
 
         let cmd = Modifiers {
             meta: true,
@@ -7085,8 +7077,8 @@ mod tests {
         let _ = press(&mut e, "z", cmd, 99);
         let _ = cmd;
         press(&mut e, "v", mods, 100);
-        assert_eq!(e.tool, Tool::Select);
-        assert!(!e.tool_locked);
+        assert_eq!(e.view.tool, Tool::Select);
+        assert!(!e.view.tool_locked);
     }
 
     #[test]
@@ -7098,12 +7090,12 @@ mod tests {
             let fx = e.pointer_down(Point::new(50.0, 50.0), 0, mods, 2);
             pump(&mut e, &fx);
         }
-        let id = e.doc.ordered_live()[0].id.clone();
+        let id = e.session.document().ordered_live()[0].id.clone();
         {
             let fx = e.commit_text(&id, "hello", 3);
             pump(&mut e, &fx);
         }
-        assert_eq!(e.tool, Tool::Select, "new text is single-shot");
+        assert_eq!(e.view.tool, Tool::Select, "new text is single-shot");
 
         press(&mut e, "t", mods, 4);
         let effects = e.pointer_down(Point::new(55.0, 55.0), 0, mods, 5);
@@ -7112,7 +7104,11 @@ mod tests {
             let fx = e.commit_text(&id, "hello again", 6);
             pump(&mut e, &fx);
         }
-        assert_eq!(e.tool, Tool::Text, "editing existing text keeps the tool");
+        assert_eq!(
+            e.view.tool,
+            Tool::Text,
+            "editing existing text keeps the tool"
+        );
     }
 
     #[test]
@@ -7124,14 +7120,16 @@ mod tests {
             pump(&mut e, &fx);
         }
         let glyph = e
-            .doc
+            .session
+            .document()
             .ordered_live()
             .into_iter()
             .find(|element| matches!(element.kind, ElementKind::Glyph { .. }))
             .expect("glyph")
             .clone();
         let caption_centre = e
-            .doc
+            .session
+            .document()
             .ordered_live()
             .into_iter()
             .find(|element| element.is_text())
@@ -7150,7 +7148,7 @@ mod tests {
             pump(&mut e, &fx);
         }
         assert_eq!(
-            e.selection.iter().next().map(String::as_str),
+            e.view.selection.iter().next().map(String::as_str),
             Some(glyph.id.as_str()),
             "clicking the caption selects the glyph"
         );
@@ -7170,7 +7168,7 @@ mod tests {
             mods,
             7,
         );
-        let after = e.doc.element(&glyph.id).unwrap().bounds();
+        let after = e.session.document().element(&glyph.id).unwrap().bounds();
         assert!((after.x - before.x - 40.0).abs() < 0.01);
     }
 
@@ -7183,7 +7181,8 @@ mod tests {
             pump(&mut e, &fx);
         }
         let caption_centre = e
-            .doc
+            .session
+            .document()
             .ordered_live()
             .into_iter()
             .find(|element| element.is_text())
@@ -7201,7 +7200,11 @@ mod tests {
             let fx = e.pointer_up(caption_centre, mods, 4);
             pump(&mut e, &fx);
         }
-        assert_eq!(e.doc.ordered_live().len(), 0, "glyph and caption both go");
+        assert_eq!(
+            e.session.document().ordered_live().len(),
+            0,
+            "glyph and caption both go"
+        );
     }
 
     #[test]
@@ -7213,13 +7216,13 @@ mod tests {
             let fx = e.pointer_down(Point::new(50.0, 50.0), 0, mods, 2);
             pump(&mut e, &fx);
         }
-        let id = e.doc.ordered_live()[0].id.clone();
+        let id = e.session.document().ordered_live()[0].id.clone();
         {
             let fx = e.commit_text(&id, "hello", 3);
             pump(&mut e, &fx);
         }
-        assert_eq!(e.doc.ordered_live().len(), 1);
-        assert_eq!(e.tool, Tool::Select, "placing text is single-shot");
+        assert_eq!(e.session.document().ordered_live().len(), 1);
+        assert_eq!(e.view.tool, Tool::Select, "placing text is single-shot");
 
         press(&mut e, "t", mods, 4);
         {
@@ -7227,7 +7230,7 @@ mod tests {
             pump(&mut e, &fx);
         }
         assert_eq!(
-            e.doc.ordered_live().len(),
+            e.session.document().ordered_live().len(),
             1,
             "clicking existing text does not stack a new element"
         );
@@ -7235,8 +7238,8 @@ mod tests {
             let fx = e.commit_text(&id, "hello world", 5);
             pump(&mut e, &fx);
         }
-        assert_eq!(e.doc.ordered_live().len(), 1);
-        match &e.doc.element(&id).unwrap().kind {
+        assert_eq!(e.session.document().ordered_live().len(), 1);
+        match &e.session.document().element(&id).unwrap().kind {
             ElementKind::Text { text, .. } => assert_eq!(text, "hello world"),
             other => panic!("expected text, got {other:?}"),
         }
@@ -7247,18 +7250,24 @@ mod tests {
         let mut e = editor();
         e.set_viewport(800.0, 600.0);
         let effects = e.insert_glyph("cloud_run", 1);
-        assert_eq!(e.doc.ordered_live().len(), 2, "glyph + caption");
+        assert_eq!(
+            e.session.document().ordered_live().len(),
+            2,
+            "glyph + caption"
+        );
         assert_eq!(effects.changed.len(), 2);
 
         let glyph = e
-            .doc
+            .session
+            .document()
             .ordered_live()
             .into_iter()
             .find(|element| matches!(element.kind, ElementKind::Glyph { .. }))
             .expect("glyph")
             .clone();
         let caption = e
-            .doc
+            .session
+            .document()
             .ordered_live()
             .into_iter()
             .find(|element| element.is_text())
@@ -7309,7 +7318,7 @@ mod tests {
             let fx = e.pointer_up(Point::new(center.x + 60.0, center.y), mods, 4);
             pump(&mut e, &fx);
         }
-        let after = e.doc.element(&caption.id).unwrap().bounds();
+        let after = e.session.document().element(&caption.id).unwrap().bounds();
         assert!((after.x - before.x - 60.0).abs() < 0.01);
     }
 
@@ -7361,8 +7370,11 @@ mod tests {
             let fx = e.pointer_up(Point::new(80.0, 60.0), mods, 5);
             pump(&mut e, &fx);
         }
-        assert!(e.doc.is_empty(), "tool switch committed a half-drawn shape");
-        assert_eq!(e.tool, Tool::Select);
+        assert!(
+            e.session.document().is_empty(),
+            "tool switch committed a half-drawn shape"
+        );
+        assert_eq!(e.view.tool, Tool::Select);
         // The gesture is really over: the next drag uses the new tool.
         {
             let fx = e.pointer_down(Point::new(300.0, 300.0), 0, mods, 6);
@@ -7376,7 +7388,7 @@ mod tests {
             let fx = e.pointer_up(Point::new(320.0, 320.0), mods, 8);
             pump(&mut e, &fx);
         }
-        assert!(e.doc.is_empty());
+        assert!(e.session.document().is_empty());
     }
 
     #[test]
@@ -7389,7 +7401,8 @@ mod tests {
             pump(&mut e, &fx);
         }
         let text_id = e
-            .doc
+            .session
+            .document()
             .ordered_live()
             .iter()
             .find(|element| element.is_text())
@@ -7400,9 +7413,10 @@ mod tests {
             pump(&mut e, &fx);
         }
         // The draft is gone entirely and the shape carries no link.
-        assert!(e.doc.element(&text_id).is_none());
-        assert_eq!(e.doc.ordered_live().len(), 1);
-        let ElementKind::Shape { bound_text_id, .. } = &e.doc.ordered_live()[0].kind else {
+        assert!(e.session.document().element(&text_id).is_none());
+        assert_eq!(e.session.document().ordered_live().len(), 1);
+        let ElementKind::Shape { bound_text_id, .. } = &e.session.document().ordered_live()[0].kind
+        else {
             panic!("expected a shape")
         };
         assert!(
@@ -7415,7 +7429,8 @@ mod tests {
             pump(&mut e, &fx);
         }
         let fresh = e
-            .doc
+            .session
+            .document()
             .ordered_live()
             .iter()
             .find(|element| element.is_text())
@@ -7425,7 +7440,8 @@ mod tests {
             let fx = e.commit_text(&fresh, "real", 7);
             pump(&mut e, &fx);
         }
-        let ElementKind::Shape { bound_text_id, .. } = &e.doc.ordered_live()[0].kind else {
+        let ElementKind::Shape { bound_text_id, .. } = &e.session.document().ordered_live()[0].kind
+        else {
             panic!("expected a shape")
         };
         assert_eq!(bound_text_id.as_deref(), Some(fresh.as_str()));
@@ -7435,18 +7451,26 @@ mod tests {
             ..Modifiers::default()
         };
         press(&mut e, "z", cmd, 8);
-        assert_eq!(e.doc.ordered_live().len(), 1, "undo ate the shape");
+        assert_eq!(
+            e.session.document().ordered_live().len(),
+            1,
+            "undo ate the shape"
+        );
         press(&mut e, "z", cmd, 9);
-        assert!(e.doc.is_empty());
+        assert!(e.session.document().is_empty());
     }
 
     #[test]
     fn a_dangling_bound_text_id_heals_on_edit() {
         let mut e = editor();
         drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(100.0, 50.0), 1);
-        let shape_id = e.doc.ordered_live()[0].id.clone();
-        if let ElementKind::Shape { bound_text_id, .. } =
-            &mut e.doc.element_mut(&shape_id).unwrap().kind
+        let shape_id = e.session.document().ordered_live()[0].id.clone();
+        if let ElementKind::Shape { bound_text_id, .. } = &mut e
+            .session
+            .document_mut()
+            .element_mut(&shape_id)
+            .unwrap()
+            .kind
         {
             *bound_text_id = Some("ghost".into());
         }
@@ -7455,7 +7479,8 @@ mod tests {
             pump(&mut e, &fx);
         }
         let fresh = e
-            .doc
+            .session
+            .document()
             .ordered_live()
             .iter()
             .find(|element| element.is_text())
@@ -7465,7 +7490,8 @@ mod tests {
             let fx = e.commit_text(&fresh, "healed", 5);
             pump(&mut e, &fx);
         }
-        let ElementKind::Shape { bound_text_id, .. } = &e.doc.element(&shape_id).unwrap().kind
+        let ElementKind::Shape { bound_text_id, .. } =
+            &e.session.document().element(&shape_id).unwrap().kind
         else {
             panic!("expected a shape")
         };
@@ -7516,10 +7542,15 @@ mod tests {
             pump(&mut e, &fx);
         }
 
-        let outer = e.doc.ordered_live()[0].id.clone();
-        let inner = e.doc.ordered_live()[1].id.clone();
+        let outer = e.session.document().ordered_live()[0].id.clone();
+        let inner = e.session.document().ordered_live()[1].id.clone();
         assert_eq!(
-            e.doc.element(&inner).unwrap().frame_id.as_deref(),
+            e.session
+                .document()
+                .element(&inner)
+                .unwrap()
+                .frame_id
+                .as_deref(),
             Some(outer.as_str()),
             "inner frame was not adopted by the outer frame"
         );
@@ -7529,7 +7560,7 @@ mod tests {
             pump(&mut e, &fx);
         }
         assert_eq!(
-            e.doc.live_count(),
+            e.session.document().live_count(),
             0,
             "nested contents survived the parent delete"
         );
@@ -7538,20 +7569,21 @@ mod tests {
             ..Modifiers::default()
         };
         press(&mut e, "z", cmd, 11);
-        assert_eq!(e.doc.live_count(), 3);
+        assert_eq!(e.session.document().live_count(), 3);
     }
 
     #[test]
     fn arrow_endpoints_bind_shapes_not_their_labels() {
         let mut e = editor();
         drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(160.0, 100.0), 1);
-        let shape_id = e.doc.ordered_live()[0].id.clone();
+        let shape_id = e.session.document().ordered_live()[0].id.clone();
         {
             let fx = e.double_click(Point::new(80.0, 50.0), 2);
             pump(&mut e, &fx);
         }
         let text_id = e
-            .doc
+            .session
+            .document()
             .ordered_live()
             .iter()
             .find(|element| element.is_text())
@@ -7580,7 +7612,8 @@ mod tests {
         }
 
         let arrow = e
-            .doc
+            .session
+            .document()
             .ordered_live()
             .into_iter()
             .find(|element| matches!(element.kind, ElementKind::Arrow { .. }))
@@ -7620,7 +7653,8 @@ mod tests {
         }
 
         let arrow = e
-            .doc
+            .session
+            .document()
             .ordered_live()
             .into_iter()
             .find(|element| matches!(element.kind, ElementKind::Arrow { .. }))
@@ -7640,7 +7674,7 @@ mod tests {
             None,
             "body drops keep dynamic anchoring"
         );
-        let route = connector::route(start, end, *routing, waypoints, &e.doc);
+        let route = connector::route(start, end, *routing, waypoints, e.session.document());
         let source = Rect::new(0.0, 200.0, 160.0, 100.0);
         let interior = route
             .iter()
@@ -7662,7 +7696,7 @@ mod tests {
         let mut e = editor();
         drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(100.0, 100.0), 1);
         drag_shape(&mut e, Point::new(300.0, 0.0), Point::new(400.0, 100.0), 2);
-        let b = e.doc.ordered_live()[1].id.clone();
+        let b = e.session.document().ordered_live()[1].id.clone();
         let mods = Modifiers::default();
         press(&mut e, "a", mods, 3);
         {
@@ -7682,7 +7716,8 @@ mod tests {
             pump(&mut e, &fx);
         }
         let text_id = e
-            .doc
+            .session
+            .document()
             .ordered_live()
             .iter()
             .find(|element| element.is_text())
@@ -7693,7 +7728,7 @@ mod tests {
             let fx = e.commit_text(&text_id, "sync", 8);
             pump(&mut e, &fx);
         }
-        let before = e.doc.element(&text_id).unwrap().bounds();
+        let before = e.session.document().element(&text_id).unwrap().bounds();
 
         press(&mut e, "v", mods, 9);
         e.select([b.clone()]);
@@ -7710,7 +7745,7 @@ mod tests {
             pump(&mut e, &fx);
         }
 
-        let after = e.doc.element(&text_id).unwrap().bounds();
+        let after = e.session.document().element(&text_id).unwrap().bounds();
         assert!(
             (after.center().y - before.center().y).abs() > 50.0,
             "label did not follow the re-routed connector: {before:?} -> {after:?}"
@@ -7721,13 +7756,14 @@ mod tests {
     fn nudge_moves_bound_text_and_reflows_arrow_labels() {
         let mut e = editor();
         drag_shape(&mut e, Point::new(0.0, 0.0), Point::new(100.0, 100.0), 1);
-        let shape_id = e.doc.ordered_live()[0].id.clone();
+        let shape_id = e.session.document().ordered_live()[0].id.clone();
         {
             let fx = e.double_click(Point::new(50.0, 50.0), 2);
             pump(&mut e, &fx);
         }
         let text_id = e
-            .doc
+            .session
+            .document()
             .ordered_live()
             .iter()
             .find(|element| element.is_text())
@@ -7738,12 +7774,12 @@ mod tests {
             let fx = e.commit_text(&text_id, "node", 3);
             pump(&mut e, &fx);
         }
-        let label_before = e.doc.element(&text_id).unwrap().bounds();
+        let label_before = e.session.document().element(&text_id).unwrap().bounds();
 
         let mods = Modifiers::default();
         e.select([shape_id.clone()]);
         press(&mut e, "ArrowRight", mods, 4);
-        let label_after = e.doc.element(&text_id).unwrap().bounds();
+        let label_after = e.session.document().element(&text_id).unwrap().bounds();
         assert!(
             label_after.x > label_before.x,
             "bound text stayed behind on nudge: {label_before:?} -> {label_after:?}"
@@ -7767,7 +7803,7 @@ mod tests {
             let fx = e.pointer_up(Point::new(400.0, 400.0), mods, 4);
             pump(&mut e, &fx);
         }
-        let frame_id = e.doc.ordered_live()[0].id.clone();
+        let frame_id = e.session.document().ordered_live()[0].id.clone();
 
         press(&mut e, "k", mods, 5);
         {
@@ -7779,7 +7815,8 @@ mod tests {
             pump(&mut e, &fx);
         }
         let stack = e
-            .doc
+            .session
+            .document()
             .ordered_live()
             .into_iter()
             .find(|element| element.is_sticky_stack())

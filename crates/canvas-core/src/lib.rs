@@ -21,20 +21,25 @@ pub mod history;
 pub mod hit;
 pub mod id;
 pub mod index;
+mod interaction;
 pub mod layout;
 pub mod merge;
 pub mod model;
 pub mod nav;
 pub mod patch;
+mod projection;
 pub mod relations;
 pub mod rough;
 pub mod scene;
 pub mod serialization;
+mod session;
+pub mod shell;
 pub mod spatial;
 pub mod svg;
 pub mod sync;
 pub mod text;
 pub mod tool;
+mod view;
 pub mod wire;
 
 pub use benchmark::benchmark_fixture;
@@ -48,8 +53,8 @@ pub use describe::{
 };
 pub use display::{Dash, DisplayList, DrawOp, FillStyle, PathOp, Renderer, StrokeStyle, TextOp};
 pub use editor::{
-    element_style, element_style_mut, translate_element, ArrowHandle, Editor, Effects, Handle,
-    Modifiers, ShellAction, GRID_SIZE,
+    element_style, element_style_mut, translate_element, ArrowHandle, Editor, Handle, Modifiers,
+    GRID_SIZE,
 };
 pub use geometry::{Affine, Point, Rect};
 pub use glyphs::{catalog as glyph_catalog, lookup as glyph_lookup, GlyphCategory, GlyphInfo};
@@ -65,6 +70,7 @@ pub use model::{
 pub use nav::NavigationState;
 pub use patch::{merge_element, Patch};
 pub use scene::{Scene, SceneLayer};
+pub use shell::{Effects, ShellAction};
 pub use spatial::HitIndex;
 pub use spatial::ObstacleIndex;
 pub use sync::{PageFrame, PurgeLedger};
