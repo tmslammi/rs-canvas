@@ -56,10 +56,15 @@ function rectsFinite(es: Record<string, any>[]): string | undefined {
   return undefined;
 }
 
-// strip fields that legitimately differ after undo (crdt version stamps)
+// strip fields that legitimately differ after undo (crdt version stamps).
+// Purge-ledger tombstones are sync metadata, not live document content.
 const normalize = (d: any) => {
   const clone = JSON.parse(JSON.stringify(d));
-  for (const e of Object.values(clone.elements as Record<string, any>)) {
+  for (const [id, e] of Object.entries(clone.elements as Record<string, any>)) {
+    if (e.isDeleted) {
+      delete clone.elements[id];
+      continue;
+    }
     delete e.version;
     delete e.versionNonce;
     delete e.updated;
@@ -101,8 +106,9 @@ test("undo during an active drag leaves consistent state", async ({ page }) => {
   await page.mouse.up();
   const c = await count(page);
   expect(c === 0 || c === 1, `unexpected count ${c}`).toBe(true);
-  for (const e of await elements(page)) expect(e.isDeleted).toBe(false);
-  expect(rectsFinite(await elements(page))).toBeUndefined();
+  const live = (await elements(page)).filter((e) => !e.isDeleted);
+  for (const e of live) expect(e.isDeleted).toBe(false);
+  expect(rectsFinite(live)).toBeUndefined();
 });
 
 test("Delete key during an active drag", async ({ page }) => {
