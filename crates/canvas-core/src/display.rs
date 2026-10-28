@@ -128,7 +128,127 @@ pub trait Renderer {
     /// paint over untouched pixels (which would let a lower layer cover the
     /// higher layers around it).
     fn clip_rects(&mut self, rects: &[Rect]);
+    /// Fill a batch of rectangles in the current transform space with one
+    /// fill call. This is the LOD overview primitive: one batch per palette
+    /// color instead of one path and fill per element. Backends paint
+    /// sub-pixel rectangles at a minimum hairline (Canvas2D uses 0.5 units)
+    /// so dense overviews read solid instead of sparkling.
+    fn fill_rects(&mut self, rects: &[Rect], color: &str);
     fn draw_path(&mut self, op: &PathOp);
     fn draw_line_batch(&mut self, segments: &[[Point; 2]], stroke: &StrokeStyle);
     fn draw_text(&mut self, op: &TextOp);
+}
+
+/// One call recorded by [`RecordingRenderer`], in the order it happened.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RecordedCall {
+    BeginFrame,
+    EndFrame,
+    SetTransform(Affine),
+    Clear {
+        color: String,
+    },
+    ClearRect {
+        rect: Rect,
+        color: String,
+    },
+    ClipRects(Vec<Rect>),
+    FillRects {
+        rects: Vec<Rect>,
+        color: String,
+    },
+    DrawPath(PathOp),
+    DrawLineBatch {
+        segments: Vec<[Point; 2]>,
+        stroke: StrokeStyle,
+    },
+    DrawText(TextOp),
+}
+
+/// A browser-free [`Renderer`] that records every call for native tests.
+///
+/// Frames are not nested: `BeginFrame`/`EndFrame` appear in `calls` exactly
+/// where they were issued, so a test can assert both frame boundaries and
+/// draw order. The recorder clones the ops it receives; it is a test
+/// instrument, not a paint path.
+#[derive(Clone, Debug, Default)]
+pub struct RecordingRenderer {
+    calls: Vec<RecordedCall>,
+}
+
+impl RecordingRenderer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Every recorded call, in order.
+    pub fn calls(&self) -> &[RecordedCall] {
+        &self.calls
+    }
+
+    /// Drop all recorded calls so the renderer can record another scenario.
+    pub fn clear(&mut self) {
+        self.calls.clear();
+    }
+
+    pub fn len(&self) -> usize {
+        self.calls.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.calls.is_empty()
+    }
+}
+
+impl Renderer for RecordingRenderer {
+    fn begin_frame(&mut self) {
+        self.calls.push(RecordedCall::BeginFrame);
+    }
+
+    fn end_frame(&mut self) {
+        self.calls.push(RecordedCall::EndFrame);
+    }
+
+    fn set_transform(&mut self, transform: Affine) {
+        self.calls.push(RecordedCall::SetTransform(transform));
+    }
+
+    fn clear(&mut self, color: &str) {
+        self.calls.push(RecordedCall::Clear {
+            color: color.to_string(),
+        });
+    }
+
+    fn clear_rect(&mut self, rect: Rect, color: &str) {
+        self.calls.push(RecordedCall::ClearRect {
+            rect,
+            color: color.to_string(),
+        });
+    }
+
+    fn clip_rects(&mut self, rects: &[Rect]) {
+        self.calls.push(RecordedCall::ClipRects(rects.to_vec()));
+    }
+
+    fn fill_rects(&mut self, rects: &[Rect], color: &str) {
+        self.calls.push(RecordedCall::FillRects {
+            rects: rects.to_vec(),
+            color: color.to_string(),
+        });
+    }
+
+    fn draw_path(&mut self, op: &PathOp) {
+        self.calls.push(RecordedCall::DrawPath(op.clone()));
+    }
+
+    fn draw_line_batch(&mut self, segments: &[[Point; 2]], stroke: &StrokeStyle) {
+        self.calls.push(RecordedCall::DrawLineBatch {
+            segments: segments.to_vec(),
+            stroke: stroke.clone(),
+        });
+    }
+
+    fn draw_text(&mut self, op: &TextOp) {
+        self.calls.push(RecordedCall::DrawText(op.clone()));
+    }
 }

@@ -27,6 +27,7 @@ pub mod merge;
 pub mod model;
 pub mod nav;
 pub mod page;
+pub mod paint;
 pub mod patch;
 mod projection;
 pub mod relations;
@@ -52,7 +53,10 @@ pub use demo::demo_document;
 pub use describe::{
     describe, describe_element, describe_element_with, describe_with, IdMap, UuidMap,
 };
-pub use display::{Dash, DisplayList, DrawOp, FillStyle, PathOp, Renderer, StrokeStyle, TextOp};
+pub use display::{
+    Dash, DisplayList, DrawOp, FillStyle, PathOp, RecordedCall, RecordingRenderer, Renderer,
+    StrokeStyle, TextOp,
+};
 pub use editor::{
     element_style, element_style_mut, translate_element, ArrowHandle, Editor, Handle, Modifiers,
     GRID_SIZE,
@@ -73,6 +77,7 @@ pub use page::{
     FrameApply, PageSession, PatchFrame, PendingFrame, PresentOutcome, PresentScript, PresentStep,
     PresentationAdvance, PresentationCues, Receive, SnapshotFrame, DEFAULT_PRESENT_ZOOM_CAP,
 };
+pub use paint::{guard_snapshot, merge_rects, Surface, ViewSnapshot, LOD_ZOOM};
 pub use patch::{merge_element, Patch};
 pub use scene::{Scene, SceneLayer};
 pub use shell::{Effects, ShellAction};
