@@ -5,9 +5,8 @@ state ownership:
 
 - `DocumentMirror` — the merged document, its revision, the bounded change log,
   element handles/aliases, and the agent transaction/revert journal.
-- `PageHub` — connected-page presence, binary-wire accounting and the wire
-  gate, the page broadcast sender, view hints, and presentation/screenshot
-  request state.
+- `PageHub` — connected-page presence, the page broadcast sender,
+  view hints, and presentation/screenshot request state.
 - `WorkspaceStore` — name, document-lifetime epoch/generation, the persist
   path and debounced persist loop, creation and retirement.
 - `DiscussionStore` — discussion notes and the path/flag that say whether they
@@ -23,8 +22,8 @@ belong to any one collaborator.
 ## Consequences
 
 - The document lock still comes before the change log, aliases and transaction
-  journal. `PageHub` keeps its own wire gate; persistence keeps its own write
-  lock. No collaborator reaches into another's state.
+  journal. Persistence keeps its own write lock. No collaborator reaches
+  into another's state.
 - Call sites use `Workspace::doc()`, `revision()`, `page_count()`,
   `broadcast()`, `discussion()` and similar delegations instead of public
   fields. Tests seed counts/revisions through test-only setters rather than
@@ -35,7 +34,7 @@ belong to any one collaborator.
 - Workspace retirement stays lifecycle state in `WorkspaceStore`; the wakeup
   is the persist-loop notification, while connected pages are told through the
   `PageHub` broadcast.
-- The `canvas-core::Editor` half of the issue is a separate stage.
+- The `canvas-core::Editor` split is recorded in ADR-0013.
 
 ## Considered options
 
